@@ -1,0 +1,201 @@
+package com.example.prismlock.model
+
+import kotlinx.serialization.Serializable
+import java.util.UUID
+
+@Serializable enum class LayerType { TEXT, STACK, SHAPE, ICON, SVG, DEPTH }
+@Serializable enum class Cond { ALWAYS, LOCK_ONLY, HOME_ONLY, CHARGING, NOT_CHARGING, LOW_BATTERY, DAY, NIGHT }
+@Serializable enum class Blend { NORMAL, MULTIPLY, SCREEN, OVERLAY, DARKEN, LIGHTEN, COLOR_DODGE, COLOR_BURN, SOFT_LIGHT, HARD_LIGHT, DIFFERENCE, EXCLUSION, PLUS, HUE, SATURATION, COLOR, LUMINOSITY }
+@Serializable enum class Fill { SOLID, GRADIENT, ADAPTIVE, GLASS, CRYSTAL, HOLLOW }
+@Serializable enum class GradientKind { LINEAR, RADIAL, SWEEP }
+@Serializable enum class Anchor { TOP_LEFT, TOP_CENTER, TOP_RIGHT, CENTER_LEFT, CENTER, CENTER_RIGHT, BOTTOM_LEFT, BOTTOM_CENTER, BOTTOM_RIGHT }
+@Serializable enum class ShapeKind { RECT, CIRCLE, LINE, BAR, RING }
+@Serializable enum class Dir { VERTICAL, HORIZONTAL }
+@Serializable enum class Align { START, CENTER, END }
+
+@Serializable
+data class Glass(
+    val blur: Float = 26f,
+    val refraction: Float = 36f,
+    val bevelWidth: Float = 22f,
+    val chromaticAberration: Float = 0.005f,
+    val frostAmount: Float = 0.18f,
+    val lightAngle: Float = 225f,
+    val saturation: Float = 1.35f,
+    val tint: Int = 0x26FFFFFF,
+    val grain: Float = 0.03f,
+    val rim: Float = 0.85f,
+    val edge: Float = 18f
+)
+
+@Serializable
+data class LayerNode(
+    val id: String = UUID.randomUUID().toString().take(8),
+    val name: String = "Camada",
+    val type: LayerType = LayerType.TEXT,
+    val x: Float = 0.5f,
+    val y: Float = 0.2f,
+    val anchor: Anchor = Anchor.TOP_LEFT,
+    val rotation: Float = 0f,
+    val scale: Float = 1f,
+    val opacity: Float = 1f,
+    val blend: Blend = Blend.NORMAL,
+    val cond: Cond = Cond.ALWAYS,
+    val hidden: Boolean = false,
+    val locked: Boolean = false,
+    val text: String = "{HH}:{mm}",
+    val font: String = "sans-serif",
+    val size: Float = 120f,
+    val weight: Int = 400,
+    val axes: Map<String, Float> = emptyMap(),
+    val letterSpacing: Float = 0f,
+    val lineSpacing: Float = 0f,
+    val align: Align = Align.CENTER,
+    val stretch: Float = 1f,
+    val strokeCompensation: Float = 1.0f,
+    val stretchTop: Float = 0.42f,
+    val stretchBottom: Float = 0.82f,
+    val fill: Fill = Fill.SOLID,
+    val color: Int = 0xFFFFFFFF.toInt(),
+    val color2: Int = 0xFF7AA7FF.toInt(),
+    val gradientKind: GradientKind = GradientKind.LINEAR,
+    val gradientAngle: Float = 90f,
+    val glass: Glass = Glass(),
+    val shadowRadius: Float = 0f,
+    val shadowColor: Int = 0x80000000.toInt(),
+    val shadowDx: Float = 0f,
+    val shadowDy: Float = 4f,
+    val strokeWidth: Float = 0f,
+    val strokeColor: Int = 0xFF000000.toInt(),
+    val shape: ShapeKind = ShapeKind.RECT,
+    val w: Float = 300f,
+    val h: Float = 120f,
+    val corner: Float = 40f,
+    val value: String = "bat",
+    val trackColor: Int = 0x40FFFFFF,
+    val icon: String = "weather",
+    val svgData: List<String> = emptyList(),
+    val svgW: Float = 24f,
+    val svgH: Float = 24f,
+    val dir: Dir = Dir.VERTICAL,
+    val spacing: Float = 12f,
+    val children: List<LayerNode> = emptyList()
+)
+
+@Serializable
+data class Project(
+    val layers: List<LayerNode> = Presets.iosGlass(),
+    val folderUri: String? = null,
+    val imageUri: String? = null,
+    val changeOnWake: Boolean = true,
+    val changeOnDoubleTap: Boolean = true,
+    val intervalMin: Int = 0,
+    val depth: Boolean = true,
+    val depthGuard: Boolean = true,
+    val defaultDepthForNewImages: Boolean = true,
+    val depthOverrides: Map<String, Boolean> = emptyMap(),
+    val city: String = "",
+    val lat: Double = -23.55,
+    val lon: Double = -46.63,
+    val dim: Float = 0.12f
+) {
+    fun isDepthEnabledFor(imageKey: String): Boolean =
+        depthOverrides[imageKey] ?: defaultDepthForNewImages
+}
+
+fun LayerNode.copyDeep(): LayerNode = copy(id = UUID.randomUUID().toString().take(8), children = children.map { it.copyDeep() })
+
+fun List<LayerNode>.find(id: String?): LayerNode? {
+    if (id == null) return null
+    for (n in this) { if (n.id == id) return n; n.children.find(id)?.let { return it } }
+    return null
+}
+
+fun List<LayerNode>.mapNode(id: String, f: (LayerNode) -> LayerNode): List<LayerNode> =
+    map { if (it.id == id) f(it) else if (it.children.isNotEmpty()) it.copy(children = it.children.mapNode(id, f)) else it }
+
+fun List<LayerNode>.removeNode(id: String): List<LayerNode> =
+    filter { it.id != id }.map { if (it.children.isNotEmpty()) it.copy(children = it.children.removeNode(id)) else it }
+
+fun List<LayerNode>.parentOf(id: String): LayerNode? {
+    for (n in this) { if (n.children.any { it.id == id }) return n; n.children.parentOf(id)?.let { return it } }
+    return null
+}
+
+fun List<LayerNode>.insertAfter(id: String, node: LayerNode): List<LayerNode> {
+    val i = indexOfFirst { it.id == id }
+    if (i >= 0) return toMutableList().apply { add(i + 1, node) }
+    return map { if (it.children.isNotEmpty()) it.copy(children = it.children.insertAfter(id, node)) else it }
+}
+
+fun List<LayerNode>.move(id: String, delta: Int): List<LayerNode> {
+    val i = indexOfFirst { it.id == id }
+    if (i >= 0) {
+        val j = (i + delta).coerceIn(0, size - 1)
+        if (i == j) return this
+        return toMutableList().apply { add(j, removeAt(i)) }
+    }
+    return map { if (it.children.isNotEmpty()) it.copy(children = it.children.move(id, delta)) else it }
+}
+
+fun List<LayerNode>.flatten(depth: Int = 0, out: MutableList<Pair<LayerNode, Int>> = mutableListOf()): List<Pair<LayerNode, Int>> {
+    for (n in this) { out.add(n to depth); n.children.flatten(depth + 1, out) }
+    return out
+}
+
+object Presets {
+    private fun t(name: String, text: String, size: Float, weight: Int = 400, align: Align = Align.START, font: String = "sans-serif", ls: Float = 0f) =
+        LayerNode(name = name, text = text, size = size, weight = weight, align = align, font = font, letterSpacing = ls)
+
+    fun xiaomi(): List<LayerNode> = listOf(
+        LayerNode(name = "Bloco Xiaomi", type = LayerType.STACK, x = 0.08f, y = 0.09f, align = Align.START, spacing = 6f, children = listOf(
+            t("Hora", "{HH}:{mm}", 210f, 300, font = "sans-serif-light"),
+            t("Data", "{EEEE}, {d} {MMMM}", 44f, 500),
+            LayerNode(name = "Clima", type = LayerType.STACK, dir = Dir.HORIZONTAL, align = Align.CENTER, spacing = 14f, children = listOf(
+                LayerNode(name = "Ícone clima", type = LayerType.ICON, icon = "weather", w = 54f, h = 54f),
+                t("Temperatura", "{temp}° {city}", 40f, 400)
+            ))
+        )),
+        LayerNode(name = "Alarme", text = "⏰ {alarm}", size = 34f, x = 0.08f, y = 0.92f, align = Align.START, cond = Cond.LOCK_ONLY)
+    )
+
+    fun iosGlass(): List<LayerNode> = listOf(
+        LayerNode(name = "Data", text = "{EEEE}, {d} de {MMMM}", size = 46f, weight = 600, x = 0.5f, y = 0.085f, cond = Cond.LOCK_ONLY),
+        LayerNode(name = "Hora vidro", text = "{H}:{mm}", size = 330f, weight = 800, x = 0.5f, y = 0.11f, fill = Fill.GLASS, cond = Cond.LOCK_ONLY,
+            stretch = 1.15f, glass = Glass(blur = 30f, refraction = 26f, tint = 0x40FFFFFF)),
+        LayerNode(name = "Sujeito 3D", type = LayerType.DEPTH),
+        LayerNode(name = "Widgets", type = LayerType.STACK, dir = Dir.HORIZONTAL, x = 0.5f, y = 0.34f, align = Align.CENTER, spacing = 36f, cond = Cond.LOCK_ONLY, children = listOf(
+            LayerNode(name = "Anel bateria", type = LayerType.SHAPE, shape = ShapeKind.RING, w = 110f, h = 110f, value = "bat", strokeWidth = 12f),
+            LayerNode(name = "Clima", type = LayerType.ICON, icon = "weather", w = 80f, h = 80f),
+            t("Temp", "{temp}°", 64f, 600)
+        ))
+    )
+
+    fun samsung(): List<LayerNode> = listOf(
+        LayerNode(name = "Pilha Samsung", type = LayerType.STACK, x = 0.5f, y = 0.12f, align = Align.CENTER, spacing = -30f, cond = Cond.LOCK_ONLY, children = listOf(
+            LayerNode(name = "HH", text = "{HH}", size = 280f, weight = 700, font = "sans-serif-condensed", stretch = 1.9f, letterSpacing = -0.02f),
+            LayerNode(name = "mm", text = "{mm}", size = 280f, weight = 700, font = "sans-serif-condensed", stretch = 1.9f, letterSpacing = -0.02f, color = 0xFFB9D4FF.toInt())
+        )),
+        LayerNode(name = "Sujeito 3D", type = LayerType.DEPTH),
+        LayerNode(name = "Data", text = "{EEE} {d} {MMM}", size = 44f, weight = 500, x = 0.5f, y = 0.075f, cond = Cond.LOCK_ONLY)
+    )
+
+    fun huawei(): List<LayerNode> = listOf(
+        LayerNode(name = "Editorial", type = LayerType.STACK, x = 0.07f, y = 0.1f, align = Align.START, spacing = 10f, cond = Cond.LOCK_ONLY, children = listOf(
+            t("Dia", "{EEEE_UPPER}", 34f, 600, ls = 0.32f),
+            t("Hora", "{HH}:{mm}", 190f, 200, font = "serif"),
+            LayerNode(name = "Linha", type = LayerType.SHAPE, shape = ShapeKind.LINE, w = 420f, h = 3f),
+            t("Data", "{yyyy. MM. dd.}", 40f, 400, ls = 0.08f),
+            LayerNode(name = "Barra bateria", type = LayerType.SHAPE, shape = ShapeKind.BAR, w = 420f, h = 14f, corner = 7f, value = "bat"),
+            t("Info", "{bat}% · {temp}° {city}", 30f, 400)
+        )),
+        LayerNode(name = "Sujeito 3D", type = LayerType.DEPTH)
+    )
+
+    val all: List<Pair<String, () -> List<LayerNode>>> = listOf(
+        "Xiaomi Canto Clássico" to ::xiaomi,
+        "iOS Vidro 3D" to ::iosGlass,
+        "Samsung Esticado" to ::samsung,
+        "Huawei Editorial" to ::huawei
+    )
+}
