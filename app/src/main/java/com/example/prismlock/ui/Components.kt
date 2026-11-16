@@ -74,7 +74,7 @@ fun PrecisionSliderField(
         modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(label, modifier = Modifier.width(96.dp), fontSize = 11.sp, color = Color(0xFFD0D6E2), maxLines = 1)
+        Text(label, modifier = Modifier.width(96.dp), fontSize = 11.sp, color = PrismColors.MutedZinc, maxLines = 1)
         Slider(
             value = sliderVal,
             onValueChange = { v ->
@@ -88,6 +88,11 @@ fun PrecisionSliderField(
                 onValueChangeFinished?.invoke()
             },
             valueRange = range,
+            colors = SliderDefaults.colors(
+                thumbColor = PrismColors.PureWhite,
+                activeTrackColor = PrismColors.PureWhite,
+                inactiveTrackColor = PrismColors.TrackZinc
+            ),
             modifier = Modifier.weight(1f).height(28.dp)
         )
         Spacer(Modifier.width(6.dp))
@@ -96,8 +101,8 @@ fun PrecisionSliderField(
                 .width(74.dp)
                 .height(30.dp)
                 .clip(RoundedCornerShape(8.dp))
-                .background(Color(0xFF171C26))
-                .border(1.dp, Color(0xFF2D3648), RoundedCornerShape(8.dp))
+                .background(PrismColors.CarbonBlack)
+                .border(1.dp, PrismColors.GlassBorder, RoundedCornerShape(8.dp))
                 .padding(horizontal = 6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -110,14 +115,14 @@ fun PrecisionSliderField(
                     }
                 },
                 singleLine = true,
-                textStyle = TextStyle(color = Color(0xFF8AB4F8), fontSize = 11.sp, fontWeight = FontWeight.Medium, textAlign = TextAlign.End),
-                cursorBrush = SolidColor(Color(0xFF8AB4F8)),
+                textStyle = TextStyle(color = PrismColors.PureWhite, fontSize = 11.sp, fontWeight = FontWeight.Medium, textAlign = TextAlign.End),
+                cursorBrush = SolidColor(PrismColors.PureWhite),
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Done),
                 keyboardActions = KeyboardActions(onDone = { commitText(text); focus.clearFocus() }),
                 modifier = Modifier.weight(1f)
             )
             if (suffix.isNotEmpty()) {
-                Text(suffix, fontSize = 10.sp, color = Color.Gray, modifier = Modifier.padding(start = 2.dp))
+                Text(suffix, fontSize = 10.sp, color = PrismColors.MutedZinc, modifier = Modifier.padding(start = 2.dp))
             }
         }
     }
@@ -153,9 +158,10 @@ fun ColorPickerPanel(
     Column(
         Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(Color(0xFF161A24))
-            .padding(8.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(PrismColors.CarbonBlack)
+            .border(1.dp, PrismColors.GlassBorder, RoundedCornerShape(14.dp))
+            .padding(10.dp)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded },
@@ -163,10 +169,10 @@ fun ColorPickerPanel(
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Box(Modifier.size(22.dp).clip(CircleShape).background(Color(colorInt)).border(1.5.dp, Color.White, CircleShape))
-                Text(title, fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.Medium)
+                Box(Modifier.size(22.dp).clip(CircleShape).background(Color(colorInt)).border(1.dp, PrismColors.GlassBorderStrong, CircleShape))
+                Text(title, fontSize = 12.sp, color = PrismColors.PureWhite, fontWeight = FontWeight.Medium)
             }
-            Text("#%08X".format(colorInt), fontSize = 11.sp, color = Color(0xFF8AB4F8))
+            Text("#%08X".format(colorInt), fontSize = 11.sp, color = PrismColors.MutedZinc)
         }
 
         if (expanded) {
@@ -179,7 +185,7 @@ fun ColorPickerPanel(
                             .size(24.dp)
                             .clip(CircleShape)
                             .background(Color(c))
-                            .border(if (c == colorInt) 2.dp else 1.dp, if (c == colorInt) Color(0xFF8AB4F8) else Color.DarkGray, CircleShape)
+                            .border(if (c == colorInt) 2.dp else 1.dp, if (c == colorInt) PrismColors.PureWhite else PrismColors.TrackZinc, CircleShape)
                             .clickable { onColorChange(c) }
                     )
                 }

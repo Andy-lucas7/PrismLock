@@ -79,11 +79,14 @@ data class LayerNode(
     val svgH: Float = 24f,
     val dir: Dir = Dir.VERTICAL,
     val spacing: Float = 12f,
+    val parentId: String? = null,
     val children: List<LayerNode> = emptyList()
 )
 
 @Serializable
 data class Project(
+    val id: String = "default",
+    val title: String = "Cristal Óptico",
     val layers: List<LayerNode> = Presets.iosGlass(),
     val folderUri: String? = null,
     val imageUri: String? = null,
@@ -103,7 +106,26 @@ data class Project(
         depthOverrides[imageKey] ?: defaultDepthForNewImages
 }
 
-fun LayerNode.copyDeep(): LayerNode = copy(id = UUID.randomUUID().toString().take(8), children = children.map { it.copyDeep() })
+fun LayerNode.copyDeep(newParentId: String? = null): LayerNode {
+    val newId = UUID.randomUUID().toString()
+    return copy(
+        id = newId,
+        parentId = newParentId,
+        children = children.map { it.copyDeep(newParentId = newId) }
+    )
+}
+
+fun List<LayerNode>.collectNestedChildIds(out: MutableSet<String> = HashSet()): Set<String> {
+    for (n in this) {
+        if (n.children.isNotEmpty()) {
+            for (c in n.children) {
+                out.add(c.id)
+                c.children.collectNestedChildIds(out)
+            }
+        }
+    }
+    return out
+}
 
 fun List<LayerNode>.find(id: String?): LayerNode? {
     if (id == null) return null

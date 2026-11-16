@@ -105,7 +105,7 @@ object FontManager {
     }
 }
 
-class TextShape(val path: Path, val width: Float, val height: Float)
+class TextShape(val path: Path, val width: Float, val height: Float, val baselineShiftY: Float = 0f)
 
 class BakedGlyph(
     val ch: Char,
@@ -230,10 +230,11 @@ object StemStretch {
             yOff += atlas.lineAdvance
         }
         val b = RectF()
-        if (out.isEmpty) return TextShape(out, 0f, 0f)
+        if (out.isEmpty) return TextShape(out, 0f, 0f, 0f)
         out.computeBounds(b, true)
-        out.offset(0f, -b.top)
-        return TextShape(out, maxW.coerceAtLeast(b.right), b.height())
+        val shiftY = -b.top
+        out.offset(0f, shiftY)
+        return TextShape(out, maxW.coerceAtLeast(b.right), b.height(), shiftY)
     }
 
     fun configure(p: Paint, node: LayerNode, textPx: Float) {
@@ -297,12 +298,13 @@ object StemStretch {
         }
 
         val scale = targetPx / EM
-        val res = if (out.isEmpty) TextShape(out, 0f, 0f) else {
+        val res = if (out.isEmpty) TextShape(out, 0f, 0f, 0f) else {
             scaleM.setScale(scale, scale)
             out.transform(scaleM)
             out.computeBounds(b, true)
-            out.offset(0f, -b.top)
-            TextShape(out, (maxW * scale).coerceAtLeast(b.right), b.height())
+            val shiftY = -b.top
+            out.offset(0f, shiftY)
+            TextShape(out, (maxW * scale).coerceAtLeast(b.right), b.height(), shiftY)
         }
         cache.put(key, res)
         return res
@@ -317,6 +319,14 @@ object StemStretch {
             if (b.width() > 1f) return b.width()
         }
         return paint.textSize * 0.11f
+    }
+
+    fun measureStrokeWidthPx(node: LayerNode, u: Float): Float {
+        val targetPx = (node.size * u).coerceAtLeast(1f)
+        val p = Paint(Paint.ANTI_ALIAS_FLAG)
+        configure(p, node, EM)
+        val b = RectF()
+        return measureBaseStrokeWidth(p, b) * (targetPx / EM)
     }
 
     /**

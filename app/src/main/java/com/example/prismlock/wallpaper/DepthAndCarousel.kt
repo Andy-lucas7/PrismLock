@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
@@ -40,6 +41,7 @@ object SubjectDepthEngine {
 
     suspend fun getOrCreateMaskIfEnabled(ctx: Context, uri: String?, source: Bitmap?, project: Project): Bitmap? {
         if (!project.depth || uri == null || source == null) return null
+        if (WallpaperCarousel.isVideoUri(ctx, uri)) return null
         val imageKey = WallpaperCarousel.imageKey(ctx, uri)
         if (!project.isDepthEnabledFor(imageKey)) return null
         return getOrCreateMask(ctx, uri, source)
@@ -79,6 +81,23 @@ object WallpaperCarousel {
     private val bmpCache = LruCache<String, Bitmap>(4)
     private val thumbCache = LruCache<String, Bitmap>(48)
     private val keyCache = ConcurrentHashMap<String, String>()
+    private val videoCache = ConcurrentHashMap<String, Boolean>()
+
+    fun isVideoUri(ctx: Context, uriStr: String?): Boolean {
+        if (uriStr.isNullOrBlank()) return false
+        videoCache[uriStr]?.let { return it }
+        val uri = Uri.parse(uriStr)
+        val mime = runCatching { ctx.contentResolver.getType(uri) }.getOrNull()
+        val isVid = when {
+            mime != null -> mime.startsWith("video/")
+            else -> {
+                val lower = (uri.lastPathSegment ?: uriStr).lowercase()
+                lower.endsWith(".mp4") || lower.endsWith(".webm") || lower.endsWith(".mkv") || lower.endsWith(".mov") || lower.endsWith(".m4v")
+            }
+        }
+        videoCache[uriStr] = isVid
+        return isVid
+    }
 
     fun imageKey(ctx: Context, uriStr: String): String {
         keyCache[uriStr]?.let { return it }
@@ -100,6 +119,11 @@ object WallpaperCarousel {
     suspend fun loadThumbnail(ctx: Context, uriStr: String, maxEdge: Int = 220): Bitmap? = withContext(Dispatchers.IO) {
         if (uriStr.isBlank()) return@withContext null
         thumbCache.get(uriStr)?.let { return@withContext it }
+        if (isVideoUri(ctx, uriStr)) {
+            val bmp = loadVideoFrame(ctx, uriStr, maxEdge, maxEdge)
+            if (bmp != null) thumbCache.put(uriStr, bmp)
+            return@withContext bmp
+        }
         runCatching {
             val uri = Uri.parse(uriStr)
             val src = ImageDecoder.createSource(ctx.contentResolver, uri)
@@ -112,6 +136,20 @@ object WallpaperCarousel {
             }
             thumbCache.put(uriStr, bmp)
             bmp
+        }.getOrNull()
+    }
+
+    suspend fun loadVideoFrame(ctx: Context, uriStr: String, reqW: Int, reqH: Int): Bitmap? = withContext(Dispatchers.IO) {
+        runCatching {
+            val uri = Uri.parse(uriStr)
+            val mmr = MediaMetadataRetriever()
+            try {
+                mmr.setDataSource(ctx, uri)
+                mmr.getScaledFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, reqW.coerceAtLeast(1), reqH.coerceAtLeast(1))
+                    ?: mmr.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            } finally {
+                runCatching { mmr.release() }
+            }
         }.getOrNull()
     }
 
@@ -131,8 +169,10 @@ object WallpaperCarousel {
                 val mimeCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
                 while (c.moveToNext()) {
                     val mime = c.getString(mimeCol) ?: ""
-                    if (mime.startsWith("image/")) {
-                        out.add(DocumentsContract.buildDocumentUriUsingTree(treeUri, c.getString(idCol)))
+                    if (mime.startsWith("image/") || mime.startsWith("video/")) {
+                        val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, c.getString(idCol))
+                        videoCache[docUri.toString()] = mime.startsWith("video/")
+                        out.add(docUri)
                     }
                 }
             }
@@ -146,7 +186,10 @@ object WallpaperCarousel {
         advance: Boolean = false,
         checkInterval: Boolean = false
     ): String? = withContext(Dispatchers.IO) {
-        val bakedEntries = WallpaperBaker.readManifest(ctx)?.entries
+        val manifest = WallpaperBaker.readManifest(ctx)
+        val bakedEntries = if (manifest != null && (manifest.projectId.isEmpty() || manifest.projectId == project.id)) {
+            manifest.entries
+        } else null
         val uriStrings: List<String> = if (!bakedEntries.isNullOrEmpty() && (project.folderUri != null || bakedEntries.size == 1)) {
             bakedEntries.map { it.uri }
         } else {
@@ -186,6 +229,11 @@ object WallpaperCarousel {
         if (uriStr.isNullOrBlank()) return@withContext null
         val key = "$uriStr@${reqW}x${reqH}"
         bmpCache.get(key)?.let { return@withContext it }
+        if (isVideoUri(ctx, uriStr)) {
+            val frame = loadVideoFrame(ctx, uriStr, reqW, reqH) ?: return@withContext null
+            bmpCache.put(key, frame)
+            return@withContext frame
+        }
         runCatching {
             val uri = Uri.parse(uriStr)
             val src = ImageDecoder.createSource(ctx.contentResolver, uri)

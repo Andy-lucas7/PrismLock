@@ -5,10 +5,6 @@ import android.app.AlarmManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
 import android.location.LocationManager
 import android.os.BatteryManager
 import androidx.datastore.preferences.core.edit
@@ -17,17 +13,20 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.example.prismlock.model.Presets
 import com.example.prismlock.model.Project
+import com.example.prismlock.model.copyDeep
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.double
 import kotlinx.serialization.json.int
@@ -38,26 +37,99 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.time.Instant
-import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.UUID
 
 val Context.prismStore by preferencesDataStore("prismlock")
 
 object ProjectStore {
     val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private val KEY = stringPreferencesKey("project")
+    private val THEMES_KEY = stringPreferencesKey("saved_themes_v1")
     private val IDX = intPreferencesKey("carousel_index")
     private val LAST_SWITCH = longPreferencesKey("carousel_switch")
     private val CURRENT_URI = stringPreferencesKey("carousel_current_uri")
+    private val ACTIVE_BAKE_VERSION = longPreferencesKey("active_bake_version")
+    private val listSerializer = ListSerializer(Project.serializer())
 
     fun flow(ctx: Context): Flow<Project> = ctx.applicationContext.prismStore.data
         .map { it[KEY] }.distinctUntilChanged()
         .map { s -> s?.let { runCatching { json.decodeFromString(Project.serializer(), it) }.getOrNull() } ?: Project() }
 
+    fun themesFlow(ctx: Context): Flow<List<Project>> = ctx.applicationContext.prismStore.data
+        .map { it[THEMES_KEY] to it[KEY] }
+        .distinctUntilChanged()
+        .map { (themesRaw, activeRaw) ->
+            val decoded = themesRaw?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
+            if (!decoded.isNullOrEmpty()) {
+                decoded
+            } else {
+                val active = activeRaw?.let { runCatching { json.decodeFromString(Project.serializer(), it) }.getOrNull() }
+                if (active != null) {
+                    listOf(active)
+                } else {
+                    defaultStarterThemes()
+                }
+            }
+        }
+
+    fun defaultStarterThemes(): List<Project> = listOf(
+        Project(
+            id = "theme_ios_crystal",
+            title = "Cristal Óptico",
+            layers = Presets.iosGlass()
+        ),
+        Project(
+            id = "theme_samsung_stretch",
+            title = "Samsung Esticado",
+            layers = Presets.samsung()
+        )
+    )
+
+    fun newTheme(title: String = "Novo Tema"): Project = Project(
+        id = UUID.randomUUID().toString(),
+        title = title,
+        layers = Presets.iosGlass().map { it.copyDeep() }
+    )
+
     suspend fun save(ctx: Context, p: Project) {
         val s = json.encodeToString(Project.serializer(), p)
-        ctx.applicationContext.prismStore.edit { it[KEY] = s }
+        ctx.applicationContext.prismStore.edit { prefs ->
+            prefs[KEY] = s
+            val curList = prefs[THEMES_KEY]
+                ?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
+                ?.toMutableList()
+                ?: mutableListOf()
+            val idx = curList.indexOfFirst { it.id == p.id }
+            if (idx >= 0) curList[idx] = p else curList.add(0, p)
+            prefs[THEMES_KEY] = json.encodeToString(listSerializer, curList)
+        }
+    }
+
+    suspend fun upsertTheme(ctx: Context, p: Project) {
+        ctx.applicationContext.prismStore.edit { prefs ->
+            val baseList = prefs[THEMES_KEY]
+                ?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
+                ?.toMutableList()
+                ?: run {
+                    val active = prefs[KEY]?.let { runCatching { json.decodeFromString(Project.serializer(), it) }.getOrNull() }
+                    if (active != null) mutableListOf(active) else defaultStarterThemes().toMutableList()
+                }
+            val idx = baseList.indexOfFirst { it.id == p.id }
+            if (idx >= 0) baseList[idx] = p else baseList.add(p)
+            prefs[THEMES_KEY] = json.encodeToString(listSerializer, baseList)
+        }
+    }
+
+    suspend fun deleteTheme(ctx: Context, themeId: String) {
+        ctx.applicationContext.prismStore.edit { prefs ->
+            val curList = prefs[THEMES_KEY]
+                ?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
+                ?: defaultStarterThemes()
+            val remaining = curList.filterNot { it.id == themeId }.ifEmpty { defaultStarterThemes().take(1) }
+            prefs[THEMES_KEY] = json.encodeToString(listSerializer, remaining)
+        }
     }
 
     suspend fun index(ctx: Context): Int = ctx.applicationContext.prismStore.data.first()[IDX] ?: 0
@@ -76,6 +148,16 @@ object ProjectStore {
             it[LAST_SWITCH] = System.currentTimeMillis()
             if (uri != null) it[CURRENT_URI] = uri
         }
+    }
+
+    fun bakeVersionFlow(ctx: Context): Flow<Long> = ctx.applicationContext.prismStore.data
+        .map { it[ACTIVE_BAKE_VERSION] ?: 0L }
+        .distinctUntilChanged()
+
+    suspend fun bakeVersion(ctx: Context): Long = ctx.applicationContext.prismStore.data.first()[ACTIVE_BAKE_VERSION] ?: 0L
+
+    suspend fun setBakeVersion(ctx: Context, version: Long) {
+        ctx.applicationContext.prismStore.edit { it[ACTIVE_BAKE_VERSION] = version }
     }
 }
 
@@ -100,8 +182,6 @@ object EnvProvider {
     private val W_TIME = longPreferencesKey("w_time")
     private val W_KEY = stringPreferencesKey("w_key")
     private val W_CITY = stringPreferencesKey("w_city")
-    private val STEP_BASE = floatPreferencesKey("step_base")
-    private val STEP_DAY = stringPreferencesKey("step_day")
 
     fun update(f: (Env) -> Env) { _env.value = f(_env.value) }
 
@@ -127,30 +207,6 @@ object EnvProvider {
         val next = am?.nextAlarmClock
         val s = next?.let { DateTimeFormatter.ofPattern("HH:mm").format(Instant.ofEpochMilli(it.triggerTime).atZone(ZoneId.systemDefault())) } ?: ""
         update { it.copy(alarm = s) }
-    }
-
-    fun refreshSteps(ctx: Context, onDone: () -> Unit = {}) {
-        val sm = ctx.getSystemService(SensorManager::class.java) ?: return
-        val sensor = sm.getDefaultSensor(Sensor.TYPE_STEP_COUNTER) ?: return
-        val store = ctx.applicationContext.prismStore
-        sm.registerListener(object : SensorEventListener {
-            override fun onSensorChanged(e: SensorEvent) {
-                sm.unregisterListener(this)
-                val total = e.values[0]
-                val today = LocalDate.now().toString()
-                CoroutineScope(Dispatchers.IO).launchSafe {
-                    var base = 0f
-                    store.edit { p ->
-                        val day = p[STEP_DAY]
-                        val b = p[STEP_BASE]
-                        base = if (day != today || b == null || b > total) total.also { p[STEP_DAY] = today; p[STEP_BASE] = total } else b
-                    }
-                    update { it.copy(steps = (total - base).toInt()) }
-                    withContext(Dispatchers.Main) { onDone() }
-                }
-            }
-            override fun onAccuracyChanged(s: Sensor?, a: Int) {}
-        }, sensor, SensorManager.SENSOR_DELAY_NORMAL)
     }
 
     @SuppressLint("MissingPermission")

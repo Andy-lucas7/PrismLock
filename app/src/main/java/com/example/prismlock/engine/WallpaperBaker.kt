@@ -11,7 +11,7 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
-import android.graphics.RectF
+import android.view.WindowManager
 import com.example.prismlock.data.EnvProvider
 import com.example.prismlock.data.ProjectStore
 import com.example.prismlock.model.Align
@@ -28,6 +28,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.io.File
+import java.io.FileOutputStream
 import java.security.MessageDigest
 import java.time.LocalDateTime
 import java.util.concurrent.ConcurrentHashMap
@@ -40,11 +41,14 @@ data class BakedWallpaperEntry(
     val id: String,
     val uri: String,
     val imageKey: String,
-    val hasDepth: Boolean
+    val hasDepth: Boolean,
+    val isVideo: Boolean = false
 )
 
 @Serializable
 data class BakedManifest(
+    val version: Long = 0L,
+    val projectId: String = "",
     val screenW: Int,
     val screenH: Int,
     val blurPx: Float,
@@ -52,11 +56,13 @@ data class BakedManifest(
 )
 
 class BakedWallAssets(
+    val version: Long,
     val id: String,
     val uri: String,
     val sharp: Bitmap,
     val frosted: Bitmap,
-    val depthMask: Bitmap?
+    val depthMask: Bitmap?,
+    val blurPx: Float
 )
 
 class BakedGlyphLens(
@@ -73,8 +79,7 @@ class BakedNodeLensAtlas(
     val spaceAdvance: Float,
     val lineAdvance: Float,
     val letterSpacingPx: Float,
-    val align: Align,
-    val baseTopOffset: Float
+    val align: Align
 )
 
 object GlyphAtlasBaker {
@@ -88,8 +93,8 @@ object GlyphAtlasBaker {
 
     fun getRegisteredNode(nodeId: String): LayerNode? = nodeLookup[nodeId]
 
-    fun lensAtlasKey(node: LayerNode, u: Float, bevelPx: Float): String =
-        "${StemStretch.atlasKey(node, u)}|bevel=${bevelPx.roundToInt()}"
+    fun lensAtlasKey(node: LayerNode, u: Float, bevelPx: Float, strokePx: Float): String =
+        "${StemStretch.atlasKey(node, u)}|bevel=${bevelPx.roundToInt()}|stroke=${strokePx.roundToInt()}"
 
     fun bakeForNode(node: LayerNode, u: Float) {
         registerNode(node)
@@ -97,8 +102,9 @@ object GlyphAtlasBaker {
         val atlas = StemStretch.getOrBakeAtlas(node, u)
         if (node.fill != Fill.CRYSTAL) return
 
-        val bevelPx = (node.glass.bevelWidth * u).coerceIn(2f, 64f * u)
-        val lKey = lensAtlasKey(node, u, bevelPx)
+        val bevelPx = (node.glass.bevelWidth * u).coerceIn(1f, 48f * u)
+        val strokePx = StemStretch.measureStrokeWidthPx(node, u)
+        val lKey = lensAtlasKey(node, u, bevelPx, strokePx)
         if (lensAtlasCache.containsKey(lKey)) return
 
         val maskPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -108,17 +114,9 @@ object GlyphAtlasBaker {
         val cutPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
         }
-        val r1 = (bevelPx * 0.45f).coerceAtLeast(1f)
-        val r2 = (bevelPx * 1.45f).coerceAtLeast(2f)
-        val pad = ceil(r2 * 2f + 6f).toInt()
-
-        var minTop = Float.MAX_VALUE
-        for (g in atlas.glyphs.values) {
-            if (!g.path.isEmpty && g.bounds.top < minTop) {
-                minTop = g.bounds.top
-            }
-        }
-        if (minTop == Float.MAX_VALUE) minTop = 0f
+        val rInterior = (strokePx * 0.65f).coerceAtLeast(4f * u)
+        val rBevel = bevelPx.coerceAtLeast(1f)
+        val pad = ceil(maxOf(rInterior, rBevel) * 2f + 6f).toInt()
 
         val glyphLensMap = HashMap<Char, BakedGlyphLens>(16)
         for ((ch, g) in atlas.glyphs) {
@@ -133,17 +131,20 @@ object GlyphAtlasBaker {
             val shifted = Path(g.path).apply { offset(-leftPx.toFloat(), -topPx.toFloat()) }
             val sharp = Bitmap.createBitmap(bw, bh, Bitmap.Config.ALPHA_8)
             val sc = Canvas(sharp)
+            sc.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
             maskPaint.maskFilter = null
             maskPaint.alpha = 255
             sc.drawPath(shifted, maskPaint)
 
             val out = Bitmap.createBitmap(bw, bh, Bitmap.Config.ALPHA_8)
             val oc = Canvas(out)
-            maskPaint.maskFilter = BlurMaskFilter(r1, BlurMaskFilter.Blur.NORMAL)
+            oc.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+            // Deep continuous convex interior dome + user bevel edge chamfer
+            maskPaint.maskFilter = BlurMaskFilter(rInterior, BlurMaskFilter.Blur.NORMAL)
             maskPaint.alpha = 145
             oc.drawPath(shifted, maskPaint)
-            maskPaint.maskFilter = BlurMaskFilter(r2, BlurMaskFilter.Blur.NORMAL)
-            maskPaint.alpha = 115
+            maskPaint.maskFilter = BlurMaskFilter(rBevel, BlurMaskFilter.Blur.NORMAL)
+            maskPaint.alpha = 125
             oc.drawPath(shifted, maskPaint)
             maskPaint.maskFilter = null
             maskPaint.alpha = 255
@@ -165,26 +166,27 @@ object GlyphAtlasBaker {
             spaceAdvance = atlas.spaceAdvance,
             lineAdvance = atlas.lineAdvance,
             letterSpacingPx = atlas.letterSpacingPx,
-            align = atlas.align,
-            baseTopOffset = -minTop
+            align = atlas.align
         )
     }
 
     fun tryAssembleScreenLens(
         node: LayerNode,
         text: String,
+        baselineShiftY: Float,
         localToScreen: Matrix,
         screenW: Int,
         screenH: Int,
         u: Float,
-        bevelPx: Float
+        bevelPx: Float,
+        strokePx: Float
     ): Bitmap? {
         if (text.isEmpty() || node.type != LayerType.TEXT) return null
         for (i in text.indices) {
             val c = text[i]
             if (c != ' ' && c != '\n' && ATLAS_CHARS.indexOf(c) < 0) return null
         }
-        val lKey = lensAtlasKey(node, u, bevelPx)
+        val lKey = lensAtlasKey(node, u, bevelPx, strokePx)
         val atlas = lensAtlasCache[lKey] ?: return null
 
         val lines = text.split('\n')
@@ -202,11 +204,12 @@ object GlyphAtlasBaker {
 
         val out = Bitmap.createBitmap(screenW, screenH, Bitmap.Config.ALPHA_8)
         val canvas = Canvas(out)
+        canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
         val blitPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
         canvas.save()
         canvas.concat(localToScreen)
 
-        var yOff = atlas.baseTopOffset
+        var yOff = baselineShiftY
         for ((i, line) in lines.withIndex()) {
             var xOff = when (atlas.align) {
                 Align.START -> 0f
@@ -249,9 +252,14 @@ object WallpaperBaker {
             .joinToString("") { "%02x".format(it) }
             .take(16)
 
-    fun sharpFile(ctx: Context, id: String): File = File(bakedDir(ctx), "wall_sharp_$id.webp")
-    fun frostedFile(ctx: Context, id: String): File = File(bakedDir(ctx), "wall_frosted_$id.webp")
-    fun depthFile(ctx: Context, id: String): File = File(bakedDir(ctx), "wall_depth_$id.png")
+    fun sharpFile(ctx: Context, version: Long, id: String): File =
+        File(bakedDir(ctx), "bake_v${version}_wall_sharp_$id.webp")
+
+    fun frostedFile(ctx: Context, version: Long, id: String): File =
+        File(bakedDir(ctx), "bake_v${version}_wall_frosted_$id.webp")
+
+    fun depthFile(ctx: Context, version: Long, id: String): File =
+        File(bakedDir(ctx), "bake_v${version}_wall_depth_$id.png")
 
     fun readManifest(ctx: Context): BakedManifest? = runCatching {
         val f = manifestFile(ctx)
@@ -259,9 +267,33 @@ object WallpaperBaker {
         json.decodeFromString(BakedManifest.serializer(), f.readText())
     }.getOrNull()
 
+    fun baseSizeForPhysical(realWidth: Int, realHeight: Int): Pair<Int, Int> {
+        val rw = realWidth.coerceAtLeast(1)
+        val rh = realHeight.coerceAtLeast(1)
+        val aspect = rh.toFloat() / rw.toFloat()
+        val baseWidth = minOf(rw, 1080)
+        val baseHeight = (baseWidth * aspect).roundToInt().coerceAtLeast(1)
+        return baseWidth to baseHeight
+    }
+
+    /**
+     * Proportional FHD+ working resolution (max 1080px width, exact physical screen aspect):
+     * Reduces QHD+ GPU fillrate by >40% while maintaining exact pixel alignment across Editor & Service.
+     */
+    fun resolveDisplaySize(ctx: Context): Pair<Int, Int> {
+        val bounds = runCatching {
+            ctx.getSystemService(WindowManager::class.java)?.maximumWindowMetrics?.bounds
+        }.getOrNull()
+        if (bounds != null && bounds.width() > 0 && bounds.height() > 0) {
+            return baseSizeForPhysical(bounds.width(), bounds.height())
+        }
+        val dm = ctx.resources.displayMetrics
+        return baseSizeForPhysical(dm.widthPixels.coerceAtLeast(1080), dm.heightPixels.coerceAtLeast(2400))
+    }
+
     fun resolvePrimaryBlurPx(project: Project, u: Float): Float {
         val allNodes = project.layers.flatten().map { it.first }
-        val crystalOrGlass = allNodes.firstOrNull { it.fill == Fill.CRYSTAL || it.fill == Fill.GLASS }
+        val crystalOrGlass = allNodes.firstOrNull { !it.hidden && (it.fill == Fill.CRYSTAL || it.fill == Fill.GLASS) }
         if (crystalOrGlass == null) return (26f * u).coerceIn(1f, 80f * u)
         val g = crystalOrGlass.glass
         return if (crystalOrGlass.fill == Fill.CRYSTAL) {
@@ -271,14 +303,32 @@ object WallpaperBaker {
         }
     }
 
-    fun loadBakedForUri(ctx: Context, uriStr: String?): BakedWallAssets? {
+    fun clearMemoryCache() {
+        memAssetsCache.clear()
+    }
+
+    fun loadBakedForUri(
+        ctx: Context,
+        uriStr: String?,
+        expectedW: Int = 0,
+        expectedH: Int = 0,
+        requiredVersion: Long = 0L
+    ): BakedWallAssets? {
         if (uriStr.isNullOrBlank()) return null
+        val manifest = readManifest(ctx) ?: return null
+        if (requiredVersion > 0L && manifest.version != requiredVersion) return null
+        val ver = manifest.version
         val id = imageId(uriStr)
-        memAssetsCache[id]?.let { cached ->
-            if (!cached.sharp.isRecycled && !cached.frosted.isRecycled) return cached
+        val memKey = "${ver}_$id"
+        memAssetsCache[memKey]?.let { cached ->
+            if (!cached.sharp.isRecycled && !cached.frosted.isRecycled &&
+                (expectedW == 0 || (cached.sharp.width == expectedW && cached.sharp.height == expectedH))
+            ) {
+                return cached
+            }
         }
-        val sf = sharpFile(ctx, id)
-        val ff = frostedFile(ctx, id)
+        val sf = sharpFile(ctx, ver, id)
+        val ff = frostedFile(ctx, ver, id)
         if (!sf.exists() || !ff.exists()) return null
 
         val opts = BitmapFactory.Options().apply {
@@ -286,18 +336,25 @@ object WallpaperBaker {
             inMutable = true
         }
         val sharp = BitmapFactory.decodeFile(sf.absolutePath, opts)?.apply { setHasAlpha(false) } ?: return null
-        val frosted = BitmapFactory.decodeFile(ff.absolutePath, opts)?.apply { setHasAlpha(false) } ?: return null
-        val df = depthFile(ctx, id)
+        if (expectedW > 0 && expectedH > 0 && (sharp.width != expectedW || sharp.height != expectedH)) {
+            sharp.recycle()
+            return null
+        }
+        val frosted = BitmapFactory.decodeFile(ff.absolutePath, opts)?.apply { setHasAlpha(false) } ?: run {
+            sharp.recycle()
+            return null
+        }
+        val df = depthFile(ctx, ver, id)
         val depth = if (df.exists()) BitmapFactory.decodeFile(df.absolutePath, opts) else null
 
-        val assets = BakedWallAssets(id, uriStr, sharp, frosted, depth)
+        val assets = BakedWallAssets(ver, id, uriStr, sharp, frosted, depth, manifest.blurPx)
         if (memAssetsCache.size >= 3) memAssetsCache.clear()
-        memAssetsCache[id] = assets
+        memAssetsCache[memKey] = assets
         return assets
     }
 
-    fun prewarmGlyphAtlases(project: Project, screenW: Int) {
-        val u = screenW.coerceAtLeast(1) / 1080f
+    fun prewarmGlyphAtlases(project: Project, baseWidth: Int) {
+        val u = baseWidth.coerceAtLeast(1) / 1080f
         val allNodes = project.layers.flatten().map { it.first }
         for (node in allNodes) {
             GlyphAtlasBaker.bakeForNode(node, u)
@@ -311,13 +368,16 @@ object WallpaperBaker {
         onProgress: (Float, String) -> Unit = { _, _ -> }
     ): BakedManifest = withContext(Dispatchers.Default) {
         val startMs = System.currentTimeMillis()
-        val dm = ctx.resources.displayMetrics
-        val screenW = dm.widthPixels.coerceAtLeast(1080)
-        val screenH = dm.heightPixels.coerceAtLeast(2400)
-        val u = screenW / 1080f
+        val (baseW, baseH) = resolveDisplaySize(ctx)
+        val u = baseW / 1080f
         val blurPx = resolvePrimaryBlurPx(project, u)
+        val bakeVersion = System.currentTimeMillis()
 
-        onProgress(0.08f, "Compilando Atlas de Glifos e Mapas de Lente...")
+        onProgress(0.05f, "Limpando cache anterior...")
+        clearMemoryCache()
+        bakedDir(ctx).listFiles()?.forEach { old -> runCatching { old.deleteRecursively() } }
+
+        onProgress(0.10f, "Compilando Atlas de Glifos e Lentes...")
         val allNodes = project.layers.flatten().map { it.first }
         val now = LocalDateTime.now()
         val env = EnvProvider.env.value.copy(locked = true)
@@ -336,70 +396,60 @@ object WallpaperBaker {
         }
 
         val entries = ArrayList<BakedWallpaperEntry>(uris.size)
-        val validIds = HashSet<String>()
         val total = uris.size.coerceAtLeast(1)
 
         for ((index, uriStr) in uris.withIndex()) {
-            val baseRatio = 0.15f + (index.toFloat() / total) * 0.78f
+            val baseRatio = 0.16f + (index.toFloat() / total) * 0.76f
             val imgKey = WallpaperCarousel.imageKey(ctx, uriStr)
             val id = imageId(uriStr)
-            validIds.add(id)
+            val isVideo = WallpaperCarousel.isVideoUri(ctx, uriStr)
 
-            onProgress(baseRatio, "Processando imagem ${index + 1}/$total ($imgKey)...")
-            val rawBmp = WallpaperCarousel.loadBitmap(ctx, uriStr, screenW, screenH)
+            onProgress(baseRatio, if (isVideo) "Processando vídeo ${index + 1}/$total ($imgKey)..." else "Processando imagem ${index + 1}/$total ($imgKey)...")
+            val rawBmp = WallpaperCarousel.loadBitmap(ctx, uriStr, baseW, baseH)
             if (rawBmp != null) {
-                val exactSharp = centerCropOpaque(rawBmp, screenW, screenH)
-                val sf = sharpFile(ctx, id)
-                sf.outputStream().use { out ->
+                val exactSharp = centerCropOpaque(rawBmp, baseW, baseH)
+                FileOutputStream(sharpFile(ctx, bakeVersion, id)).use { out ->
                     exactSharp.compress(Bitmap.CompressFormat.WEBP_LOSSY, 96, out)
+                    out.flush()
                 }
 
                 onProgress(baseRatio + (0.25f / total), "Pré-renderizando vidro jateado ${index + 1}/$total...")
-                val frostedBmp = renderer.bakeBlurredBitmap(exactSharp, screenW, screenH, blurPx)
-                val ff = frostedFile(ctx, id)
-                ff.outputStream().use { out ->
+                val frostedBmp = renderer.bakeBlurredBitmap(exactSharp, baseW, baseH, blurPx)
+                FileOutputStream(frostedFile(ctx, bakeVersion, id)).use { out ->
                     frostedBmp.compress(Bitmap.CompressFormat.WEBP_LOSSY, 94, out)
+                    out.flush()
                 }
 
-                val wantDepth = project.depth && project.isDepthEnabledFor(imgKey)
-                val df = depthFile(ctx, id)
+                val wantDepth = !isVideo && project.depth && project.isDepthEnabledFor(imgKey)
                 var hasDepthMask = false
                 if (wantDepth) {
                     onProgress(baseRatio + (0.50f / total), "Recortando sujeito 3D ${index + 1}/$total...")
                     val rawMask = SubjectDepthEngine.getOrCreateMask(ctx, uriStr, exactSharp)
                     if (rawMask != null) {
-                        val croppedMask = centerCropAlpha(rawMask, screenW, screenH)
-                        df.outputStream().use { out ->
+                        val croppedMask = centerCropAlpha(rawMask, baseW, baseH)
+                        FileOutputStream(depthFile(ctx, bakeVersion, id)).use { out ->
                             croppedMask.compress(Bitmap.CompressFormat.PNG, 92, out)
+                            out.flush()
                         }
                         hasDepthMask = true
-                    } else if (df.exists()) {
-                        df.delete()
                     }
-                } else if (df.exists()) {
-                    df.delete()
                 }
 
-                memAssetsCache.remove(id)
-                entries.add(BakedWallpaperEntry(id = id, uri = uriStr, imageKey = imgKey, hasDepth = hasDepthMask))
-            }
-        }
-
-        bakedDir(ctx).listFiles()?.forEach { f ->
-            if (f.name != "manifest.json") {
-                val keep = validIds.any { id -> f.name.contains(id) }
-                if (!keep) runCatching { f.delete() }
+                entries.add(BakedWallpaperEntry(id = id, uri = uriStr, imageKey = imgKey, hasDepth = hasDepthMask, isVideo = isVideo))
             }
         }
 
         val manifest = BakedManifest(
-            screenW = screenW,
-            screenH = screenH,
+            version = bakeVersion,
+            projectId = project.id,
+            screenW = baseW,
+            screenH = baseH,
             blurPx = blurPx,
             entries = entries
         )
-        runCatching {
-            manifestFile(ctx).writeText(json.encodeToString(BakedManifest.serializer(), manifest))
+        FileOutputStream(manifestFile(ctx)).use { out ->
+            out.write(json.encodeToString(BakedManifest.serializer(), manifest).toByteArray(Charsets.UTF_8))
+            out.flush()
         }
 
         if (entries.isNotEmpty()) {
@@ -410,10 +460,13 @@ object WallpaperBaker {
             }
         }
 
+        // Atomic version publish ONLY after all baked files are flushed & closed
+        ProjectStore.setBakeVersion(ctx, bakeVersion)
+
         val elapsed = System.currentTimeMillis() - startMs
-        if (elapsed < 1050L) {
-            onProgress(0.96f, "Finalizando pacote nativo...")
-            delay(1050L - elapsed)
+        if (elapsed < 900L) {
+            onProgress(0.97f, "Finalizando pacote nativo...")
+            delay(900L - elapsed)
         }
         onProgress(1.0f, "Pacote nativo pronto!")
         manifest
@@ -423,7 +476,7 @@ object WallpaperBaker {
         if (src.width == w && src.height == h && !src.hasAlpha()) return src
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val c = Canvas(out)
-        c.drawColor(Color.BLACK)
+        c.drawColor(Color.BLACK, PorterDuff.Mode.SRC)
         val scale = maxOf(w.toFloat() / src.width, h.toFloat() / src.height)
         val dx = (w - src.width * scale) * 0.5f
         val dy = (h - src.height * scale) * 0.5f
@@ -440,6 +493,7 @@ object WallpaperBaker {
         if (src.width == w && src.height == h) return src
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val c = Canvas(out)
+        c.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
         val scale = maxOf(w.toFloat() / src.width, h.toFloat() / src.height)
         val dx = (w - src.width * scale) * 0.5f
         val dy = (h - src.height * scale) * 0.5f
