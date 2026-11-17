@@ -1,16 +1,26 @@
 package com.example.prismlock.engine
 
+import android.media.AudioManager
 import android.os.Build
 import com.example.prismlock.data.Env
+import java.time.Duration
+import java.time.LocalDate
 import java.time.LocalDateTime
+import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.ceil
+import kotlin.math.cos
 import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
+import kotlin.math.roundToInt
 import kotlin.math.roundToLong
+import kotlin.math.sin
+import kotlin.math.sqrt
+import kotlin.random.Random
 
 data class FormulaCategory(
     val id: String,
@@ -54,6 +64,9 @@ object KustomFormulaEngine {
                 FormulaSnippet("Status Carga", "\$bi(status)\$"),
                 FormulaSnippet("Temp. Bat.", "\$bi(temp)\$°C"),
                 FormulaSnippet("Próx. Alarme", "\$si(alarm)\$"),
+                FormulaSnippet("Volume Mídia", "\$si(volm)\$%"),
+                FormulaSnippet("Tocando Mídia", "\$if(si(mplaying), \"▶ Tocando\", \"⏸ Pausado\")\$"),
+                FormulaSnippet("Modo Som", "\$si(ringer)\$"),
                 FormulaSnippet("Aparelho", "\$si(model)\$")
             )
         ),
@@ -69,13 +82,26 @@ object KustomFormulaEngine {
         ),
         FormulaCategory(
             id = "logic",
-            label = "Condicionais IF",
+            label = "Lógica / KLWP",
             items = listOf(
+                FormulaSnippet("Global gv()", "\$gv(painel, \"0\")\$"),
                 FormulaSnippet("Alerta Bateria", "\$if(bi(level) < 20, \"Bateria Baixa\", \"Normal\")\$"),
                 FormulaSnippet("Se Carregando", "\$if(bi(status) = \"Carregando\", \"⚡ Carregando\", bi(level) + \"%\")\$"),
+                FormulaSnippet("Contagem Alarme", "\$tf(si(alarm))\$"),
+                FormulaSnippet("Barra Pontos", "\$fl(1, 5, 1, \"if(i <= bi(level)/20, \\\"●\\\", \\\"○\\\")\")\$"),
                 FormulaSnippet("Dia MAIÚSCULO", "\$tc(up, df(EEEE))\$"),
-                FormulaSnippet("Clima minúsculo", "\$tc(low, wi(cond))\$"),
                 FormulaSnippet("Capitalizar", "\$tc(cap, df(EEEE))\$")
+            )
+        ),
+        FormulaCategory(
+            id = "fx",
+            label = "FX / Cores",
+            items = listOf(
+                FormulaSnippet("Cor Bateria", "\$if(bi(level) <= 20, \"#FFFF5252\", \"#FFFFFFFF\")\$"),
+                FormulaSnippet("Cor Contraste", "\$ce(\"#FF111318\", \"contrast\")\$"),
+                FormulaSnippet("Misturar Cores", "\$ce(\"#FFFFFFFF\", \"mix\", \"#FF7AA7FF\", 50)\$"),
+                FormulaSnippet("Ponteiros Seg.", "\$df(ss) * 6\$"),
+                FormulaSnippet("Visível se Global", "\$gv(painel) = 1\$")
             )
         ),
         FormulaCategory(
@@ -94,9 +120,14 @@ object KustomFormulaEngine {
     )
 
     fun hasSecondsToken(text: String): Boolean =
-        "{ss}" in text || ("\$df(" in text && "ss" in text)
+        "{ss}" in text || ("\$df(" in text && "ss" in text) || ("\$tf(" in text && "\"S\"" in text)
 
-    fun evalDollarBlocks(text: String, env: Env, now: LocalDateTime): String {
+    fun evalDollarBlocks(
+        text: String,
+        env: Env,
+        now: LocalDateTime,
+        globals: Map<String, String> = emptyMap()
+    ): String {
         if ('$' !in text) return text
         val sb = StringBuilder(text.length + 16)
         var i = 0
@@ -109,7 +140,7 @@ object KustomFormulaEngine {
                     break
                 }
                 val expr = text.substring(i + 1, close)
-                val evaluated = runCatching { Parser(expr, env, now).parseExpr().text }
+                val evaluated = runCatching { Parser(expr, env, now, globals).parseExpr().text }
                     .getOrElse { "" }
                 sb.append(evaluated)
                 i = close + 1
@@ -121,12 +152,53 @@ object KustomFormulaEngine {
         return sb.toString()
     }
 
-    fun evalNumeric(expr: String, env: Env, now: LocalDateTime): Double? {
+    fun resolveValue(
+        expr: String,
+        env: Env,
+        now: LocalDateTime,
+        globals: Map<String, String> = emptyMap()
+    ): String {
         val trimmed = expr.trim()
-        if ('$' in trimmed) {
-            val evaluated = evalDollarBlocks(trimmed, env, now).trim().removeSuffix("%").trim()
+        if (trimmed.isEmpty()) return ""
+        val firstPass = when {
+            '$' in trimmed || '{' in trimmed -> Dynamic.eval(trimmed, env, now, globals).trim()
+            else -> {
+                val directGlobal = globals[trimmed.lowercase()]
+                if (directGlobal != null) {
+                    directGlobal.trim()
+                } else if ('(' in trimmed) {
+                    runCatching { Parser(trimmed, env, now, globals).parseExpr().text.trim() }.getOrDefault(trimmed)
+                } else {
+                    trimmed
+                }
+            }
+        }
+        val secondPass = globals[firstPass.lowercase()]?.trim() ?: firstPass
+        return if ('$' in secondPass || '{' in secondPass) {
+            Dynamic.eval(secondPass, env, now, globals).trim()
+        } else {
+            secondPass
+        }
+    }
+
+    fun evalNumeric(
+        expr: String,
+        env: Env,
+        now: LocalDateTime,
+        globals: Map<String, String> = emptyMap()
+    ): Double? {
+        val trimmed = expr.trim()
+        if (trimmed.isEmpty()) return null
+        globals[trimmed.lowercase()]?.let { gVal ->
+            gVal.trim().toDoubleOrNull()?.let { return it }
+            if ('$' in gVal || '(' in gVal) {
+                evalNumeric(gVal, env, now, globals)?.let { return it }
+            }
+        }
+        if ('$' in trimmed || '{' in trimmed) {
+            val evaluated = Dynamic.eval(trimmed, env, now, globals).trim().removeSuffix("%").trim()
             evaluated.toDoubleOrNull()?.let { return it }
-            runCatching { Expr(evaluated, Dynamic.vars(env, now)).parse() }.getOrNull()?.let { return it }
+            runCatching { Expr(evaluated, Dynamic.vars(env, now, globals)).parse() }.getOrNull()?.let { return it }
         }
         val inner = if (trimmed.startsWith("$") && trimmed.endsWith("$") && trimmed.length >= 2) {
             trimmed.substring(1, trimmed.length - 1)
@@ -134,9 +206,62 @@ object KustomFormulaEngine {
             trimmed
         }
         return runCatching {
-            val v = Parser(inner, env, now).parseExpr()
+            val v = Parser(inner, env, now, globals).parseExpr()
             v.num ?: v.text.toDoubleOrNull()
         }.getOrNull()
+    }
+
+    fun evalTruthy(
+        expr: String,
+        env: Env,
+        now: LocalDateTime,
+        globals: Map<String, String> = emptyMap()
+    ): Boolean {
+        val trimmed = expr.trim()
+        if (trimmed.isEmpty()) return true
+        globals[trimmed.lowercase()]?.let { gVal ->
+            val gt = gVal.trim()
+            gt.toDoubleOrNull()?.let { return it != 0.0 }
+            if (gt.equals("false", ignoreCase = true)) return false
+            if (gt.equals("true", ignoreCase = true)) return true
+            return gt.isNotEmpty()
+        }
+        val inner = if (trimmed.startsWith("$") && trimmed.endsWith("$") && trimmed.length >= 2) {
+            trimmed.substring(1, trimmed.length - 1)
+        } else {
+            Dynamic.eval(trimmed, env, now, globals).trim()
+        }
+        if (trimmed.startsWith("$") && trimmed.endsWith("$") && inner.count { it == '$' } == 0) {
+            return runCatching { Parser(inner, env, now, globals).parseExpr().isTruthy }.getOrDefault(false)
+        }
+        val evaluated = Dynamic.eval(trimmed, env, now, globals).trim()
+        if (evaluated.isEmpty()) return false
+        evaluated.toDoubleOrNull()?.let { return it != 0.0 }
+        if (evaluated.equals("false", ignoreCase = true)) return false
+        if (evaluated.equals("true", ignoreCase = true)) return true
+        return runCatching { Parser(evaluated, env, now, globals).parseExpr().isTruthy }.getOrDefault(evaluated.isNotEmpty())
+    }
+
+    fun evalColor(
+        expr: String,
+        env: Env,
+        now: LocalDateTime,
+        globals: Map<String, String> = emptyMap()
+    ): Int? {
+        val evaluated = resolveValue(expr, env, now, globals)
+        if (evaluated.isEmpty()) return null
+        return parseHexOrIntColor(evaluated)
+    }
+
+    fun parseHexOrIntColor(raw: String): Int? = parseColorSafe(raw)
+
+    private fun parseColorSafe(raw: String): Int? {
+        val s = raw.trim().removePrefix("#")
+        return when (s.length) {
+            6 -> s.toLongOrNull(16)?.let { (0xFF000000L or it).toInt() }
+            8 -> s.toLongOrNull(16)?.toInt()
+            else -> raw.trim().toIntOrNull()
+        }
     }
 
     private fun findClosingDollar(s: String, start: Int): Int {
@@ -185,7 +310,9 @@ object KustomFormulaEngine {
     private class Parser(
         private val src: String,
         private val env: Env,
-        private val now: LocalDateTime
+        private val now: LocalDateTime,
+        private val globals: Map<String, String> = emptyMap(),
+        private val locals: Map<String, KVal> = emptyMap()
     ) {
         private var p = 0
 
@@ -347,6 +474,7 @@ object KustomFormulaEngine {
             if (p < src.length && src[p] == '(') {
                 return parseFunctionCall(ident.lowercase())
             }
+            locals[ident.lowercase()]?.let { return it }
             return KVal.ofText(ident)
         }
 
@@ -412,9 +540,14 @@ object KustomFormulaEngine {
 
         private fun evalFunction(name: String, args: List<KVal>): KVal = when (name) {
             "df" -> evalDf(args.getOrNull(0)?.text ?: "HH:mm")
+            "tf" -> evalTf(args)
             "bi" -> evalBi(args.getOrNull(0)?.text ?: "level")
             "si" -> evalSi(args.getOrNull(0)?.text ?: "model")
             "wi" -> evalWi(args.getOrNull(0)?.text ?: "temp")
+            "mi" -> evalMi(args.getOrNull(0)?.text ?: "state")
+            "gv" -> evalGv(args)
+            "ce" -> evalCe(args)
+            "fl" -> evalFl(args)
             "if" -> evalIf(args)
             "tc" -> evalTc(args)
             "mu" -> evalMu(args)
@@ -423,11 +556,60 @@ object KustomFormulaEngine {
 
         private fun evalDf(pattern: String): KVal {
             if (pattern.isEmpty()) return KVal.ofText("")
+            if (pattern == "D") return KVal.ofNum(now.dayOfYear.toDouble())
+            if (pattern == "f" || pattern == "S") {
+                return KVal.ofNum(now.atZone(java.time.ZoneId.systemDefault()).toEpochSecond().toDouble())
+            }
             val fmt = fmtCache.getOrPut(pattern) {
                 runCatching { DateTimeFormatter.ofPattern(pattern, Locale.getDefault()) }.getOrNull()
             }
             val formatted = fmt?.let { runCatching { it.format(now) }.getOrNull() } ?: pattern
             return KVal.ofText(formatted)
+        }
+
+        private fun evalTf(args: List<KVal>): KVal {
+            val raw = args.getOrNull(0)?.text?.trim().orEmpty()
+            if (raw.isEmpty() || raw == "--:--") return KVal.ofText("--")
+            val targetDt: LocalDateTime = runCatching {
+                when {
+                    Regex("^\\d{1,2}:\\d{2}(:\\d{2})?$").matches(raw) -> {
+                        val parts = raw.split(":")
+                        val t = LocalTime.of(
+                            parts[0].toInt().coerceIn(0, 23),
+                            parts[1].toInt().coerceIn(0, 59),
+                            parts.getOrNull(2)?.toInt()?.coerceIn(0, 59) ?: 0
+                        )
+                        val today = now.toLocalDate().atTime(t)
+                        if (today.isBefore(now)) today.plusDays(1) else today
+                    }
+                    Regex("^\\d{4}-\\d{2}-\\d{2}$").matches(raw) -> {
+                        LocalDate.parse(raw).atStartOfDay()
+                    }
+                    else -> LocalDateTime.parse(raw)
+                }
+            }.getOrNull() ?: return KVal.ofText("--")
+
+            val secs = Duration.between(now, targetDt).seconds
+            val mode = args.getOrNull(1)?.text?.trim()?.uppercase()
+            return when (mode) {
+                "D" -> KVal.ofNum((secs / 86400L).toDouble())
+                "H" -> KVal.ofNum((secs / 3600L).toDouble())
+                "M" -> KVal.ofNum((secs / 60L).toDouble())
+                "S" -> KVal.ofNum(secs.toDouble())
+                else -> {
+                    val absS = abs(secs)
+                    val d = absS / 86400L
+                    val h = (absS % 86400L) / 3600L
+                    val m = (absS % 3600L) / 60L
+                    val prefix = if (secs < 0) "-" else ""
+                    val out = when {
+                        d > 0 -> "${prefix}${d}d ${h}h"
+                        h > 0 -> "${prefix}${h}h ${m}m"
+                        else -> "${prefix}${m}m"
+                    }
+                    KVal.ofText(out)
+                }
+            }
         }
 
         private fun evalBi(param: String): KVal = when (param.lowercase()) {
@@ -442,9 +624,92 @@ object KustomFormulaEngine {
             "alarm" -> KVal.ofText(env.alarm.ifEmpty { "--:--" })
             "model" -> KVal.ofText(Build.MODEL ?: "Android")
             "man", "manufacturer" -> KVal.ofText(Build.MANUFACTURER ?: "Android")
+            "brand" -> KVal.ofText(Build.BRAND ?: "Android")
+            "sdk" -> KVal.ofNum(Build.VERSION.SDK_INT.toDouble())
             "locked" -> KVal.ofBool(env.locked)
             "steps" -> KVal.ofNum(env.steps.toDouble())
+            "volm" -> KVal.ofNum(env.mediaVolume.toDouble())
+            "mplaying" -> KVal.ofBool(env.mediaPlaying)
+            "ringer" -> KVal.ofText(
+                when (env.ringerMode) {
+                    AudioManager.RINGER_MODE_SILENT -> "Silencioso"
+                    AudioManager.RINGER_MODE_VIBRATE -> "Vibrar"
+                    else -> "Normal"
+                }
+            )
             else -> KVal.ofText("")
+        }
+
+        private fun evalMi(param: String): KVal = when (param.lowercase()) {
+            "state" -> KVal.ofText(if (env.mediaPlaying) "PLAYING" else "PAUSED")
+            "playing" -> KVal.ofBool(env.mediaPlaying)
+            else -> KVal.ofText("")
+        }
+
+        private fun evalGv(args: List<KVal>): KVal {
+            val key = args.getOrNull(0)?.text?.trim()?.lowercase().orEmpty()
+            val fallback = args.getOrNull(1)?.text ?: ""
+            val value = if (key.isEmpty()) fallback else (globals[key] ?: fallback)
+            return KVal.ofText(value)
+        }
+
+        private fun evalCe(args: List<KVal>): KVal {
+            val baseRaw = args.getOrNull(0)?.text ?: return KVal.ofText("#FFFFFFFF")
+            val c1 = parseColorSafe(baseRaw) ?: 0xFFFFFFFF.toInt()
+            val op = args.getOrNull(1)?.text?.lowercase() ?: return KVal.ofText(formatHexColor(c1))
+            val a1 = (c1 ushr 24) and 0xFF
+            val r1 = (c1 ushr 16) and 0xFF
+            val g1 = (c1 ushr 8) and 0xFF
+            val b1 = c1 and 0xFF
+            return when (op) {
+                "alpha" -> {
+                    val pct = (args.getOrNull(2)?.num ?: 100.0).coerceIn(0.0, 100.0)
+                    val a = ((pct / 100.0) * 255.0).roundToInt().coerceIn(0, 255)
+                    KVal.ofText(formatHexColor((c1 and 0x00FFFFFF) or (a shl 24)))
+                }
+                "mix" -> {
+                    val c2 = parseColorSafe(args.getOrNull(2)?.text ?: "") ?: 0xFFFFFFFF.toInt()
+                    val t = ((args.getOrNull(3)?.num ?: 50.0) / 100.0).coerceIn(0.0, 1.0).toFloat()
+                    val a = (a1 + (((c2 ushr 24) and 0xFF) - a1) * t).roundToInt().coerceIn(0, 255)
+                    val r = (r1 + (((c2 ushr 16) and 0xFF) - r1) * t).roundToInt().coerceIn(0, 255)
+                    val g = (g1 + (((c2 ushr 8) and 0xFF) - g1) * t).roundToInt().coerceIn(0, 255)
+                    val b = (b1 + ((c2 and 0xFF) - b1) * t).roundToInt().coerceIn(0, 255)
+                    KVal.ofText(formatHexColor((a shl 24) or (r shl 16) or (g shl 8) or b))
+                }
+                "contrast" -> {
+                    val lum = (0.2126 * r1 + 0.7152 * g1 + 0.0722 * b1) / 255.0
+                    KVal.ofText(if (lum > 0.55) "#FF000000" else "#FFFFFFFF")
+                }
+                "lum" -> {
+                    val lum = (0.2126 * r1 + 0.7152 * g1 + 0.0722 * b1) / 2.55
+                    KVal.ofNum(lum)
+                }
+                else -> KVal.ofText(formatHexColor(c1))
+            }
+        }
+
+        private fun formatHexColor(c: Int): String = String.format(Locale.US, "#%08X", c)
+
+        private fun evalFl(args: List<KVal>): KVal {
+            val start = (args.getOrNull(0)?.num ?: 1.0).roundToInt()
+            val end = (args.getOrNull(1)?.num ?: 1.0).roundToInt()
+            val step = (args.getOrNull(2)?.num ?: 1.0).roundToInt().let { if (it == 0) 1 else abs(it) }
+            val body = args.getOrNull(3)?.text ?: return KVal.ofText("")
+            val sep = args.getOrNull(4)?.text ?: ""
+            val sb = StringBuilder()
+            var count = 0
+            var i = start
+            val dir = if (end >= start) 1 else -1
+            while ((if (dir > 0) i <= end else i >= end) && count < 64) {
+                if (count > 0 && sep.isNotEmpty()) sb.append(sep)
+                val out = runCatching {
+                    Parser(body, env, now, globals, locals + ("i" to KVal.ofNum(i.toDouble()))).parseExpr().text
+                }.getOrDefault("")
+                sb.append(out)
+                i += step * dir
+                count++
+            }
+            return KVal.ofText(sb.toString())
         }
 
         private fun evalWi(param: String): KVal = when (param.lowercase()) {
@@ -485,6 +750,35 @@ object KustomFormulaEngine {
                     val maxLen = args.getOrNull(2)?.num?.toInt()?.coerceAtLeast(0) ?: txt.length
                     KVal.ofText(txt.take(maxLen))
                 }
+                "ell" -> {
+                    val maxLen = args.getOrNull(2)?.num?.toInt()?.coerceAtLeast(1) ?: txt.length
+                    KVal.ofText(if (txt.length > maxLen) txt.take(maxLen - 1) + "…" else txt)
+                }
+                "split" -> {
+                    val sep = args.getOrNull(2)?.text ?: " "
+                    val idx = args.getOrNull(3)?.num?.toInt()?.coerceAtLeast(0) ?: 0
+                    val parts = txt.split(sep)
+                    KVal.ofText(parts.getOrElse(idx) { "" })
+                }
+                "lpad" -> {
+                    val targetLen = args.getOrNull(2)?.num?.toInt()?.coerceIn(0, 64) ?: txt.length
+                    val padChar = args.getOrNull(3)?.text?.firstOrNull() ?: '0'
+                    KVal.ofText(txt.padStart(targetLen, padChar))
+                }
+                "rpad" -> {
+                    val targetLen = args.getOrNull(2)?.num?.toInt()?.coerceIn(0, 64) ?: txt.length
+                    val padChar = args.getOrNull(3)?.text?.firstOrNull() ?: ' '
+                    KVal.ofText(txt.padEnd(targetLen, padChar))
+                }
+                "reg" -> {
+                    val pat = args.getOrNull(2)?.text ?: ""
+                    val repl = args.getOrNull(3)?.text ?: ""
+                    KVal.ofText(runCatching { txt.replace(Regex(pat), repl) }.getOrDefault(txt))
+                }
+                "count" -> {
+                    val sub = args.getOrNull(2)?.text ?: ""
+                    if (sub.isEmpty()) KVal.ofNum(0.0) else KVal.ofNum(txt.windowed(sub.length) { it == sub }.count { it }.toDouble())
+                }
                 else -> KVal.ofText(txt)
             }
         }
@@ -500,6 +794,22 @@ object KustomFormulaEngine {
                 "round" -> KVal.ofNum(nums[0].roundToLong().toDouble())
                 "floor" -> KVal.ofNum(floor(nums[0]))
                 "ceil" -> KVal.ofNum(ceil(nums[0]))
+                "pow" -> KVal.ofNum(nums[0].pow(nums.getOrElse(1) { 1.0 }))
+                "sqrt" -> KVal.ofNum(sqrt(nums[0].coerceAtLeast(0.0)))
+                "sin" -> KVal.ofNum(sin(Math.toRadians(nums[0])))
+                "cos" -> KVal.ofNum(cos(Math.toRadians(nums[0])))
+                "clamp" -> {
+                    val lo = nums.getOrElse(1) { 0.0 }
+                    val hi = nums.getOrElse(2) { lo.coerceAtLeast(100.0) }
+                    KVal.ofNum(nums[0].coerceIn(min(lo, hi), max(lo, hi)))
+                }
+                "rnd" -> {
+                    val lo = nums[0].roundToInt()
+                    val hi = nums.getOrElse(1) { 100.0 }.roundToInt()
+                    val minV = min(lo, hi)
+                    val maxV = max(lo, hi)
+                    KVal.ofNum(Random.nextInt(minV, maxV + 1).toDouble())
+                }
                 else -> KVal.ofNum(nums[0])
             }
         }

@@ -1,6 +1,7 @@
 package com.example.prismlock.ui
 
 import android.graphics.Bitmap
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -62,6 +63,7 @@ import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Save
+import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.TextFields
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Videocam
@@ -111,6 +113,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -122,7 +125,9 @@ import com.example.prismlock.engine.Dynamic
 import com.example.prismlock.engine.FontManager
 import com.example.prismlock.engine.Icons
 import com.example.prismlock.engine.KustomFormulaEngine
+import com.example.prismlock.engine.LaunchableApp
 import com.example.prismlock.engine.LiquidGlassRenderer
+import com.example.prismlock.engine.TouchActionExecutor
 import com.example.prismlock.engine.WallpaperBaker
 import com.example.prismlock.model.Align
 import com.example.prismlock.model.Anchor
@@ -131,12 +136,16 @@ import com.example.prismlock.model.Cond
 import com.example.prismlock.model.Dir
 import com.example.prismlock.model.Fill
 import com.example.prismlock.model.Glass
+import com.example.prismlock.model.GlobalType
+import com.example.prismlock.model.GlobalVar
 import com.example.prismlock.model.GradientKind
 import com.example.prismlock.model.LayerNode
 import com.example.prismlock.model.LayerType
 import com.example.prismlock.model.Presets
 import com.example.prismlock.model.Project
 import com.example.prismlock.model.ShapeKind
+import com.example.prismlock.model.TouchAction
+import com.example.prismlock.model.TouchActionType
 import com.example.prismlock.model.copyDeep
 import com.example.prismlock.model.find
 import com.example.prismlock.model.flatten
@@ -158,7 +167,9 @@ private enum class StudioTab(val label: String) {
     LAYERS("Camadas"),
     CONTENT("Conteúdo"),
     TYPE("Tipografia"),
-    PAINT("Vidro / Cor")
+    PAINT("Vidro / Cor"),
+    TOUCH("Toque"),
+    GLOBALS("Globais")
 }
 
 private fun anchorLabel(a: Anchor): String = when (a) {
@@ -297,8 +308,10 @@ fun StudioScreen(
     hasFontFolder: Boolean = false,
     onPickFontFolder: () -> Unit = {},
     onRefreshFontFolder: (Boolean) -> Unit = {},
-    onImportSvg: () -> Unit
+    onImportSvg: () -> Unit,
+    onNextWallpaper: (() -> Unit)? = null
 ) {
+    val ctx = LocalContext.current
     var tab by remember(project.id) { mutableStateOf(StudioTab.BACKGROUND) }
     var sheetExpanded by remember(project.id) { mutableStateOf(true) }
     var showAddMenu by remember(project.id) { mutableStateOf(false) }
@@ -308,6 +321,8 @@ fun StudioScreen(
     var showPresetsModal by remember(project.id) { mutableStateOf(false) }
     var pendingPreset by remember(project.id) { mutableStateOf<Pair<String, () -> List<LayerNode>>?>(null) }
     var isActivelyDraggingLayer by remember(project.id) { mutableStateOf(false) }
+    var previewLocked by remember(project.id) { mutableStateOf(true) }
+    var testTouchMode by remember(project.id) { mutableStateOf(false) }
     val chromeAlpha by animateFloatAsState(
         targetValue = if (isActivelyDraggingLayer) 0f else 1f,
         animationSpec = tween(180),
@@ -315,6 +330,19 @@ fun StudioScreen(
     )
 
     val selected = project.layers.find(selectedId)
+
+    fun runLayerTouch(targetNode: LayerNode) {
+        TouchActionExecutor.execute(
+            ctx = ctx,
+            node = targetNode,
+            project = project,
+            env = env.copy(locked = previewLocked),
+            now = LocalDateTime.now(),
+            onMutateProject = { updated -> onCommitProject(updated) },
+            onNextWallpaper = { onNextWallpaper?.invoke() },
+            onFeedback = { msg -> Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show() }
+        )
+    }
 
     Box(Modifier.fillMaxSize().background(PrismColors.PureBlack)) {
         InteractiveLockPreview(
@@ -325,6 +353,9 @@ fun StudioScreen(
             depthBitmap = depthBitmap,
             activePreviewUri = activePreviewUri,
             env = env,
+            previewLocked = previewLocked,
+            testTouchMode = testTouchMode && tab == StudioTab.TOUCH,
+            onTriggerLayerTouch = ::runLayerTouch,
             onSelectLayer = onSelectLayer,
             onUpdateLayer = onUpdateLayer,
             onFlushSave = onFlushSave,
@@ -392,7 +423,7 @@ fun StudioScreen(
                     }
                 }
 
-                // Right: Collapse inspector, Layer Lock, 3-dots menu
+                // Right: Layer Lock, Collapse inspector, 3-dots menu
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     if (selected != null) {
                         IconButton(
@@ -586,7 +617,8 @@ fun StudioScreen(
                         )
                         StudioTab.CONTENT -> ContentTab(
                             node = selected,
-                            env = env,
+                            project = project,
+                            env = env.copy(locked = previewLocked),
                             wallPalette = wallPalette,
                             update = onUpdateSelected,
                             onSaveFinished = onFlushSave,
@@ -604,10 +636,32 @@ fun StudioScreen(
                         )
                         StudioTab.PAINT -> PaintTab(
                             allLayers = project.layers,
+                            colorGlobals = project.globals.filter { it.type == GlobalType.COLOR },
                             node = selected,
                             wallPalette = wallPalette,
                             onSelect = { onSelectLayer(it) },
                             update = onUpdateSelected,
+                            onSaveFinished = onFlushSave
+                        )
+                        StudioTab.TOUCH -> TouchTab(
+                            node = selected,
+                            project = project,
+                            previewLocked = previewLocked,
+                            testTouchMode = testTouchMode,
+                            onTogglePreviewLocked = { previewLocked = !previewLocked },
+                            onToggleTestTouch = { testTouchMode = !testTouchMode },
+                            onTestAction = ::runLayerTouch,
+                            onOpenGlobalsTab = { tab = StudioTab.GLOBALS },
+                            update = onUpdateSelected,
+                            onSaveFinished = onFlushSave
+                        )
+                        StudioTab.GLOBALS -> GlobalsTab(
+                            project = project,
+                            wallPalette = wallPalette,
+                            onSelectLayer = onSelectLayer,
+                            onUpdateLayer = onUpdateLayer,
+                            onStageProject = onStageProject,
+                            onCommitProject = onCommitProject,
                             onSaveFinished = onFlushSave
                         )
                     }
@@ -741,13 +795,16 @@ private fun layerTypeIcon(type: LayerType): ImageVector = when (type) {
     LayerType.DEPTH -> MIcons.Rounded.Layers
 }
 
-private fun layerSubtitle(node: LayerNode, env: Env): String = when (node.type) {
-    LayerType.TEXT -> "${node.text}  →  ${Dynamic.eval(node.text, env, LocalDateTime.now())}"
-    LayerType.STACK -> "Pilha ${dirLabel(node.dir).lowercase()} · ${node.children.size} itens"
-    LayerType.SHAPE -> "Forma ${shapeLabel(node.shape)}"
-    LayerType.ICON -> "Ícone ${iconLabel(node.icon)}"
-    LayerType.SVG -> "Vetor SVG"
-    LayerType.DEPTH -> "Recorte 3D automático"
+private fun layerSubtitle(node: LayerNode, env: Env, globals: Map<String, String> = emptyMap()): String {
+    val base = when (node.type) {
+        LayerType.TEXT -> "${node.text}  →  ${Dynamic.eval(node.text, env, LocalDateTime.now(), globals)}"
+        LayerType.STACK -> "Pilha ${dirLabel(node.dir).lowercase()} · ${node.children.size} itens"
+        LayerType.SHAPE -> "Forma ${shapeLabel(node.shape)}"
+        LayerType.ICON -> "Ícone ${iconLabel(node.icon)}"
+        LayerType.SVG -> "Vetor SVG"
+        LayerType.DEPTH -> "Recorte 3D automático"
+    }
+    return if (node.touch.isActive) "$base  · ⚡ ${TouchActionExecutor.describe(node.touch)}" else base
 }
 
 @Composable
@@ -864,7 +921,7 @@ private fun LayersTab(
                     Spacer(Modifier.width(9.dp))
                     Column(Modifier.weight(1f)) {
                         Text(node.name, color = PrismColors.PureWhite, fontSize = 12.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(layerSubtitle(node, env), color = PrismColors.MutedZinc, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(layerSubtitle(node, env, project.globalsMap()), color = PrismColors.MutedZinc, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                     IconButton(onClick = { onCommit(project.copy(layers = project.layers.move(node.id, -1))) }, Modifier.size(26.dp)) {
                         Icon(MIcons.Rounded.ArrowUpward, null, tint = PrismColors.MutedZinc, modifier = Modifier.size(15.dp))
@@ -906,6 +963,7 @@ private fun LayersTab(
 @Composable
 private fun ContentTab(
     node: LayerNode?,
+    project: Project,
     env: Env,
     wallPalette: List<Int>,
     update: ((LayerNode) -> LayerNode) -> Unit,
@@ -916,9 +974,10 @@ private fun ContentTab(
         Text("Selecione uma camada na tela ou na aba Camadas", color = PrismColors.MutedZinc, fontSize = 12.sp)
         return
     }
+    val globals = remember(project.globals) { project.globalsMap() }
     var activeCategoryId by remember { mutableStateOf(KustomFormulaEngine.categories.first().id) }
     val liveNow by produceState(initialValue = LocalDateTime.now(), node.text) {
-        val period = if (KustomFormulaEngine.hasSecondsToken(node.text)) 1000L else 15_000L
+        val period = if (Dynamic.hasSeconds(node)) 1000L else 15_000L
         while (true) {
             value = LocalDateTime.now()
             delay(period)
@@ -928,6 +987,8 @@ private fun ContentTab(
     var showNameDialog by remember(node.id) { mutableStateOf(false) }
     var showFormulaDialog by remember(node.id) { mutableStateOf(false) }
     var showValueDialog by remember(node.id) { mutableStateOf(false) }
+    var showIconFormulaDialog by remember(node.id) { mutableStateOf(false) }
+    var fxDialogField by remember(node.id) { mutableStateOf<String?>(null) }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         FocusedFieldTrigger(
@@ -973,8 +1034,8 @@ private fun ContentTab(
                 )
             }
             // Real-time evaluated formula preview card
-            val liveResult = remember(node.text, env, liveNow) {
-                Dynamic.eval(node.text, env, liveNow)
+            val liveResult = remember(node.text, env, liveNow, globals) {
+                Dynamic.eval(node.text, env, liveNow, globals)
             }
             Row(
                 modifier = Modifier
@@ -1050,6 +1111,24 @@ private fun ContentTab(
                         "Limpar" to { update { it.copy(text = "") }; onSaveFinished() }
                     )
                 )
+                if (project.globals.isNotEmpty()) {
+                    Text("Inserir Global do Projeto", fontSize = 11.sp, color = PrismColors.MutedZinc)
+                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        project.globals.forEach { g ->
+                            val snippet = "\$gv(${g.name})\$"
+                            FilterChip(
+                                selected = snippet in node.text,
+                                onClick = {
+                                    update { it.copy(text = if (it.text.isBlank()) snippet else it.text + snippet) }
+                                    onSaveFinished()
+                                },
+                                label = { Text("${g.name} (${g.value})", fontSize = 10.sp) },
+                                colors = prismFilterChipColors(),
+                                border = prismFilterChipBorder(snippet in node.text)
+                            )
+                        }
+                    }
+                }
             }
         }
         if (node.type == LayerType.SHAPE) {
@@ -1108,6 +1187,26 @@ private fun ContentTab(
                         FilterChip(selected = sel, onClick = { update { it.copy(icon = ic) }; onSaveFinished() }, label = { Text(iconLabel(ic), fontSize = 11.sp) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
                     }
                 }
+                FocusedFieldTrigger(
+                    label = "Fórmula de Ícone Dinâmico (opcional)",
+                    value = node.icon,
+                    placeholder = "weather",
+                    onClick = { showIconFormulaDialog = true }
+                )
+                if (showIconFormulaDialog) {
+                    FocusedInputDialog(
+                        title = "Ícone / Fórmula (\$...\$)",
+                        initialValue = node.icon,
+                        placeholder = "weather",
+                        exampleHint = "Ex: \$if(bi(charging), \"bolt\", \"battery\")\$ ou \$if(si(mplaying), \"music\", \"lock\")\$",
+                        onDismiss = { showIconFormulaDialog = false },
+                        onConfirm = { v ->
+                            update { it.copy(icon = v.trim().ifEmpty { "weather" }) }
+                            onSaveFinished()
+                            showIconFormulaDialog = false
+                        }
+                    )
+                }
             }
         }
         if (node.type == LayerType.STACK) {
@@ -1134,6 +1233,840 @@ private fun ContentTab(
                     val sel = node.cond == c
                     FilterChip(selected = sel, onClick = { update { it.copy(cond = c) }; onSaveFinished() }, label = { Text(condLabel(c), fontSize = 10.sp) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
                 }
+            }
+        }
+
+        val fxEntries = listOf(
+            Triple("vis", "Visibilidade por Fórmula", node.visibilityExpr to "Ex: \$gv(painel) = 1\$ ou \$bi(level) < 30\$"),
+            Triple("color", "Cor Dinâmica FX (HEX)", node.fxColor to "Ex: \$if(bi(level) <= 20, \"#FFFF5252\", \"#FFFFFFFF\")\$"),
+            Triple("opacity", "Opacidade FX (0..100%)", node.fxOpacity to "Ex: \$if(gv(modo) = 1, 100, 35)\$"),
+            Triple("rot", "Rotação FX (°)", node.fxRotation to "Ex: \$df(ss) * 6\$ ou \$bi(level) * 3.6\$"),
+            Triple("scale", "Escala FX (x)", node.fxScale to "Ex: \$if(gv(zoom) = 1, 1.25, 1.0)\$"),
+            Triple("dx", "Deslocamento X FX (px)", node.fxOffsetX to "Ex: \$if(gv(aberto) = 1, 0, -140)\$"),
+            Triple("dy", "Deslocamento Y FX (px)", node.fxOffsetY to "Ex: \$if(gv(menu) = 1, 0, 80)\$")
+        )
+        val activeFxCount = fxEntries.count { it.third.first.isNotBlank() }
+        StudioSection(
+            title = "Fórmulas Avançadas FX (KLWP)",
+            summary = if (activeFxCount == 0) "Nenhuma ativa" else "$activeFxCount ativa(s)",
+            initiallyExpanded = activeFxCount > 0
+        ) {
+            fxEntries.forEach { (key, label, valAndHint) ->
+                FocusedFieldTrigger(
+                    label = label,
+                    value = valAndHint.first,
+                    placeholder = "Opcional (\$...\$)",
+                    onClick = { fxDialogField = key }
+                )
+            }
+            val activeFx = fxEntries.firstOrNull { it.first == fxDialogField }
+            if (activeFx != null) {
+                val (key, label, valAndHint) = activeFx
+                FocusedInputDialog(
+                    title = label,
+                    initialValue = valAndHint.first,
+                    placeholder = "\$...\$ (vazio desativa)",
+                    exampleHint = valAndHint.second,
+                    singleLine = false,
+                    onDismiss = { fxDialogField = null },
+                    onConfirm = { raw ->
+                        val v = raw.trim()
+                        update { n ->
+                            when (key) {
+                                "vis" -> n.copy(visibilityExpr = v)
+                                "color" -> n.copy(fxColor = v)
+                                "opacity" -> n.copy(fxOpacity = v)
+                                "rot" -> n.copy(fxRotation = v)
+                                "scale" -> n.copy(fxScale = v)
+                                "dx" -> n.copy(fxOffsetX = v)
+                                "dy" -> n.copy(fxOffsetY = v)
+                                else -> n
+                            }
+                        }
+                        onSaveFinished()
+                        fxDialogField = null
+                    }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun TouchTab(
+    node: LayerNode?,
+    project: Project,
+    previewLocked: Boolean,
+    testTouchMode: Boolean,
+    onTogglePreviewLocked: () -> Unit,
+    onToggleTestTouch: () -> Unit,
+    onTestAction: (LayerNode) -> Unit,
+    onOpenGlobalsTab: () -> Unit,
+    update: ((LayerNode) -> LayerNode) -> Unit,
+    onSaveFinished: () -> Unit
+) {
+    val ctx = LocalContext.current
+    var showAppPicker by remember { mutableStateOf(false) }
+    var showAppSearchDialog by remember { mutableStateOf(false) }
+    var appQuery by remember { mutableStateOf("") }
+    var showPackageDialog by remember(node?.id) { mutableStateOf(false) }
+    var showUrlDialog by remember(node?.id) { mutableStateOf(false) }
+    var showGlobalNameDialog by remember(node?.id) { mutableStateOf(false) }
+    var showGlobalValueDialog by remember(node?.id) { mutableStateOf(false) }
+
+    val apps by produceState<List<LaunchableApp>>(initialValue = emptyList(), showAppPicker) {
+        if (showAppPicker) {
+            value = withContext(Dispatchers.IO) { TouchActionExecutor.queryLaunchableApps(ctx) }
+        }
+    }
+
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            FilterChip(
+                selected = testTouchMode,
+                onClick = onToggleTestTouch,
+                label = { Text(if (testTouchMode) "Testar Toques na Tela: ATIVO" else "Testar Toques na Tela", fontSize = 11.sp) },
+                colors = prismFilterChipColors(),
+                border = prismFilterChipBorder(testTouchMode)
+            )
+            FilterChip(
+                selected = !previewLocked,
+                onClick = onTogglePreviewLocked,
+                label = { Text(if (previewLocked) "Preview: Bloqueio" else "Preview: Início", fontSize = 11.sp) },
+                colors = prismFilterChipColors(),
+                border = prismFilterChipBorder(!previewLocked)
+            )
+        }
+
+        Text(
+            text = "No Papel de Parede Vivo, toques executam na Tela Inicial (Launcher). Ative \"Testar Toques na Tela\" acima para clicar nos itens direto no preview.",
+            fontSize = 10.sp,
+            color = PrismColors.MutedZinc,
+            lineHeight = 14.sp
+        )
+
+        if (node == null) {
+            Text("Selecione uma camada na tela ou em Camadas para configurar o clique.", color = PrismColors.MutedZinc, fontSize = 12.sp)
+        } else {
+            StudioSection(
+                title = "Ação ao Clicar · ${node.name}",
+                summary = TouchActionExecutor.describe(node.touch),
+                initiallyExpanded = true
+            ) {
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    TouchActionType.entries.forEach { t ->
+                        val sel = node.touch.type == t
+                        FilterChip(
+                            selected = sel,
+                            onClick = {
+                                update { it.copy(touch = it.touch.copy(type = t)) }
+                                onSaveFinished()
+                            },
+                            label = { Text(TouchActionExecutor.labelOf(t), fontSize = 11.sp) },
+                            colors = prismFilterChipColors(),
+                            border = prismFilterChipBorder(sel)
+                        )
+                    }
+                }
+
+                when (node.touch.type) {
+                    TouchActionType.OPEN_APP -> {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { showAppPicker = true },
+                                modifier = Modifier.weight(1f),
+                                colors = ButtonDefaults.buttonColors(containerColor = PrismColors.PureWhite, contentColor = PrismColors.PureBlack),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text(
+                                    text = node.touch.targetLabel.ifBlank { "Escolher Aplicativo" },
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            OutlinedButton(
+                                onClick = { showPackageDialog = true },
+                                shape = RoundedCornerShape(12.dp),
+                                border = androidx.compose.foundation.BorderStroke(1.dp, PrismColors.GlassBorder)
+                            ) { Text("Pacote", fontSize = 11.sp, color = PrismColors.PureWhite) }
+                        }
+                        if (node.touch.targetPackage.isNotBlank()) {
+                            Text("Pacote: ${node.touch.targetPackage}", fontSize = 10.sp, color = PrismColors.MutedZinc)
+                        }
+                    }
+                    TouchActionType.OPEN_URL -> {
+                        FocusedFieldTrigger(
+                            label = "Link / URL / Deep Link",
+                            value = node.touch.url,
+                            placeholder = "https://...",
+                            onClick = { showUrlDialog = true }
+                        )
+                        QuickPresetRow(
+                            items = listOf(
+                                "Google" to { update { it.copy(touch = it.touch.copy(url = "https://www.google.com")) }; onSaveFinished() },
+                                "YouTube" to { update { it.copy(touch = it.touch.copy(url = "https://www.youtube.com")) }; onSaveFinished() },
+                                "Spotify" to { update { it.copy(touch = it.touch.copy(url = "spotify:")) }; onSaveFinished() },
+                                "Clima Busca" to { update { it.copy(touch = it.touch.copy(url = "https://www.google.com/search?q=clima+\$wi(city)\$")) }; onSaveFinished() }
+                            )
+                        )
+                    }
+                    TouchActionType.TOGGLE_GLOBAL, TouchActionType.SET_GLOBAL, TouchActionType.NEXT_GLOBAL_LIST -> {
+                        if (project.globals.isNotEmpty()) {
+                            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                project.globals.forEach { g ->
+                                    val sel = node.touch.globalName.equals(g.name, ignoreCase = true)
+                                    FilterChip(
+                                        selected = sel,
+                                        onClick = {
+                                            update { it.copy(touch = it.touch.copy(globalName = g.name)) }
+                                            onSaveFinished()
+                                        },
+                                        label = { Text("${g.name} (${g.value})", fontSize = 10.sp) },
+                                        colors = prismFilterChipColors(),
+                                        border = prismFilterChipBorder(sel)
+                                    )
+                                }
+                            }
+                        }
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Box(Modifier.weight(1f)) {
+                                FocusedFieldTrigger(
+                                    label = "Global Alvo",
+                                    value = node.touch.globalName,
+                                    placeholder = "painel",
+                                    onClick = { showGlobalNameDialog = true }
+                                )
+                            }
+                            OutlinedButton(
+                                onClick = onOpenGlobalsTab,
+                                shape = RoundedCornerShape(12.dp),
+                                border = androidx.compose.foundation.BorderStroke(1.dp, PrismColors.GlassBorderStrong)
+                            ) { Text("Globais →", fontSize = 11.sp, color = PrismColors.PureWhite) }
+                        }
+                        if (node.touch.type == TouchActionType.SET_GLOBAL) {
+                            FocusedFieldTrigger(
+                                label = "Valor a Definir (aceita \$...\$)",
+                                value = node.touch.globalValue,
+                                placeholder = "1 ou \$if(gv(x)=1, 0, 1)\$",
+                                onClick = { showGlobalValueDialog = true }
+                            )
+                        }
+                    }
+                    else -> Unit
+                }
+
+                if (node.touch.isActive) {
+                    OutlinedButton(
+                        onClick = { onTestAction(node) },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, PrismColors.GlassBorderStrong)
+                    ) { Text("Executar Ação Agora", fontSize = 12.sp, color = PrismColors.PureWhite, fontWeight = FontWeight.Medium) }
+                }
+            }
+        }
+    }
+
+    if (showPackageDialog && node != null) {
+        FocusedInputDialog(
+            title = "Pacote do App",
+            initialValue = node.touch.targetPackage,
+            placeholder = "com.whatsapp",
+            exampleHint = "Ex: com.whatsapp, com.spotify.music, com.android.chrome",
+            onDismiss = { showPackageDialog = false },
+            onConfirm = { v ->
+                update { it.copy(touch = it.touch.copy(targetPackage = v.trim(), targetLabel = v.trim())) }
+                onSaveFinished()
+                showPackageDialog = false
+            }
+        )
+    }
+
+    if (showUrlDialog && node != null) {
+        FocusedInputDialog(
+            title = "Link ou Deep Link",
+            initialValue = node.touch.url,
+            placeholder = "https://www.google.com",
+            exampleHint = "Aceita URL, tel:, mailto: ou fórmulas \$...\$",
+            onDismiss = { showUrlDialog = false },
+            onConfirm = { v ->
+                update { it.copy(touch = it.touch.copy(url = v.trim())) }
+                onSaveFinished()
+                showUrlDialog = false
+            }
+        )
+    }
+
+    if (showGlobalNameDialog && node != null) {
+        FocusedInputDialog(
+            title = "Nome da Variável Global",
+            initialValue = node.touch.globalName,
+            placeholder = "painel",
+            exampleHint = "Ex: painel, cor_tema, modo (sem \$ ou espaços)",
+            onDismiss = { showGlobalNameDialog = false },
+            onConfirm = { v ->
+                update { it.copy(touch = it.touch.copy(globalName = v.trim())) }
+                onSaveFinished()
+                showGlobalNameDialog = false
+            }
+        )
+    }
+
+    if (showGlobalValueDialog && node != null) {
+        FocusedInputDialog(
+            title = "Valor da Global",
+            initialValue = node.touch.globalValue,
+            placeholder = "1",
+            exampleHint = "Texto, HEX (#FF7AA7FF), número ou fórmula \$...\$",
+            onDismiss = { showGlobalValueDialog = false },
+            onConfirm = { v ->
+                update { it.copy(touch = it.touch.copy(globalValue = v)) }
+                onSaveFinished()
+                showGlobalValueDialog = false
+            }
+        )
+    }
+
+    if (showAppPicker && node != null) {
+        Dialog(onDismissRequest = { showAppPicker = false }) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(470.dp)
+                    .frostedChrome(shape = RoundedCornerShape(24.dp), dense = true, elevation = 24.dp)
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Text("Escolher Aplicativo (${apps.size})", color = PrismColors.PureWhite, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                    Row {
+                        IconButton(onClick = { showAppSearchDialog = true }, modifier = Modifier.size(32.dp)) {
+                            Icon(MIcons.Rounded.Search, contentDescription = "Buscar", tint = PrismColors.PureWhite, modifier = Modifier.size(18.dp))
+                        }
+                        TextButton(onClick = { showAppPicker = false }) { Text("Fechar", color = PrismColors.MutedZinc) }
+                    }
+                }
+                val filtered = remember(apps, appQuery) {
+                    val q = appQuery.trim().lowercase()
+                    if (q.isEmpty()) apps else apps.filter { q in it.label.lowercase() || q in it.packageName.lowercase() }
+                }
+                LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(filtered, key = { it.packageName }) { app ->
+                        val sel = node.touch.targetPackage == app.packageName
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(if (sel) PrismColors.PureWhite else Color(0x16FFFFFF))
+                                .border(1.dp, if (sel) PrismColors.PureWhite else PrismColors.GlassBorder, RoundedCornerShape(12.dp))
+                                .clickable {
+                                    update {
+                                        it.copy(touch = it.touch.copy(type = TouchActionType.OPEN_APP, targetPackage = app.packageName, targetLabel = app.label))
+                                    }
+                                    onSaveFinished()
+                                    showAppPicker = false
+                                }
+                                .padding(horizontal = 12.dp, vertical = 9.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(app.label, color = if (sel) PrismColors.PureBlack else PrismColors.PureWhite, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(app.packageName, color = if (sel) PrismColors.PureBlack.copy(alpha = 0.7f) else PrismColors.MutedZinc, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (showAppSearchDialog) {
+            FocusedInputDialog(
+                title = "Filtrar Aplicativos",
+                initialValue = appQuery,
+                placeholder = "Spotify, WhatsApp, Câmera...",
+                exampleHint = "Deixe vazio para mostrar todos",
+                onDismiss = { showAppSearchDialog = false },
+                onConfirm = { q -> appQuery = q; showAppSearchDialog = false }
+            )
+        }
+    }
+}
+
+private fun globalTypeLabel(t: GlobalType): String = when (t) {
+    GlobalType.COLOR -> "Cor"
+    GlobalType.SWITCH -> "Interruptor"
+    GlobalType.NUMBER -> "Número"
+    GlobalType.TEXT -> "Texto"
+    GlobalType.LIST -> "Lista"
+}
+
+private fun List<LayerNode>.mapAllNodes(f: (LayerNode) -> LayerNode): List<LayerNode> = map { n ->
+    val next = f(n)
+    if (next.children.isEmpty()) next else next.copy(children = next.children.mapAllNodes(f))
+}
+
+@Composable
+private fun GlobalsTab(
+    project: Project,
+    wallPalette: List<Int>,
+    onSelectLayer: (String?) -> Unit,
+    onUpdateLayer: (String, (LayerNode) -> LayerNode) -> Unit,
+    onStageProject: (Project) -> Unit,
+    onCommitProject: (Project) -> Unit,
+    onSaveFinished: () -> Unit
+) {
+    var createPresetType by remember { mutableStateOf<GlobalType?>(null) }
+    var editingTextGlobal by remember { mutableStateOf<GlobalVar?>(null) }
+    var editingColorGlobal by remember { mutableStateOf<GlobalVar?>(null) }
+    val targetLayers = remember(project.layers) {
+        project.layers.flatten().map { it.first }.filter { it.type != LayerType.DEPTH }
+    }
+    val switchColors = SwitchDefaults.colors(
+        checkedThumbColor = PrismColors.PureBlack,
+        checkedTrackColor = PrismColors.PureWhite,
+        uncheckedThumbColor = PrismColors.MutedZinc,
+        uncheckedTrackColor = PrismColors.TrackZinc
+    )
+
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Button(
+                onClick = { createPresetType = GlobalType.COLOR },
+                colors = ButtonDefaults.buttonColors(containerColor = PrismColors.PureWhite, contentColor = PrismColors.PureBlack),
+                shape = RoundedCornerShape(14.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+            ) {
+                Icon(MIcons.Rounded.Add, null, Modifier.size(16.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("Nova Global", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            }
+            Text("${project.globals.size} variável(is)", fontSize = 11.sp, color = PrismColors.MutedZinc)
+        }
+
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf(
+                GlobalType.COLOR to "+ Cor",
+                GlobalType.SWITCH to "+ Interruptor",
+                GlobalType.TEXT to "+ Texto",
+                GlobalType.NUMBER to "+ Número",
+                GlobalType.LIST to "+ Lista"
+            ).forEach { (gt, lbl) ->
+                AssistChip(
+                    onClick = { createPresetType = gt },
+                    label = { Text(lbl, fontSize = 11.sp) },
+                    colors = AssistChipDefaults.assistChipColors(containerColor = Color(0x16FFFFFF), labelColor = PrismColors.PureWhite)
+                )
+            }
+        }
+
+        if (project.globals.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Color(0x12FFFFFF))
+                    .border(1.dp, PrismColors.GlassBorder, RoundedCornerShape(14.dp))
+                    .padding(14.dp)
+            ) {
+                Text(
+                    "Crie globais de Cor, Texto, Número, Interruptor ou Lista para controlar várias camadas ao mesmo tempo via \$gv(nome)\$.",
+                    fontSize = 11.sp,
+                    color = PrismColors.MutedZinc,
+                    lineHeight = 16.sp
+                )
+            }
+        } else {
+            project.globals.forEach { g ->
+                val gvExpr = "\$gv(${g.name})\$"
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color(0x14FFFFFF))
+                        .border(1.dp, PrismColors.GlassBorder, RoundedCornerShape(14.dp))
+                        .padding(horizontal = 12.dp, vertical = 9.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                        Column(Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(g.name, color = PrismColors.PureWhite, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    globalTypeLabel(g.type),
+                                    fontSize = 9.sp,
+                                    color = PrismColors.MutedZinc,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .background(Color(0x1EFFFFFF))
+                                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                            Text(gvExpr, color = PrismColors.MutedZinc, fontSize = 10.sp)
+                        }
+
+                        when (g.type) {
+                            GlobalType.SWITCH -> {
+                                val checked = g.value == "1" || g.value.equals("true", ignoreCase = true)
+                                Switch(
+                                    checked = checked,
+                                    onCheckedChange = { onCommitProject(project.setGlobalValue(g.name, if (it) "1" else "0")) },
+                                    colors = switchColors
+                                )
+                            }
+                            GlobalType.COLOR -> {
+                                val parsed = KustomFormulaEngine.evalColor(g.value, Env(), LocalDateTime.now()) ?: 0xFFFFFFFF.toInt()
+                                Box(
+                                    modifier = Modifier
+                                        .size(28.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(parsed))
+                                        .border(1.5.dp, PrismColors.PureWhite, CircleShape)
+                                        .clickable { editingColorGlobal = g }
+                                )
+                            }
+                            GlobalType.NUMBER -> {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    OutlinedButton(
+                                        onClick = { onCommitProject(project.cycleGlobal(g.name, -1)) },
+                                        contentPadding = PaddingValues(horizontal = 8.dp),
+                                        modifier = Modifier.height(28.dp)
+                                    ) { Text("-", fontSize = 12.sp, color = PrismColors.PureWhite) }
+                                    Text(
+                                        g.value,
+                                        color = PrismColors.PureWhite,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        modifier = Modifier.clickable { editingTextGlobal = g }.padding(horizontal = 4.dp)
+                                    )
+                                    OutlinedButton(
+                                        onClick = { onCommitProject(project.cycleGlobal(g.name, 1)) },
+                                        contentPadding = PaddingValues(horizontal = 8.dp),
+                                        modifier = Modifier.height(28.dp)
+                                    ) { Text("+", fontSize = 12.sp, color = PrismColors.PureWhite) }
+                                }
+                            }
+                            GlobalType.TEXT -> {
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(Color(0x1EFFFFFF))
+                                        .clickable { editingTextGlobal = g }
+                                        .padding(horizontal = 10.dp, vertical = 5.dp)
+                                ) {
+                                    Text(g.value.ifBlank { "(vazio)" }, color = PrismColors.PureWhite, fontSize = 11.sp, maxLines = 1)
+                                }
+                            }
+                            GlobalType.LIST -> Unit
+                        }
+
+                        IconButton(
+                            onClick = { onCommitProject(project.copy(globals = project.globals.filterNot { it.name.equals(g.name, ignoreCase = true) })) },
+                            modifier = Modifier.size(28.dp)
+                        ) {
+                            Icon(MIcons.Rounded.DeleteOutline, contentDescription = "Excluir global", tint = PrismColors.MutedZinc, modifier = Modifier.size(16.dp))
+                        }
+                    }
+
+                    if (g.type == GlobalType.LIST && g.options.isNotEmpty()) {
+                        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            g.options.forEach { opt ->
+                                val sel = g.value == opt
+                                FilterChip(
+                                    selected = sel,
+                                    onClick = { onCommitProject(project.setGlobalValue(g.name, opt)) },
+                                    label = { Text(opt, fontSize = 10.sp) },
+                                    colors = prismFilterChipColors(),
+                                    border = prismFilterChipBorder(sel)
+                                )
+                            }
+                        }
+                    }
+
+                    if (targetLayers.isNotEmpty()) {
+                        val compatibleLayers = when (g.type) {
+                            GlobalType.COLOR, GlobalType.SWITCH -> targetLayers
+                            GlobalType.TEXT, GlobalType.LIST -> targetLayers.filter { it.type == LayerType.TEXT }
+                            GlobalType.NUMBER -> targetLayers.filter {
+                                it.type == LayerType.TEXT || (it.type == LayerType.SHAPE && (it.shape == ShapeKind.BAR || it.shape == ShapeKind.RING))
+                            }
+                        }
+                        if (compatibleLayers.isNotEmpty()) {
+                            Text("Aplicar em:", fontSize = 10.sp, color = PrismColors.MutedZinc)
+                            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                if (g.type == GlobalType.COLOR) {
+                                    val allBound = compatibleLayers.all { it.fxColor == gvExpr }
+                                    FilterChip(
+                                        selected = allBound,
+                                        onClick = {
+                                            val nextExpr = if (allBound) "" else gvExpr
+                                            onCommitProject(
+                                                project.copy(
+                                                    layers = project.layers.mapAllNodes { n ->
+                                                        if (n.type == LayerType.DEPTH) n else n.copy(fxColor = nextExpr)
+                                                    }
+                                                )
+                                            )
+                                        },
+                                        label = { Text("Todas", fontSize = 10.sp) },
+                                        colors = prismFilterChipColors(),
+                                        border = prismFilterChipBorder(allBound)
+                                    )
+                                }
+                                compatibleLayers.forEach { layer ->
+                                    val bound = when (g.type) {
+                                        GlobalType.COLOR -> layer.fxColor == gvExpr
+                                        GlobalType.SWITCH -> layer.visibilityExpr == "\$gv(${g.name}) = 1\$"
+                                        GlobalType.TEXT, GlobalType.LIST -> gvExpr in layer.text
+                                        GlobalType.NUMBER -> if (layer.type == LayerType.SHAPE) layer.value == gvExpr else gvExpr in layer.text
+                                    }
+                                    FilterChip(
+                                        selected = bound,
+                                        onClick = {
+                                            onSelectLayer(layer.id)
+                                            when (g.type) {
+                                                GlobalType.COLOR -> onUpdateLayer(layer.id) {
+                                                    it.copy(fxColor = if (bound) "" else gvExpr)
+                                                }
+                                                GlobalType.SWITCH -> {
+                                                    val visExpr = "\$gv(${g.name}) = 1\$"
+                                                    onUpdateLayer(layer.id) {
+                                                        it.copy(visibilityExpr = if (bound) "" else visExpr)
+                                                    }
+                                                }
+                                                GlobalType.TEXT, GlobalType.LIST -> onUpdateLayer(layer.id) {
+                                                    it.copy(
+                                                        text = if (bound) {
+                                                            it.text.replace(gvExpr, "").trim()
+                                                        } else if (it.text.isBlank()) {
+                                                            gvExpr
+                                                        } else {
+                                                            it.text + gvExpr
+                                                        }
+                                                    )
+                                                }
+                                                GlobalType.NUMBER -> onUpdateLayer(layer.id) {
+                                                    if (it.type == LayerType.SHAPE) {
+                                                        it.copy(value = if (bound) "bat" else gvExpr)
+                                                    } else {
+                                                        it.copy(
+                                                            text = if (bound) {
+                                                                it.text.replace(gvExpr, "").trim()
+                                                            } else if (it.text.isBlank()) {
+                                                                gvExpr
+                                                            } else {
+                                                                it.text + gvExpr
+                                                            }
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                            onSaveFinished()
+                                        },
+                                        label = { Text(layer.name, fontSize = 10.sp) },
+                                        colors = prismFilterChipColors(),
+                                        border = prismFilterChipBorder(bound)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    createPresetType?.let { initialType ->
+        CreateGlobalDialog(
+            initialType = initialType,
+            wallPalette = wallPalette,
+            onDismiss = { createPresetType = null },
+            onCreate = { newVar ->
+                val nextList = project.globals.filterNot { it.name.equals(newVar.name, ignoreCase = true) } + newVar
+                onCommitProject(project.copy(globals = nextList))
+                createPresetType = null
+            }
+        )
+    }
+
+    editingTextGlobal?.let { g ->
+        FocusedInputDialog(
+            title = "Valor de ${g.name}",
+            initialValue = g.value,
+            placeholder = if (g.type == GlobalType.NUMBER) "100" else "Valor",
+            exampleHint = "Altera todos os itens que usam \$gv(${g.name})\$",
+            keyboardType = if (g.type == GlobalType.NUMBER) KeyboardType.Decimal else KeyboardType.Text,
+            allowNegative = true,
+            onDismiss = { editingTextGlobal = null },
+            onConfirm = { raw ->
+                onCommitProject(project.setGlobalValue(g.name, raw.trim()))
+                editingTextGlobal = null
+            }
+        )
+    }
+
+    editingColorGlobal?.let { g ->
+        val liveGlobal = project.globals.firstOrNull { it.name.equals(g.name, ignoreCase = true) } ?: g
+        val curColor = KustomFormulaEngine.evalColor(liveGlobal.value, Env(), LocalDateTime.now()) ?: 0xFFFFFFFF.toInt()
+        Dialog(onDismissRequest = { onSaveFinished(); editingColorGlobal = null }) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .frostedChrome(shape = RoundedCornerShape(24.dp), dense = true, elevation = 24.dp)
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text("Cor Global · ${g.name}", color = PrismColors.PureWhite, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                ColorPickerPanel(g.name, curColor, wallPalette, initiallyExpanded = true) { newArgb ->
+                    val hex = String.format("#%08X", newArgb)
+                    val updated = project.setGlobalValue(g.name, hex)
+                    onStageProject(updated)
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    TextButton(onClick = { onSaveFinished(); editingColorGlobal = null }) { Text("Concluir", color = PrismColors.PureWhite) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CreateGlobalDialog(
+    initialType: GlobalType = GlobalType.SWITCH,
+    wallPalette: List<Int> = emptyList(),
+    onDismiss: () -> Unit,
+    onCreate: (GlobalVar) -> Unit
+) {
+    var name by remember {
+        mutableStateOf(
+            when (initialType) {
+                GlobalType.COLOR -> "cor_destaque"
+                GlobalType.SWITCH -> "painel"
+                GlobalType.NUMBER -> "valor"
+                GlobalType.TEXT -> "titulo"
+                GlobalType.LIST -> "modo"
+            }
+        )
+    }
+    var type by remember { mutableStateOf(initialType) }
+    var value by remember {
+        mutableStateOf(
+            when (initialType) {
+                GlobalType.COLOR -> "#FFFFFFFF"
+                GlobalType.SWITCH -> "0"
+                GlobalType.NUMBER -> "50"
+                GlobalType.TEXT -> "PrismLock"
+                GlobalType.LIST -> ""
+            }
+        )
+    }
+    var pickedColor by remember { mutableStateOf(wallPalette.firstOrNull() ?: 0xFFFFFFFF.toInt()) }
+    var optionsRaw by remember { mutableStateOf("Clima,Bateria,Música") }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .frostedChrome(shape = RoundedCornerShape(24.dp), dense = true, elevation = 24.dp)
+                .padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text("Nova Variável Global (\$gv\$)", color = PrismColors.PureWhite, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                GlobalType.entries.forEach { gt ->
+                    val sel = type == gt
+                    FilterChip(
+                        selected = sel,
+                        onClick = {
+                            type = gt
+                            value = when (gt) {
+                                GlobalType.COLOR -> String.format("#%08X", pickedColor)
+                                GlobalType.SWITCH -> "0"
+                                GlobalType.NUMBER -> "50"
+                                GlobalType.TEXT -> "PrismLock"
+                                GlobalType.LIST -> ""
+                            }
+                        },
+                        label = { Text(globalTypeLabel(gt), fontSize = 11.sp) },
+                        colors = prismFilterChipColors(),
+                        border = prismFilterChipBorder(sel)
+                    )
+                }
+            }
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it },
+                label = { Text("Nome (sem espaços, ex: cor_destaque)", fontSize = 11.sp) },
+                singleLine = true,
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedTextColor = PrismColors.PureWhite,
+                    unfocusedTextColor = PrismColors.PureWhite,
+                    focusedBorderColor = PrismColors.PureWhite,
+                    unfocusedBorderColor = PrismColors.GlassBorder
+                ),
+                modifier = Modifier.fillMaxWidth()
+            )
+            when (type) {
+                GlobalType.COLOR -> {
+                    ColorPickerPanel("Cor Inicial", pickedColor, wallPalette, initiallyExpanded = true) { argb ->
+                        pickedColor = argb
+                        value = String.format("#%08X", argb)
+                    }
+                }
+                GlobalType.LIST -> {
+                    OutlinedTextField(
+                        value = optionsRaw,
+                        onValueChange = { optionsRaw = it },
+                        label = { Text("Opções separadas por vírgula", fontSize = 11.sp) },
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = PrismColors.PureWhite,
+                            unfocusedTextColor = PrismColors.PureWhite,
+                            focusedBorderColor = PrismColors.PureWhite,
+                            unfocusedBorderColor = PrismColors.GlassBorder
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                else -> {
+                    OutlinedTextField(
+                        value = value,
+                        onValueChange = { value = it },
+                        label = { Text("Valor inicial", fontSize = 11.sp) },
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = PrismColors.PureWhite,
+                            unfocusedTextColor = PrismColors.PureWhite,
+                            focusedBorderColor = PrismColors.PureWhite,
+                            unfocusedBorderColor = PrismColors.GlassBorder
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = onDismiss) { Text("Cancelar", color = PrismColors.MutedZinc) }
+                Spacer(Modifier.width(6.dp))
+                Button(
+                    onClick = {
+                        val cleanName = name.trim().replace(" ", "_")
+                        if (cleanName.isNotEmpty()) {
+                            val opts = if (type == GlobalType.LIST) optionsRaw.split(",").map { it.trim() }.filter { it.isNotEmpty() } else emptyList()
+                            val initVal = when (type) {
+                                GlobalType.LIST -> opts.firstOrNull().orEmpty()
+                                GlobalType.COLOR -> String.format("#%08X", pickedColor)
+                                else -> value.trim()
+                            }
+                            onCreate(GlobalVar(name = cleanName, type = type, value = initVal, options = opts))
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = PrismColors.PureWhite, contentColor = PrismColors.PureBlack)
+                ) { Text("Criar Global", fontWeight = FontWeight.SemiBold) }
             }
         }
     }
@@ -1383,6 +2316,7 @@ private fun TypeTab(
 @Composable
 private fun PaintTab(
     allLayers: List<LayerNode>,
+    colorGlobals: List<GlobalVar> = emptyList(),
     node: LayerNode?,
     wallPalette: List<Int>,
     onSelect: (String) -> Unit,
@@ -1432,6 +2366,32 @@ private fun PaintTab(
 
             if (node.fill == Fill.SOLID || node.fill == Fill.GRADIENT || node.fill == Fill.HOLLOW) {
                 ColorPickerPanel("Cor Principal", node.color, wallPalette) { c -> update { it.copy(color = c) } }
+            }
+            if (colorGlobals.isNotEmpty()) {
+                Text("Globais de Cor (\$gv\$)", fontSize = 11.sp, color = PrismColors.MutedZinc)
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    colorGlobals.forEach { cg ->
+                        val expr = "\$gv(${cg.name})\$"
+                        val bound = node.fxColor == expr
+                        val argb = KustomFormulaEngine.evalColor(cg.value, Env(), LocalDateTime.now()) ?: 0xFFFFFFFF.toInt()
+                        Row(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(if (bound) Color(0x28FFFFFF) else Color(0x14FFFFFF))
+                                .border(1.dp, if (bound) PrismColors.PureWhite else PrismColors.GlassBorder, RoundedCornerShape(12.dp))
+                                .clickable {
+                                    update { it.copy(fxColor = if (bound) "" else expr) }
+                                    onSaveFinished()
+                                }
+                                .padding(horizontal = 9.dp, vertical = 5.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Box(Modifier.size(14.dp).clip(CircleShape).background(Color(argb)).border(1.dp, PrismColors.PureWhite, CircleShape))
+                            Text(cg.name, fontSize = 11.sp, color = PrismColors.PureWhite)
+                        }
+                    }
+                }
             }
             if (node.fill == Fill.GRADIENT || (node.fill == Fill.HOLLOW && node.color2 != node.color)) {
                 ColorPickerPanel("Cor Secundária", node.color2, wallPalette) { c -> update { it.copy(color2 = c) } }
@@ -1659,7 +2619,7 @@ private fun PositionAndSafTab(
                         value = withContext(Dispatchers.IO) { WallpaperCarousel.isVideoUri(ctx, uriStr) }
                     }
                     val isSelected = uriStr == activePreviewUri
-                    val is3dOn = !isVideo && project.isDepthEnabledFor(imageKey)
+                    val is3dOn = !isVideo && project.depth && project.isDepthEnabledFor(imageKey)
                     Box(
                         modifier = Modifier
                             .width(86.dp)
@@ -1754,21 +2714,19 @@ private fun PositionAndSafTab(
             }
         }
 
-        if (!activeIsVideo) {
+        val activeGalleryItem = galleryItems.firstOrNull { it.first == activePreviewUri } ?: galleryItems.firstOrNull()
+        val activeImage3dOn = activeGalleryItem != null && !activeIsVideo && project.depth && project.isDepthEnabledFor(activeGalleryItem.second)
+
+        if (activeImage3dOn) {
             StudioSection(
                 title = "Profundidade 3D (Bokeh & Color Pop)",
-                summary = if (!project.depth) "Desativado" else if (project.hasDepthPostProcessing()) "Personalizado" else "Natural",
+                summary = if (project.hasDepthPostProcessing()) "Personalizado" else "Natural",
                 initiallyExpanded = true
             ) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("Segmentação 3D (ML Kit)", fontSize = 12.sp, color = PrismColors.PureWhite)
-                    Switch(checked = project.depth, onCheckedChange = { onCommit(project.copy(depth = it)) }, colors = switchColors)
+                    Text("Proteção Cobertura Relógio", fontSize = 12.sp, color = PrismColors.MutedZinc)
+                    Switch(checked = project.depthGuard, onCheckedChange = { onCommit(project.copy(depthGuard = it)) }, colors = switchColors)
                 }
-                if (project.depth) {
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text("Proteção Cobertura Relógio", fontSize = 12.sp, color = PrismColors.MutedZinc)
-                        Switch(checked = project.depthGuard, onCheckedChange = { onCommit(project.copy(depthGuard = it)) }, colors = switchColors)
-                    }
                     QuickPresetRow(
                         items = listOf(
                             "Original" to {
@@ -1801,7 +2759,6 @@ private fun PositionAndSafTab(
                     PrecisionSliderField("Vinheta & Halo 3D", project.depthVignette * 100f, 0f..100f, "%", 0, onSaveFinished) { v ->
                         onStage(project.copy(depthVignette = (v / 100f).coerceIn(0f, 1f)))
                     }
-                }
             }
         }
 

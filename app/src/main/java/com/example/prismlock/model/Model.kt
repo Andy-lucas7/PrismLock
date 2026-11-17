@@ -14,6 +14,47 @@ import java.util.UUID
 @Serializable enum class Align { START, CENTER, END }
 
 @Serializable
+enum class TouchActionType {
+    NONE,
+    OPEN_APP,
+    OPEN_URL,
+    TOGGLE_GLOBAL,
+    SET_GLOBAL,
+    NEXT_GLOBAL_LIST,
+    NEXT_WALLPAPER,
+    MEDIA_PLAY_PAUSE,
+    MEDIA_NEXT,
+    MEDIA_PREV,
+    SYSTEM_ALARM,
+    SYSTEM_CAMERA,
+    SYSTEM_SETTINGS,
+    OPEN_PRISMLOCK
+}
+
+@Serializable
+data class TouchAction(
+    val type: TouchActionType = TouchActionType.NONE,
+    val targetPackage: String = "",
+    val targetLabel: String = "",
+    val url: String = "",
+    val globalName: String = "",
+    val globalValue: String = ""
+) {
+    val isActive: Boolean get() = type != TouchActionType.NONE
+}
+
+@Serializable
+enum class GlobalType { SWITCH, NUMBER, TEXT, COLOR, LIST }
+
+@Serializable
+data class GlobalVar(
+    val name: String,
+    val type: GlobalType = GlobalType.SWITCH,
+    val value: String = "0",
+    val options: List<String> = emptyList()
+)
+
+@Serializable
 data class Glass(
     val blur: Float = 26f,
     val refraction: Float = 36f,
@@ -80,8 +121,24 @@ data class LayerNode(
     val dir: Dir = Dir.VERTICAL,
     val spacing: Float = 12f,
     val parentId: String? = null,
-    val children: List<LayerNode> = emptyList()
-)
+    val children: List<LayerNode> = emptyList(),
+    val touch: TouchAction = TouchAction(),
+    val visibilityExpr: String = "",
+    val fxColor: String = "",
+    val fxOpacity: String = "",
+    val fxRotation: String = "",
+    val fxScale: String = "",
+    val fxOffsetX: String = "",
+    val fxOffsetY: String = ""
+) {
+    fun hasFx(): Boolean =
+        fxColor.isNotEmpty() ||
+            fxOpacity.isNotEmpty() ||
+            fxRotation.isNotEmpty() ||
+            fxScale.isNotEmpty() ||
+            fxOffsetX.isNotEmpty() ||
+            fxOffsetY.isNotEmpty()
+}
 
 @Serializable
 data class Project(
@@ -105,13 +162,80 @@ data class Project(
     val city: String = "",
     val lat: Double = -23.55,
     val lon: Double = -46.63,
-    val dim: Float = 0.12f
+    val dim: Float = 0.12f,
+    val globals: List<GlobalVar> = emptyList()
 ) {
     fun isDepthEnabledFor(imageKey: String): Boolean =
         depthOverrides[imageKey] ?: defaultDepthForNewImages
 
     fun hasDepthPostProcessing(): Boolean =
         depth && (depthBgBlur > 0.01f || depthBgDesaturate > 0.01f || depthSubjectPop > 0.01f || depthVignette > 0.01f)
+
+    fun globalsMap(): Map<String, String> =
+        if (globals.isEmpty()) emptyMap() else globals.associate { it.name.lowercase() to it.value }
+
+    fun toggleGlobal(name: String): Project {
+        val key = name.trim()
+        if (key.isEmpty()) return this
+        val idx = globals.indexOfFirst { it.name.equals(key, ignoreCase = true) }
+        val updated = if (idx < 0) {
+            globals + GlobalVar(name = key, type = GlobalType.SWITCH, value = "1")
+        } else {
+            val g = globals[idx]
+            val nextVal = when (g.type) {
+                GlobalType.SWITCH -> if (g.value == "1" || g.value.equals("true", ignoreCase = true)) "0" else "1"
+                GlobalType.LIST -> {
+                    val opts = g.options
+                    if (opts.isEmpty()) g.value else opts[(opts.indexOf(g.value) + 1) % opts.size]
+                }
+                GlobalType.NUMBER -> ((g.value.toDoubleOrNull() ?: 0.0) + 1.0).let {
+                    if (it == kotlin.math.floor(it)) it.toLong().toString() else it.toString()
+                }
+                GlobalType.TEXT -> if (g.value.isEmpty()) "1" else ""
+                GlobalType.COLOR -> {
+                    val opts = g.options
+                    if (opts.size >= 2) opts[(opts.indexOf(g.value) + 1) % opts.size] else g.value
+                }
+            }
+            globals.toMutableList().apply { set(idx, g.copy(value = nextVal)) }
+        }
+        return copy(globals = updated)
+    }
+
+    fun cycleGlobal(name: String, step: Int = 1): Project {
+        val key = name.trim()
+        if (key.isEmpty()) return this
+        val idx = globals.indexOfFirst { it.name.equals(key, ignoreCase = true) }
+        if (idx < 0) return toggleGlobal(key)
+        val g = globals[idx]
+        val nextVal = when (g.type) {
+            GlobalType.LIST -> {
+                val opts = g.options
+                if (opts.isEmpty()) g.value else {
+                    val cur = opts.indexOf(g.value).coerceAtLeast(0)
+                    opts[((cur + step) % opts.size + opts.size) % opts.size]
+                }
+            }
+            GlobalType.SWITCH -> if (g.value == "1") "0" else "1"
+            GlobalType.NUMBER -> ((g.value.toDoubleOrNull() ?: 0.0) + step).let {
+                if (it == kotlin.math.floor(it)) it.toLong().toString() else it.toString()
+            }
+            GlobalType.TEXT, GlobalType.COLOR -> g.value
+        }
+        return copy(globals = globals.toMutableList().apply { set(idx, g.copy(value = nextVal)) })
+    }
+
+    fun setGlobalValue(name: String, value: String): Project {
+        val key = name.trim()
+        if (key.isEmpty()) return this
+        val idx = globals.indexOfFirst { it.name.equals(key, ignoreCase = true) }
+        val updated = if (idx < 0) {
+            globals + GlobalVar(name = key, type = GlobalType.TEXT, value = value)
+        } else {
+            globals.toMutableList().apply { set(idx, globals[idx].copy(value = value)) }
+        }
+        return copy(globals = updated)
+    }
 }
 
 fun LayerNode.copyDeep(newParentId: String? = null): LayerNode {

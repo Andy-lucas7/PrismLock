@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.location.LocationManager
+import android.media.AudioManager
 import android.os.BatteryManager
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
@@ -190,7 +191,10 @@ data class Env(
     val city: String = "",
     val alarm: String = "",
     val steps: Int = 0,
-    val locked: Boolean = true
+    val locked: Boolean = true,
+    val mediaVolume: Int = 50,
+    val mediaPlaying: Boolean = false,
+    val ringerMode: Int = AudioManager.RINGER_MODE_NORMAL
 )
 
 object EnvProvider {
@@ -229,6 +233,19 @@ object EnvProvider {
         val next = am?.nextAlarmClock
         val s = next?.let { DateTimeFormatter.ofPattern("HH:mm").format(Instant.ofEpochMilli(it.triggerTime).atZone(ZoneId.systemDefault())) } ?: ""
         update { it.copy(alarm = s) }
+    }
+
+    fun refreshAudio(ctx: Context): Boolean {
+        val am = ctx.getSystemService(AudioManager::class.java) ?: return false
+        val maxVol = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+        val curVol = am.getStreamVolume(AudioManager.STREAM_MUSIC).coerceIn(0, maxVol)
+        val pct = (curVol * 100f / maxVol).toInt().coerceIn(0, 100)
+        val playing = am.isMusicActive
+        val ringer = am.ringerMode
+        val old = _env.value
+        if (old.mediaVolume == pct && old.mediaPlaying == playing && old.ringerMode == ringer) return false
+        _env.value = old.copy(mediaVolume = pct, mediaPlaying = playing, ringerMode = ringer)
+        return true
     }
 
     @SuppressLint("MissingPermission")

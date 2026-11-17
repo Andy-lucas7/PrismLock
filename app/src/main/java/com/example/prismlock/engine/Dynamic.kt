@@ -1,6 +1,9 @@
 package com.example.prismlock.engine
 
 import com.example.prismlock.data.Env
+import com.example.prismlock.model.LayerNode
+import com.example.prismlock.model.Project
+import com.example.prismlock.model.flatten
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
@@ -28,32 +31,66 @@ object Dynamic {
         in 51..57 -> "Garoa"; in 61..67, in 80..82 -> "Chuva"; in 71..77, 85, 86 -> "Neve"; in 95..99 -> "Tempestade"; else -> "—"
     }
 
-    fun vars(env: Env, now: LocalDateTime): Map<String, Double> {
+    fun vars(env: Env, now: LocalDateTime, globals: Map<String, String> = emptyMap()): Map<String, Double> {
         val secs = now.toLocalTime().toSecondOfDay()
-        return mapOf(
-            "bat" to env.battery.toDouble(), "charging" to if (env.charging) 1.0 else 0.0, "temp" to (env.temp ?: 0).toDouble(),
-            "steps" to env.steps.toDouble(), "wcode" to env.weatherCode.toDouble(), "isday" to if (env.isDay) 1.0 else 0.0,
-            "hour" to now.hour.toDouble(), "minute" to now.minute.toDouble(), "second" to now.second.toDouble(),
-            "day" to now.dayOfMonth.toDouble(), "month" to now.monthValue.toDouble(), "dow" to now.dayOfWeek.value.toDouble(),
-            "dayprog" to secs / 864.0, "hourprog" to (now.minute * 60 + now.second) / 36.0, "locked" to if (env.locked) 1.0 else 0.0,
-            "pi" to Math.PI
-        )
+        val base = HashMap<String, Double>(24 + globals.size)
+        base["bat"] = env.battery.toDouble()
+        base["charging"] = if (env.charging) 1.0 else 0.0
+        base["temp"] = (env.temp ?: 0).toDouble()
+        base["steps"] = env.steps.toDouble()
+        base["wcode"] = env.weatherCode.toDouble()
+        base["isday"] = if (env.isDay) 1.0 else 0.0
+        base["hour"] = now.hour.toDouble()
+        base["minute"] = now.minute.toDouble()
+        base["second"] = now.second.toDouble()
+        base["day"] = now.dayOfMonth.toDouble()
+        base["month"] = now.monthValue.toDouble()
+        base["dow"] = now.dayOfWeek.value.toDouble()
+        base["dayprog"] = secs / 864.0
+        base["hourprog"] = (now.minute * 60 + now.second) / 36.0
+        base["locked"] = if (env.locked) 1.0 else 0.0
+        base["pi"] = Math.PI
+        globals.forEach { (k, v) ->
+            v.toDoubleOrNull()?.let { base[k.lowercase()] = it }
+        }
+        return base
     }
 
-    fun eval(text: String, env: Env, now: LocalDateTime): String {
+    fun hasSeconds(node: LayerNode): Boolean =
+        KustomFormulaEngine.hasSecondsToken(node.text) ||
+            KustomFormulaEngine.hasSecondsToken(node.value) ||
+            KustomFormulaEngine.hasSecondsToken(node.visibilityExpr) ||
+            KustomFormulaEngine.hasSecondsToken(node.fxColor) ||
+            KustomFormulaEngine.hasSecondsToken(node.fxOpacity) ||
+            KustomFormulaEngine.hasSecondsToken(node.fxRotation) ||
+            KustomFormulaEngine.hasSecondsToken(node.fxScale) ||
+            KustomFormulaEngine.hasSecondsToken(node.fxOffsetX) ||
+            KustomFormulaEngine.hasSecondsToken(node.fxOffsetY) ||
+            KustomFormulaEngine.hasSecondsToken(node.icon)
+
+    fun hasSeconds(project: Project): Boolean =
+        project.layers.flatten().any { (n, _) -> !n.hidden && hasSeconds(n) }
+
+    fun eval(
+        text: String,
+        env: Env,
+        now: LocalDateTime,
+        globals: Map<String, String> = emptyMap()
+    ): String {
         val hasDollar = '$' in text
         val hasBraces = '{' in text
         if (!hasDollar && !hasBraces) return text
         val hasSec = KustomFormulaEngine.hasSecondsToken(text)
-        val stamp = if (hasSec) "${now.withNano(0)}|$env" else "${now.withSecond(0).withNano(0)}|$env"
+        val gHash = globals.hashCode()
+        val stamp = if (hasSec) "${now.withNano(0)}|$env|$gHash" else "${now.withSecond(0).withNano(0)}|$env|$gHash"
         if (stamp != cacheStamp) { textCache.clear(); cacheStamp = stamp }
         textCache[text]?.let { return it }
 
-        var cur = if (hasDollar) KustomFormulaEngine.evalDollarBlocks(text, env, now) else text
+        var cur = if (hasDollar) KustomFormulaEngine.evalDollarBlocks(text, env, now, globals) else text
         if ('{' !in cur) {
             return cur.also { textCache[text] = it }
         }
-        val v by lazy { vars(env, now) }
+        val v by lazy { vars(env, now, globals) }
         val sb = StringBuilder()
         var i = 0
         while (i < cur.length) {
@@ -61,14 +98,20 @@ object Dynamic {
             if (c == '{') {
                 val j = cur.indexOf('}', i + 1)
                 if (j < 0) { sb.append(cur, i, cur.length); break }
-                sb.append(tag(cur.substring(i + 1, j), env, now) { v })
+                sb.append(tag(cur.substring(i + 1, j), env, now, globals) { v })
                 i = j + 1
             } else { sb.append(c); i++ }
         }
         return sb.toString().also { textCache[text] = it }
     }
 
-    private fun tag(raw: String, env: Env, now: LocalDateTime, v: () -> Map<String, Double>): String {
+    private fun tag(
+        raw: String,
+        env: Env,
+        now: LocalDateTime,
+        globals: Map<String, String> = emptyMap(),
+        v: () -> Map<String, Double>
+    ): String {
         var t = raw; var case = 0
         if (t.endsWith("_UPPER")) { t = t.removeSuffix("_UPPER"); case = 1 } else if (t.endsWith("_LOWER")) { t = t.removeSuffix("_LOWER"); case = 2 }
         val out = when {
@@ -82,8 +125,12 @@ object Dynamic {
             t == "steps" -> env.steps.toString()
             t == "dayprog" -> (v()["dayprog"] ?: 0.0).toInt().toString()
             else -> {
-                val f = fmtCache.getOrPut(t) { runCatching { DateTimeFormatter.ofPattern(t, Locale.getDefault()) }.getOrNull() }
-                f?.let { runCatching { it.format(now) }.getOrNull() } ?: "{$raw}"
+                globals[t.trim().lowercase()]?.let { gVal ->
+                    if ('$' in gVal) KustomFormulaEngine.evalDollarBlocks(gVal, env, now, globals) else gVal
+                } ?: run {
+                    val f = fmtCache.getOrPut(t) { runCatching { DateTimeFormatter.ofPattern(t, Locale.getDefault()) }.getOrNull() }
+                    f?.let { runCatching { it.format(now) }.getOrNull() } ?: "{$raw}"
+                }
             }
         }
         return when (case) { 1 -> out.uppercase(); 2 -> out.lowercase(); else -> out }
@@ -95,12 +142,18 @@ object Dynamic {
         else -> "%.1f".format(d)
     }
 
-    fun number(expr: String, env: Env, now: LocalDateTime): Double {
-        if ('$' in expr) {
-            KustomFormulaEngine.evalNumeric(expr, env, now)?.let { return it }
+    fun number(
+        expr: String,
+        env: Env,
+        now: LocalDateTime,
+        globals: Map<String, String> = emptyMap()
+    ): Double {
+        if ('$' in expr || '{' in expr || '(' in expr) {
+            KustomFormulaEngine.evalNumeric(expr, env, now, globals)?.let { return it }
         }
         val e = expr.trim().removePrefix("{").removeSuffix("}").removePrefix("=")
-        return runCatching { Expr(e, vars(env, now)).parse() }.getOrDefault(0.0)
+        globals[e.lowercase()]?.toDoubleOrNull()?.let { return it }
+        return runCatching { Expr(e, vars(env, now, globals)).parse() }.getOrDefault(0.0)
     }
 }
 

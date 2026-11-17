@@ -2,6 +2,7 @@ package com.example.prismlock.wallpaper
 
 import android.animation.ValueAnimator
 import android.app.KeyguardManager
+import android.app.WallpaperManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -9,6 +10,7 @@ import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PorterDuff
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
@@ -22,7 +24,9 @@ import com.example.prismlock.data.EnvProvider
 import com.example.prismlock.data.ProjectStore
 import com.example.prismlock.data.launchSafe
 import com.example.prismlock.engine.FontManager
+import com.example.prismlock.engine.HitBox
 import com.example.prismlock.engine.LiquidGlassRenderer
+import com.example.prismlock.engine.TouchActionExecutor
 import com.example.prismlock.engine.WallpaperBaker
 import com.example.prismlock.model.Cond
 import com.example.prismlock.model.LayerType
@@ -93,6 +97,13 @@ class PrismWallpaperService : WallpaperService() {
         private var wakeProgress = 1f
         private var lockAlpha = 1f
         private var lastTapMs = 0L
+        private var touchDownX = 0f
+        private var touchDownY = 0f
+        private var touchDownMs = 0L
+        private var touchMoved = false
+        private var lastActionTapMs = 0L
+        @Volatile private var activeHits: List<HitBox> = emptyList()
+        private val videoHitsBuffer = ArrayList<HitBox>()
 
         private val mainHandler = Handler(Looper.getMainLooper())
         private val frameDrawPending = AtomicBoolean(false)
@@ -126,6 +137,12 @@ class PrismWallpaperService : WallpaperService() {
                     }
                     Intent.ACTION_USER_PRESENT -> {
                         EnvProvider.update { it.copy(locked = false) }
+                        if (!hasOnlyLockLayers()) {
+                            scope.launchSafe {
+                                ensureBakedMinuteScene(force = true)
+                                if (surfaceVisible && isVisible && isCurrentEngine()) drawOnce()
+                            }
+                        }
                         if (surfaceVisible && isVisible) {
                             startUnlockFade()
                         } else {
@@ -196,6 +213,7 @@ class PrismWallpaperService : WallpaperService() {
 
             EnvProvider.refreshBattery(this@PrismWallpaperService)
             EnvProvider.refreshAlarm(this@PrismWallpaperService)
+            EnvProvider.refreshAudio(this@PrismWallpaperService)
             EnvProvider.update { it.copy(locked = isDeviceLocked()) }
 
             bakeVersionJob = scope.launchSafe {
@@ -251,6 +269,7 @@ class PrismWallpaperService : WallpaperService() {
             if (visible) {
                 claimEngineSlot()
                 surfaceVisible = true
+                EnvProvider.refreshAudio(this@PrismWallpaperService)
                 val locked = isDeviceLocked()
                 EnvProvider.update { it.copy(locked = locked) }
                 if (locked) {
@@ -303,20 +322,110 @@ class PrismWallpaperService : WallpaperService() {
         }
 
         override fun onTouchEvent(event: MotionEvent) {
-            if (isCurrentEngine() && event.actionMasked == MotionEvent.ACTION_DOWN && project.changeOnDoubleTap && surfaceVisible && isVisible) {
+            if (!isCurrentEngine() || !surfaceVisible || !isVisible) {
+                super.onTouchEvent(event)
+                return
+            }
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    touchDownX = event.x
+                    touchDownY = event.y
+                    touchDownMs = SystemClock.uptimeMillis()
+                    touchMoved = false
+                    val hitNode = findActionableAt(event.x, event.y)
+                    if (hitNode == null && project.changeOnDoubleTap) {
+                        val now = SystemClock.uptimeMillis()
+                        if (now - lastTapMs in 50L..320L) {
+                            lastTapMs = 0L
+                            scope.launchSafe {
+                                loadWallpaperAndMask(advance = true, checkInterval = false)
+                                ensureBakedMinuteScene(force = true)
+                                if (surfaceVisible && isVisible && isCurrentEngine()) drawOnce()
+                            }
+                        } else {
+                            lastTapMs = now
+                        }
+                    }
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (!touchMoved) {
+                        val dx = event.x - touchDownX
+                        val dy = event.y - touchDownY
+                        if (dx * dx + dy * dy > 32f * 32f) touchMoved = true
+                    }
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!touchMoved && SystemClock.uptimeMillis() - touchDownMs < 450L) {
+                        if (handleLayerTap(event.x, event.y)) {
+                            lastActionTapMs = SystemClock.uptimeMillis()
+                        }
+                    }
+                }
+            }
+            super.onTouchEvent(event)
+        }
+
+        override fun onCommand(
+            action: String?,
+            x: Int,
+            y: Int,
+            z: Int,
+            extras: Bundle?,
+            resultRequested: Boolean
+        ): Bundle? {
+            if (isCurrentEngine() && action == WallpaperManager.COMMAND_TAP && surfaceVisible && isVisible) {
                 val now = SystemClock.uptimeMillis()
-                if (now - lastTapMs in 50L..320L) {
-                    lastTapMs = 0L
+                if (now - lastActionTapMs > 180L && handleLayerTap(x.toFloat(), y.toFloat())) {
+                    lastActionTapMs = now
+                }
+            }
+            return super.onCommand(action, x, y, z, extras, resultRequested)
+        }
+
+        private fun findActionableAt(rawX: Float, rawY: Float): com.example.prismlock.model.LayerNode? {
+            val hits = activeHits
+            if (hits.isEmpty()) return null
+            val frame = surfaceHolder.surfaceFrame
+            val viewW = frame.width().coerceAtLeast(1).toFloat()
+            val viewH = frame.height().coerceAtLeast(1).toFloat()
+            val baseX = rawX * (baseW / viewW)
+            val baseY = rawY * (baseH / viewH)
+            return TouchActionExecutor.hitTestActionable(hits, project.layers, baseX, baseY)
+        }
+
+        private fun handleLayerTap(rawX: Float, rawY: Float): Boolean {
+            val hitNode = findActionableAt(rawX, rawY) ?: return false
+            val env = EnvProvider.env.value.copy(locked = if (isPreview) true else isDeviceLocked())
+            return TouchActionExecutor.execute(
+                ctx = this@PrismWallpaperService,
+                node = hitNode,
+                project = project,
+                env = env,
+                now = LocalDateTime.now(),
+                onMutateProject = { updated ->
+                    project = updated
+                    scope.launchSafe {
+                        ProjectStore.save(this@PrismWallpaperService, updated)
+                        ensureBakedMinuteScene(force = true)
+                        if (surfaceVisible && isVisible && isCurrentEngine()) drawOnce()
+                    }
+                },
+                onNextWallpaper = {
                     scope.launchSafe {
                         loadWallpaperAndMask(advance = true, checkInterval = false)
                         ensureBakedMinuteScene(force = true)
                         if (surfaceVisible && isVisible && isCurrentEngine()) drawOnce()
                     }
-                } else {
-                    lastTapMs = now
+                }
+            ).also {
+                scope.launchSafe {
+                    delay(120L)
+                    if (EnvProvider.refreshAudio(this@PrismWallpaperService) && surfaceVisible && isVisible && isCurrentEngine()) {
+                        ensureBakedMinuteScene(force = true)
+                        drawOnce()
+                    }
                 }
             }
-            super.onTouchEvent(event)
         }
 
         override fun onDestroy() {
@@ -509,8 +618,8 @@ class PrismWallpaperService : WallpaperService() {
                 return@withLock
             }
             val now = LocalDateTime.now()
-            val env = EnvProvider.env.value.copy(locked = true)
-            val key = "${loadedBakeVersion}|${currentUri}|${baseW}x${baseH}|${now.year}-${now.dayOfYear}-${now.hour}:${now.minute}|${env.battery}|${env.charging}|${env.temp}|${env.weatherCode}|${project.hashCode()}|${depthMask != null}"
+            val env = EnvProvider.env.value.copy(locked = if (isPreview) true else isDeviceLocked())
+            val key = "${loadedBakeVersion}|${currentUri}|${baseW}x${baseH}|${now.year}-${now.dayOfYear}-${now.hour}:${now.minute}|${env.locked}|${env.battery}|${env.charging}|${env.temp}|${env.weatherCode}|${env.mediaVolume}|${env.mediaPlaying}|${project.hashCode()}|${depthMask != null}"
             if (!force && key == cachedSceneKey && cachedScene != null) return@withLock
 
             val sharp = bgBitmap
@@ -520,6 +629,7 @@ class PrismWallpaperService : WallpaperService() {
             val proj = project
             val bw = baseW
             val bh = baseH
+            val freshHits = ArrayList<HitBox>()
             val scene = withContext(Dispatchers.Default) {
                 renderer.bakeMinuteScene(
                     w = bw,
@@ -530,12 +640,14 @@ class PrismWallpaperService : WallpaperService() {
                     depthMask = mask,
                     env = env,
                     now = now,
-                    prebakedBlurPx = preBlur
+                    prebakedBlurPx = preBlur,
+                    hits = freshHits
                 )
             }
             if (isCurrentEngine()) {
                 cachedScene = scene
                 cachedSceneKey = key
+                activeHits = freshHits
             }
         }
 
@@ -649,8 +761,10 @@ class PrismWallpaperService : WallpaperService() {
                             frostedShader = frame.frostedShader,
                             env = env,
                             now = LocalDateTime.now(),
-                            adaptiveColor = videoAdaptiveColor
+                            adaptiveColor = videoAdaptiveColor,
+                            hits = videoHitsBuffer
                         )
+                        activeHits = videoHitsBuffer.toList()
                         true
                     } ?: false
                     if (drewVideo) return

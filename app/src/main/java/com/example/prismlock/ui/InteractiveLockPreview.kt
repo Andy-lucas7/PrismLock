@@ -54,10 +54,13 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.prismlock.data.Env
+import com.example.prismlock.engine.Dynamic
 import com.example.prismlock.engine.HitBox
 import com.example.prismlock.engine.KustomFormulaEngine
 import com.example.prismlock.engine.LiquidGlassRenderer
+import com.example.prismlock.engine.TouchActionExecutor
 import com.example.prismlock.engine.WallpaperBaker
+import com.example.prismlock.model.Fill
 import com.example.prismlock.model.LayerNode
 import com.example.prismlock.model.LayerType
 import com.example.prismlock.model.Project
@@ -70,6 +73,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.withContext
 import java.time.LocalDateTime
 import kotlin.math.abs
@@ -114,6 +118,9 @@ fun InteractiveLockPreview(
     depthBitmap: Bitmap?,
     activePreviewUri: String? = null,
     env: Env,
+    previewLocked: Boolean = true,
+    testTouchMode: Boolean = false,
+    onTriggerLayerTouch: (LayerNode) -> Unit = {},
     onSelectLayer: (String?) -> Unit,
     onUpdateLayer: (String, (LayerNode) -> LayerNode) -> Unit,
     onFlushSave: () -> Unit,
@@ -132,14 +139,16 @@ fun InteractiveLockPreview(
     val currentSelectedId by rememberUpdatedState(selectedId)
     val currentBg by rememberUpdatedState(bgBitmap)
     val currentDepth by rememberUpdatedState(depthBitmap)
-    val currentEnv by rememberUpdatedState(env)
+    val currentPreviewLocked by rememberUpdatedState(previewLocked)
+    val currentTestTouchMode by rememberUpdatedState(testTouchMode)
+    val currentEnv by rememberUpdatedState(env.copy(locked = previewLocked))
 
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
     var preparedVersion by remember(project.id) { mutableStateOf(0) }
     var videoFrameTick by remember { mutableIntStateOf(0) }
     var secondsTick by remember { mutableIntStateOf(0) }
     val hasSecondsLayer = remember(project.layers) {
-        project.layers.flatten().any { (n, _) -> !n.hidden && n.type == LayerType.TEXT && KustomFormulaEngine.hasSecondsToken(n.text) }
+        Dynamic.hasSeconds(project)
     }
     LaunchedEffect(hasSecondsLayer) {
         if (!hasSecondsLayer) return@LaunchedEffect
@@ -154,6 +163,8 @@ fun InteractiveLockPreview(
     var snapLineY by remember(project.id) { mutableStateOf<Float?>(null) }
     var activeDraggingLayerId by remember(project.id) { mutableStateOf<String?>(null) }
     val currentActiveDragId by rememberUpdatedState(activeDraggingLayerId)
+    var isDraggingStretch by remember(project.id) { mutableStateOf(false) }
+    val currentDraggingStretch by rememberUpdatedState(isDraggingStretch)
 
     val isVideoPreview by produceState(initialValue = false, activePreviewUri) {
         value = activePreviewUri != null && withContext(Dispatchers.IO) {
@@ -215,9 +226,16 @@ fun InteractiveLockPreview(
         renderer.clearShaderCachesForHome()
         renderer.setAllowStaleLensOnMiss(true)
         snapshotFlow {
-            PreparedPreview(currentProject, currentBg, currentDepth, currentEnv, 0) to canvasSize
-        }.debounce(80).conflate().collect { (frame, sz) ->
-            if (sz.width > 0 && sz.height > 0) {
+            Triple(
+                PreparedPreview(currentProject, currentBg, currentDepth, currentEnv, 0),
+                canvasSize,
+                currentActiveDragId != null || currentDraggingStretch
+            )
+        }.filter { !it.third }.debounce(160).conflate().collect { (frame, sz, _) ->
+            val needsLensOrBlur = frame.project.layers.flatten().any { (n, _) ->
+                !n.hidden && (n.fill == Fill.CRYSTAL || n.fill == Fill.GLASS)
+            }
+            if (needsLensOrBlur && sz.width > 0 && sz.height > 0) {
                 val (bw, bh) = WallpaperBaker.baseSizeForPhysical(sz.width, sz.height)
                 withContext(Dispatchers.Default) {
                     renderer.prepareFrameAssets(
@@ -225,7 +243,7 @@ fun InteractiveLockPreview(
                         h = bh,
                         project = frame.project,
                         bg = frame.bg,
-                        env = frame.env.copy(locked = true),
+                        env = frame.env,
                         now = LocalDateTime.now()
                     )
                 }
@@ -266,7 +284,7 @@ fun InteractiveLockPreview(
                             generateSequence(pid) { cur -> currentProject.layers.parentOf(cur)?.id }.last()
                         }
                         val rootNode = rootId?.let { currentProject.layers.find(it) }?.takeIf { !it.locked }
-                        val lockedDragId = if (rootNode != null) rootId else null
+                        val lockedDragId = if (!currentTestTouchMode && rootNode != null) rootId else null
                         activeDraggingLayerId = lockedDragId
 
                         val rootBox = lockedDragId?.let { id -> hitBoxes.firstOrNull { it.id == id }?.rect }
@@ -381,7 +399,24 @@ fun InteractiveLockPreview(
 
                         onDragStateChange(false)
                         if (!movedPastSlop) {
-                            onSelectLayer(picked?.id)
+                            if (currentTestTouchMode) {
+                                val hitAction = TouchActionExecutor.hitTestActionable(
+                                    hitBoxes,
+                                    currentProject.layers,
+                                    startPos.x / sxScale,
+                                    startPos.y / syScale,
+                                    minTouchPx / sxScale
+                                )
+                                if (hitAction != null) {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    onSelectLayer(hitAction.id)
+                                    onTriggerLayerTouch(hitAction)
+                                } else {
+                                    onSelectLayer(picked?.id)
+                                }
+                            } else {
+                                onSelectLayer(picked?.id)
+                            }
                         } else {
                             onFlushSave()
                         }
@@ -420,7 +455,7 @@ fun InteractiveLockPreview(
                                 sharpShader = frame.sharpShader,
                                 frostedBmp = frame.frostedBitmap,
                                 frostedShader = frame.frostedShader,
-                                env = env.copy(locked = true),
+                                env = env.copy(locked = currentPreviewLocked),
                                 now = LocalDateTime.now(),
                                 hits = hitBoxes
                             )
@@ -429,6 +464,25 @@ fun InteractiveLockPreview(
                     } else false
 
                     if (!drewLiveVideo) {
+                        val now = LocalDateTime.now()
+                        val timeKey = if (hasSecondsLayer) {
+                            "${now.year}-${now.dayOfYear}-${now.hour}:${now.minute}:${now.second}"
+                        } else {
+                            "${now.year}-${now.dayOfYear}-${now.hour}:${now.minute}"
+                        }
+                        val lockedEnv = env.copy(locked = currentPreviewLocked)
+                        val sceneCacheKey = buildString {
+                            append(project.hashCode()).append('|')
+                            append(System.identityHashCode(bgBitmap)).append(':')
+                            append(bgBitmap?.generationId ?: 0).append('|')
+                            append(System.identityHashCode(depthBitmap)).append(':')
+                            append(depthBitmap?.generationId ?: 0).append('|')
+                            append(baseW).append('x').append(baseH).append('|')
+                            append(viewW).append('x').append(viewH).append('|')
+                            append(timeKey).append('|')
+                            append(lockedEnv.hashCode()).append('|')
+                            append(ver)
+                        }
                         renderer.renderScaledBaseFrame(
                             canvas = c.nativeCanvas,
                             viewW = viewW,
@@ -438,9 +492,10 @@ fun InteractiveLockPreview(
                             project = project,
                             bg = bgBitmap,
                             depthMask = depthBitmap,
-                            env = env.copy(locked = true),
-                            now = LocalDateTime.now(),
-                            hits = hitBoxes
+                            env = lockedEnv,
+                            now = now,
+                            hits = hitBoxes,
+                            cacheKey = sceneCacheKey
                         )
                     }
                 }
@@ -481,9 +536,9 @@ fun InteractiveLockPreview(
                     .background(PrismColors.PureWhite)
                     .pointerInput(selected.id) {
                         detectDragGestures(
-                            onDragStart = { onDragStateChange(true) },
-                            onDragEnd = { onDragStateChange(false); onFlushSave() },
-                            onDragCancel = { onDragStateChange(false); onFlushSave() }
+                            onDragStart = { isDraggingStretch = true; onDragStateChange(true) },
+                            onDragEnd = { isDraggingStretch = false; onDragStateChange(false); onFlushSave() },
+                            onDragCancel = { isDraggingStretch = false; onDragStateChange(false); onFlushSave() }
                         ) { change, dragAmount ->
                             change.consume()
                             onUpdateLayer(selected.id) { it.copy(stretch = (it.stretch + dragAmount.y / 140f).coerceIn(1f, 3f)) }

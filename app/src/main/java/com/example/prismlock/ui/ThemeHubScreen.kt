@@ -58,6 +58,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -67,11 +68,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -98,8 +99,83 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.time.LocalDateTime
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.absoluteValue
 import kotlin.math.roundToInt
+
+private data class HubCachedCard(
+    val signature: String,
+    val preview: Bitmap,
+    val previewImage: ImageBitmap,
+    val ambientImage: ImageBitmap
+)
+
+private object HubPreviewCache {
+    val map = ConcurrentHashMap<String, HubCachedCard>()
+}
+
+private fun bakeTinyAmbientBitmap(src: Bitmap, outW: Int = 72, outH: Int = 156): Bitmap {
+    val tiny = Bitmap.createScaledBitmap(src, outW, outH, true).copy(Bitmap.Config.ARGB_8888, true)
+    val pix = IntArray(outW * outH)
+    val tmp = IntArray(outW * outH)
+    tiny.getPixels(pix, 0, outW, 0, 0, outW, outH)
+    val r = 12
+    val div = r * 2 + 1
+    repeat(2) {
+        for (y in 0 until outH) {
+            val rowOff = y * outW
+            var rSum = 0; var gSum = 0; var bSum = 0
+            for (dx in -r..r) {
+                val c = pix[rowOff + dx.coerceIn(0, outW - 1)]
+                rSum += (c ushr 16) and 0xFF
+                gSum += (c ushr 8) and 0xFF
+                bSum += c and 0xFF
+            }
+            for (x in 0 until outW) {
+                tmp[rowOff + x] = (0xFF shl 24) or ((rSum / div) shl 16) or ((gSum / div) shl 8) or (bSum / div)
+                val addC = pix[rowOff + (x + r + 1).coerceIn(0, outW - 1)]
+                val remC = pix[rowOff + (x - r).coerceIn(0, outW - 1)]
+                rSum += ((addC ushr 16) and 0xFF) - ((remC ushr 16) and 0xFF)
+                gSum += ((addC ushr 8) and 0xFF) - ((remC ushr 8) and 0xFF)
+                bSum += (addC and 0xFF) - (remC and 0xFF)
+            }
+        }
+        for (x in 0 until outW) {
+            var rSum = 0; var gSum = 0; var bSum = 0
+            for (dy in -r..r) {
+                val c = tmp[dy.coerceIn(0, outH - 1) * outW + x]
+                rSum += (c ushr 16) and 0xFF
+                gSum += (c ushr 8) and 0xFF
+                bSum += c and 0xFF
+            }
+            for (y in 0 until outH) {
+                pix[y * outW + x] = (0xFF shl 24) or ((rSum / div) shl 16) or ((gSum / div) shl 8) or (bSum / div)
+                val addC = tmp[(y + r + 1).coerceIn(0, outH - 1) * outW + x]
+                val remC = tmp[(y - r).coerceIn(0, outH - 1) * outW + x]
+                rSum += ((addC ushr 16) and 0xFF) - ((remC ushr 16) and 0xFF)
+                gSum += ((addC ushr 8) and 0xFF) - ((remC ushr 8) and 0xFF)
+                bSum += (addC and 0xFF) - (remC and 0xFF)
+            }
+        }
+    }
+    tiny.setPixels(pix, 0, outW, 0, 0, outW, outH)
+    tiny.setHasAlpha(false)
+    return tiny
+}
+
+private val HUB_MOCK_TIME: LocalDateTime = LocalDateTime.of(2026, 11, 17, 18, 45, 0)
+private val HUB_MOCK_ENV: Env = Env(
+    battery = 85,
+    charging = false,
+    batteryTempC = 27.0f,
+    temp = 24,
+    weatherCode = 1,
+    isDay = true,
+    city = "São Paulo",
+    alarm = "07:00",
+    steps = 4280,
+    locked = true
+)
 
 @Composable
 fun ThemeHubScreen(
@@ -107,7 +183,7 @@ fun ThemeHubScreen(
     activeThemeId: String,
     focusThemeId: String? = null,
     onFocusConsumed: () -> Unit = {},
-    env: Env,
+    @Suppress("UNUSED_PARAMETER") env: Env,
     onCreateTheme: (String) -> Unit,
     onImportTheme: () -> Unit,
     onImportFolderTheme: () -> Unit = {},
@@ -123,8 +199,8 @@ fun ThemeHubScreen(
     val pagerState = rememberPagerState(pageCount = { themes.size.coerceAtLeast(1) })
     val cardRenderer = remember { LiquidGlassRenderer() }
     val renderMutex = remember { Mutex() }
-    val previewBitmaps = remember { mutableStateMapOf<String, Bitmap>() }
-    val ambientWallpapers = remember { mutableStateMapOf<String, Bitmap?>() }
+    val previewImages = remember { mutableStateMapOf<String, ImageBitmap>() }
+    val ambientImages = remember { mutableStateMapOf<String, ImageBitmap>() }
     var showCreateDialog by remember { mutableStateOf(false) }
     var newThemeName by remember { mutableStateOf("") }
     var showImportMenu by remember { mutableStateOf(false) }
@@ -135,11 +211,13 @@ fun ThemeHubScreen(
 
     var pendingDelete by remember { mutableStateOf<Project?>(null) }
 
-    val safeIndex = pagerState.currentPage.coerceIn(0, (themes.size - 1).coerceAtLeast(0))
-    val currentTheme = themes.getOrNull(safeIndex)
+    val settledIndex by remember(themes.size) {
+        derivedStateOf { pagerState.settledPage.coerceIn(0, (themes.size - 1).coerceAtLeast(0)) }
+    }
+    val currentTheme = themes.getOrNull(settledIndex)
     val dragThresholdPx = with(density) { 86.dp.toPx() }
     val (baseW, baseH) = remember { WallpaperBaker.resolveDisplaySize(ctx) }
-    val cardRenderW = 540
+    val cardRenderW = 420
     val cardRenderH = (cardRenderW * (baseH.toFloat() / baseW.coerceAtLeast(1))).roundToInt().coerceAtLeast(1)
 
     LaunchedEffect(focusThemeId, themes) {
@@ -152,16 +230,31 @@ fun ThemeHubScreen(
         }
     }
 
-    // Render full preview bitmaps offscreen on Dispatchers.Default for visible themes
-    val nowMinute = LocalDateTime.now().withSecond(0).withNano(0)
-    LaunchedEffect(themes, env, nowMinute) {
+    // Static mock preview cards (18:45 + mock telemetry) cached across navigations
+    LaunchedEffect(themes) {
         val activeIds = themes.mapTo(HashSet()) { it.id }
-        previewBitmaps.keys.toList().filter { it !in activeIds }.forEach { previewBitmaps.remove(it) }
-        ambientWallpapers.keys.toList().filter { '|' !in it && it !in activeIds }.forEach { ambientWallpapers.remove(it) }
-        for (theme in themes) {
-            val cacheKey = "${theme.id}|${theme.hashCode()}|${env.battery}|${env.temp}|${nowMinute}"
-            if (previewBitmaps[theme.id] != null && ambientWallpapers.containsKey(cacheKey)) continue
-            val (rendered, bg) = withContext(Dispatchers.Default) {
+        previewImages.keys.toList().filter { it !in activeIds }.forEach { previewImages.remove(it) }
+        ambientImages.keys.toList().filter { it !in activeIds }.forEach { ambientImages.remove(it) }
+        HubPreviewCache.map.keys.toList().filter { it !in activeIds }.forEach { HubPreviewCache.map.remove(it) }
+
+        val pending = ArrayList<Pair<Int, Project>>()
+        themes.forEachIndexed { idx, theme ->
+            val sig = "${theme.id}|${theme.hashCode()}|${cardRenderW}x${cardRenderH}"
+            val cached = HubPreviewCache.map[theme.id]
+            if (cached != null && cached.signature == sig && !cached.preview.isRecycled) {
+                previewImages[theme.id] = cached.previewImage
+                ambientImages[theme.id] = cached.ambientImage
+            } else {
+                pending.add(idx to theme)
+            }
+        }
+
+        val anchor = pagerState.settledPage.coerceIn(0, (themes.size - 1).coerceAtLeast(0))
+        pending.sortBy { (idx, _) -> (idx - anchor).absoluteValue }
+
+        for ((_, theme) in pending) {
+            val sig = "${theme.id}|${theme.hashCode()}|${cardRenderW}x${cardRenderH}"
+            val entry = withContext(Dispatchers.Default) {
                 renderMutex.withLock {
                     cardRenderer.clearShaderCachesForHome()
                     val uri = WallpaperCarousel.currentUri(ctx, theme, advance = false)
@@ -182,15 +275,21 @@ fun ThemeHubScreen(
                         project = theme,
                         bg = bgBmp,
                         depthMask = depthMask,
-                        env = env,
-                        now = nowMinute
+                        env = HUB_MOCK_ENV,
+                        now = HUB_MOCK_TIME
                     )
-                    bmp to bgBmp
+                    val tinyAmb = bakeTinyAmbientBitmap(bgBmp ?: bmp)
+                    HubCachedCard(
+                        signature = sig,
+                        preview = bmp,
+                        previewImage = bmp.asImageBitmap(),
+                        ambientImage = tinyAmb.asImageBitmap()
+                    )
                 }
             }
-            previewBitmaps[theme.id] = rendered
-            ambientWallpapers[theme.id] = bg
-            ambientWallpapers[cacheKey] = bg
+            HubPreviewCache.map[theme.id] = entry
+            previewImages[theme.id] = entry.previewImage
+            ambientImages[theme.id] = entry.ambientImage
         }
     }
 
@@ -199,21 +298,20 @@ fun ThemeHubScreen(
             .fillMaxSize()
             .background(PrismColors.PureBlack)
     ) {
-        // Real ambient blurred wallpaper glow behind the pure black hub chrome
-        val ambientBmp = currentTheme?.let { ambientWallpapers[it.id] ?: previewBitmaps[it.id] }
+        // Pre-blurred low-res ambient wallpaper glow (zero real-time GPU blur during swipe)
+        val ambientImg = currentTheme?.let { ambientImages[it.id] ?: previewImages[it.id] }
         Crossfade(
-            targetState = ambientBmp,
-            animationSpec = tween(320),
+            targetState = ambientImg,
+            animationSpec = tween(260),
             label = "AmbientGlow"
-        ) { targetBmp ->
-            if (targetBmp != null && !targetBmp.isRecycled) {
+        ) { targetImg ->
+            if (targetImg != null) {
                 Image(
-                    bitmap = targetBmp.asImageBitmap(),
+                    bitmap = targetImg,
                     contentDescription = null,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
                         .fillMaxSize()
-                        .blur(72.dp)
                         .alpha(0.32f)
                 )
             }
@@ -361,18 +459,16 @@ fun ThemeHubScreen(
             ) {
                 HorizontalPager(
                     state = pagerState,
+                    beyondViewportPageCount = 1,
                     key = { index -> themes.getOrNull(index)?.id ?: index },
                     contentPadding = PaddingValues(horizontal = 52.dp),
                     pageSpacing = 14.dp,
                     modifier = Modifier.fillMaxSize()
                 ) { page ->
                     val theme = themes.getOrNull(page) ?: return@HorizontalPager
-                    val pageOffset = ((pagerState.currentPage - page) + pagerState.currentPageOffsetFraction)
-                        .absoluteValue
-                        .coerceIn(0f, 1f)
-                    val scale = lerp(1.0f, 0.84f, pageOffset)
-                    val cardAlpha = lerp(1.0f, 0.55f, pageOffset)
-                    val isCenter = page == pagerState.currentPage
+                    val isCenter by remember(page) {
+                        derivedStateOf { pagerState.settledPage == page }
+                    }
 
                     val dragY = remember(theme.id) { Animatable(0f) }
                     var triggeredHaptic by remember(theme.id) { mutableStateOf(false) }
@@ -382,9 +478,13 @@ fun ThemeHubScreen(
                         modifier = Modifier
                             .fillMaxSize()
                             .graphicsLayer {
+                                val pageOffset = ((pagerState.currentPage - page) + pagerState.currentPageOffsetFraction)
+                                    .absoluteValue
+                                    .coerceIn(0f, 1f)
+                                val scale = lerp(1.0f, 0.86f, pageOffset)
                                 scaleX = scale
                                 scaleY = scale
-                                alpha = cardAlpha
+                                alpha = lerp(1.0f, 0.55f, pageOffset)
                             },
                         contentAlignment = Alignment.Center
                     ) {
@@ -395,7 +495,7 @@ fun ThemeHubScreen(
                                     .aspectRatio(9f / 19.5f)
                                     .offset { IntOffset(0, dragY.value.roundToInt()) }
                                     .graphicsLayer {
-                                        shadowElevation = lerp(28.dp.toPx(), 6.dp.toPx(), pageOffset)
+                                        shadowElevation = 16.dp.toPx()
                                         shape = cardShape
                                         clip = true
                                     }
@@ -442,10 +542,10 @@ fun ThemeHubScreen(
                                 }
                                 .clickable(enabled = isCenter) { onEditTheme(theme) }
                         ) {
-                            val bmp = previewBitmaps[theme.id]
-                            if (bmp != null && !bmp.isRecycled) {
+                            val img = previewImages[theme.id]
+                            if (img != null) {
                                 Image(
-                                    bitmap = bmp.asImageBitmap(),
+                                    bitmap = img,
                                     contentDescription = theme.title,
                                     contentScale = ContentScale.Crop,
                                     modifier = Modifier.fillMaxSize()

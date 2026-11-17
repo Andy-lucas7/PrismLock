@@ -21,7 +21,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.RandomAccessFile
+import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.roundToInt
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 data class FontAxis(val tag: String, val min: Float, val def: Float, val max: Float)
@@ -493,7 +496,7 @@ object StemStretch {
             } else {
                 raw.computeBounds(b, true)
                 val origH = (b.bottom - b.top).coerceAtLeast(1f)
-                val st = stretchContinuousWithNormalComp(raw, b.top, stretchY, baseStrokeEm, comp)
+                val st = stretchContinuousWithNormalComp(raw, b.top, origH, stretchY, baseStrokeEm, comp)
                 st.computeBounds(b, true)
                 maxStretchedExtra = maxOf(maxStretchedExtra, (b.height() - origH).coerceAtLeast(0f))
                 st
@@ -618,7 +621,7 @@ object StemStretch {
             } else {
                 tmp.computeBounds(b, true)
                 val origH = (b.bottom - b.top).coerceAtLeast(1f)
-                val stretched = stretchContinuousWithNormalComp(tmp, b.top, stretchY, baseStrokeEm, comp)
+                val stretched = stretchContinuousWithNormalComp(tmp, b.top, origH, stretchY, baseStrokeEm, comp)
                 stretched.computeBounds(b, true)
                 out.addPath(stretched)
                 baseline += lineAdvance + (b.height() - origH).coerceAtLeast(0f)
@@ -658,12 +661,13 @@ object StemStretch {
     }
 
     /**
-     * Continuous vertical stretch with perpendicular normal-based stroke-thickness compensation:
-     * Clamps offset to 0.36 * baseStrokeWidth to prevent stroke strangulation on curved digits (3, 6).
+     * Continuous vertical stretch with weighted C-infinity stem elongation and circular-smoothed
+     * normal-based stroke compensation with corner/tip protection.
      */
     private fun stretchContinuousWithNormalComp(
         rawPath: Path,
         top: Float,
+        origH: Float,
         stretchY: Float,
         baseStrokeWidth: Float,
         strokeCompensation: Float
@@ -684,25 +688,64 @@ object StemStretch {
         val pos = FloatArray(2)
         val tan = FloatArray(2)
         val step = 1.0f
+        val safeOrigH = origH.coerceAtLeast(1f)
         val halfStroke = baseStrokeWidth * 0.5f
-        val maxSafeOffset = baseStrokeWidth * 0.36f
+        val maxSafeOffset = baseStrokeWidth * 0.38f
+        val alpha = 0.34f
+        val twoPiF = (2.0 * Math.PI).toFloat()
+
+        fun stretchYWeighted(y: Float): Float {
+            val u = ((y - top) / safeOrigH).coerceIn(0f, 1f)
+            val twoPiU = twoPiF * u
+            val wIntegral = u - (alpha / twoPiF) * sin(twoPiU)
+            return top + safeOrigH * (u + (stretchY - 1f) * wIntegral)
+        }
 
         do {
             val len = pm.length
             if (len <= 0.5f) continue
             val pts = ArrayList<FloatArray>((len / step).toInt() + 4)
             var dist = 0f
+            var cMinX = Float.MAX_VALUE
+            var cMaxX = -Float.MAX_VALUE
+            var cMinY = Float.MAX_VALUE
+            var cMaxY = -Float.MAX_VALUE
             while (dist < len) {
                 if (pm.getPosTan(dist, pos, tan)) {
-                    pts.add(floatArrayOf(pos[0], pos[1], tan[0], tan[1]))
+                    val px = pos[0]
+                    val py = pos[1]
+                    if (px < cMinX) cMinX = px
+                    if (px > cMaxX) cMaxX = px
+                    if (py < cMinY) cMinY = py
+                    if (py > cMaxY) cMaxY = py
+                    pts.add(floatArrayOf(px, py, tan[0], tan[1]))
                 }
                 dist += step
             }
-            if (pts.size < 3) continue
+            val n = pts.size
+            if (n < 3) continue
+            fun wrap(idx: Int): Int = ((idx % n) + n) % n
+
+            // Protect small punctuation contours (e.g., ':' and '.'): stretch gently around center with zero thinning offset
+            val cW = cMaxX - cMinX
+            val cH = cMaxY - cMinY
+            if (cH <= baseStrokeWidth * 1.85f && cW <= baseStrokeWidth * 1.85f) {
+                val cMidY = (cMinY + cMaxY) * 0.5f
+                val midStretched = stretchYWeighted(cMidY)
+                val dotStretch = 1f + (stretchY - 1f) * 0.35f
+                for (i in 0 until n) {
+                    val p = pts[i]
+                    val xFinal = p[0]
+                    val yFinal = midStretched + (p[1] - cMidY) * dotStretch
+                    if (i == 0) outPath.moveTo(xFinal, yFinal) else outPath.lineTo(xFinal, yFinal)
+                }
+                outPath.close()
+                continue
+            }
 
             var outVotes = 0
-            val probeStep = (pts.size / 16).coerceAtLeast(1)
-            for (i in pts.indices step probeStep) {
+            val probeStep = (n / 16).coerceAtLeast(1)
+            for (i in 0 until n step probeStep) {
                 val p = pts[i]
                 val candNx = p[3]
                 val candNy = -p[2]
@@ -714,36 +757,91 @@ object StemStretch {
                 if (outVotes > 0) 1f else -1f
             } else {
                 var area2 = 0.0
-                for (i in pts.indices) {
+                for (i in 0 until n) {
                     val p0 = pts[i]
-                    val p1 = pts[(i + 1) % pts.size]
+                    val p1 = pts[(i + 1) % n]
                     area2 += p0[0].toDouble() * p1[1] - p1[0].toDouble() * p0[1]
                 }
                 if (area2 >= 0.0) 1f else -1f
             }
 
-            for (i in pts.indices) {
+            // Classify contiguous horizontal lobes uniformly to preserve crisp stem tips and corners
+            val nxArr = FloatArray(n)
+            val nyArr = FloatArray(n)
+            val isHoriz = BooleanArray(n)
+            val lobeFactor = FloatArray(n) { 1f }
+            for (i in 0 until n) {
+                val p = pts[i]
+                val nx = p[3] * outSign
+                val ny = -p[2] * outSign
+                nxArr[i] = nx
+                nyArr[i] = ny
+                isHoriz[i] = abs(ny) > 0.20f
+            }
+
+            val firstNonHoriz = (0 until n).firstOrNull { !isHoriz[it] } ?: -1
+            if (firstNonHoriz < 0) {
+                val midP = pts[n / 2]
+                val dirY = if (nyArr[n / 2] > 0f) -1f else 1f
+                val probeDist = baseStrokeWidth * 1.45f
+                if ((cMaxX - cMinX) <= baseStrokeWidth * 1.38f &&
+                    region.contains(midP[0].roundToInt(), (midP[1] + dirY * probeDist).roundToInt())
+                ) {
+                    lobeFactor.fill(0f)
+                }
+            } else {
+                val run = ArrayList<Int>(64)
+                var offset = 0
+                while (offset < n) {
+                    val idx = wrap(firstNonHoriz + offset)
+                    if (!isHoriz[idx]) {
+                        offset++
+                        continue
+                    }
+                    run.clear()
+                    var minX = Float.MAX_VALUE
+                    var maxX = -Float.MAX_VALUE
+                    while (offset < n) {
+                        val cur = wrap(firstNonHoriz + offset)
+                        if (!isHoriz[cur]) break
+                        run.add(cur)
+                        val px = pts[cur][0]
+                        if (px < minX) minX = px
+                        if (px > maxX) maxX = px
+                        offset++
+                    }
+                    val lobeWidthX = maxX - minX
+                    val midIdx = run[run.size / 2]
+                    val midP = pts[midIdx]
+                    val dirY = if (nyArr[midIdx] > 0f) -1f else 1f
+                    val probeDist = baseStrokeWidth * 1.45f
+                    if (lobeWidthX <= baseStrokeWidth * 1.38f &&
+                        region.contains(midP[0].roundToInt(), (midP[1] + dirY * probeDist).roundToInt())
+                    ) {
+                        for (k in run) lobeFactor[k] = 0f
+                    }
+                }
+            }
+
+            for (i in 0 until n) {
                 val p = pts[i]
                 val x = p[0]
                 val y = p[1]
-                val tx = p[2]
-                val ty = p[3]
-                val nx = ty * outSign
-                val ny = -tx * outSign
+                val nx = nxArr[i]
+                val ny = nyArr[i]
 
-                val yStretched = top + (y - top) * stretchY
-                val denom = sqrt(nx * nx + (ny * stretchY) * (ny * stretchY)).coerceAtLeast(0.0001f)
-                val offset = halfStroke * strokeCompensation * (1.0f - (1.0f / denom))
-                val clampedOffset = offset.coerceIn(0f, maxSafeOffset)
+                val u = ((y - top) / safeOrigH).coerceIn(0f, 1f)
+                val twoPiU = twoPiF * u
+                val wIntegral = u - (alpha / twoPiF) * sin(twoPiU)
+                val yStretched = top + safeOrigH * (u + (stretchY - 1f) * wIntegral)
+                val localStretchY = 1f + (stretchY - 1f) * (1f - alpha * cos(twoPiU))
 
-                val t2x = tx
-                val t2y = ty * stretchY
-                val t2Len = sqrt(t2x * t2x + t2y * t2y).coerceAtLeast(0.0001f)
-                val nx2 = (t2y / t2Len) * outSign
-                val ny2 = -(t2x / t2Len) * outSign
+                val denom = sqrt(nx * nx + (ny * localStretchY) * (ny * localStretchY)).coerceAtLeast(0.0001f)
+                val rawOffset = halfStroke * strokeCompensation * (1.0f - (1.0f / denom))
+                val clampedOffset = (rawOffset * lobeFactor[i]).coerceIn(0f, maxSafeOffset)
 
-                val xFinal = x - nx2 * clampedOffset
-                val yFinal = yStretched - ny2 * clampedOffset
+                val xFinal = x
+                val yFinal = yStretched - ny * clampedOffset
                 if (i == 0) outPath.moveTo(xFinal, yFinal) else outPath.lineTo(xFinal, yFinal)
             }
             outPath.close()

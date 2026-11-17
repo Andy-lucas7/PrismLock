@@ -357,9 +357,10 @@ fun ColorPickerPanel(
     title: String,
     colorInt: Int,
     palette: List<Int>,
+    initiallyExpanded: Boolean = false,
     onColorChange: (Int) -> Unit
 ) {
-    var expanded by remember { mutableStateOf(false) }
+    var expanded by remember(initiallyExpanded) { mutableStateOf(initiallyExpanded) }
     var lastEmitted by remember { mutableStateOf<Int?>(null) }
     var hue by remember { mutableFloatStateOf(0f) }
     var sat by remember { mutableFloatStateOf(0f) }

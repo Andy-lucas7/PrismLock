@@ -139,6 +139,7 @@ private fun PrismApp() {
     }
 
     LaunchedEffect(Unit) {
+        EnvProvider.refreshAudio(ctx)
         val savedFolder = ProjectStore.fontFolderUri(ctx)
         fontFolderUri = savedFolder
         if (savedFolder != null) {
@@ -207,7 +208,8 @@ private fun PrismApp() {
         }
     }
 
-    LaunchedEffect(editingProject.lat, editingProject.lon, editingProject.city) {
+    LaunchedEffect(screen, editingProject.lat, editingProject.lon, editingProject.city) {
+        if (screen != AppScreen.STUDIO) return@LaunchedEffect
         EnvProvider.refreshWeather(ctx, editingProject.lat, editingProject.lon, editingProject.city)
     }
 
@@ -472,7 +474,19 @@ private fun PrismApp() {
                         val nextMap = currentProject.depthOverrides.toMutableMap().apply {
                             put(imageKey, enabled)
                         }.toMap()
-                        val updated = currentProject.copy(depth = true, depthOverrides = nextMap)
+                        val nextLayers = if (enabled) {
+                            val existing = currentProject.layers.firstOrNull { it.type == LayerType.DEPTH }
+                            when {
+                                existing == null -> {
+                                    val depthNode = LayerNode(name = "Sujeito 3D", type = LayerType.DEPTH)
+                                    val insertIdx = if (currentProject.layers.isNotEmpty()) 1 else 0
+                                    currentProject.layers.toMutableList().apply { add(insertIdx, depthNode) }
+                                }
+                                existing.hidden -> currentProject.layers.mapNode(existing.id) { it.copy(hidden = false) }
+                                else -> currentProject.layers
+                            }
+                        } else currentProject.layers
+                        val updated = currentProject.copy(depth = true, depthOverrides = nextMap, layers = nextLayers)
                         editingProject = updated
                         saveFlow.tryEmit(updated)
                     },
@@ -514,7 +528,13 @@ private fun PrismApp() {
                             }
                         }
                     },
-                    onImportSvg = { svgPicker.launch(arrayOf("image/svg+xml", "*/*")) }
+                    onImportSvg = { svgPicker.launch(arrayOf("image/svg+xml", "*/*")) },
+                    onNextWallpaper = {
+                        scope.launch {
+                            val next = WallpaperCarousel.currentUri(ctx, currentProject, advance = true)
+                            if (next != null) previewUri = next
+                        }
+                    }
                 )
             }
         }
