@@ -3,7 +3,16 @@ package com.example.prismlock.wallpaper
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.BlurMaskFilter
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.ImageDecoder
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.RadialGradient
+import android.graphics.Shader
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.provider.DocumentsContract
@@ -74,6 +83,112 @@ object SubjectDepthEngine {
             .addOnFailureListener {
                 if (cont.isActive) cont.resume(null)
             }
+    }
+
+    fun buildSubjectColorFilter(project: Project): ColorMatrixColorFilter? {
+        val sat = if (project.depthInvertColorPop) {
+            1f - project.depthBgDesaturate.coerceIn(0f, 1f)
+        } else {
+            1f + project.depthSubjectPop.coerceIn(0f, 1f) * 0.14f
+        }
+        val pop = project.depthSubjectPop.coerceIn(0f, 1f)
+        if (kotlin.math.abs(sat - 1f) < 0.01f && pop < 0.01f) return null
+
+        val satMatrix = ColorMatrix().apply { setSaturation(sat.coerceIn(0f, 2f)) }
+        val contrast = 1f + pop * 0.22f
+        val translate = (-0.5f * contrast + 0.5f) * 255f + pop * 12f
+        val cbMatrix = ColorMatrix(
+            floatArrayOf(
+                contrast, 0f, 0f, 0f, translate,
+                0f, contrast, 0f, 0f, translate,
+                0f, 0f, contrast, 0f, translate,
+                0f, 0f, 0f, 1f, 0f
+            )
+        )
+        cbMatrix.preConcat(satMatrix)
+        return ColorMatrixColorFilter(cbMatrix)
+    }
+
+    fun applySubjectColorPopMask(mask: Bitmap, project: Project): Bitmap {
+        val filter = buildSubjectColorFilter(project) ?: return mask
+        val out = Bitmap.createBitmap(mask.width, mask.height, Bitmap.Config.ARGB_8888)
+        val c = Canvas(out)
+        val p = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
+            colorFilter = filter
+        }
+        c.drawBitmap(mask, 0f, 0f, p)
+        return out
+    }
+
+    fun composeProcessedWallpaper(
+        baseSharp: Bitmap,
+        depthMask: Bitmap?,
+        project: Project,
+        blurFn: ((Bitmap, Float) -> Bitmap)? = null
+    ): Bitmap {
+        if (depthMask == null || !project.hasDepthPostProcessing()) return baseSharp
+        val w = baseSharp.width.coerceAtLeast(1)
+        val h = baseSharp.height.coerceAtLeast(1)
+        val u = w / 1080f
+
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawColor(Color.BLACK)
+
+        // 1. Background layer (selective Bokeh blur + Color Pop desaturation)
+        val blurPx = (project.depthBgBlur.coerceIn(0f, 1f) * 42f * u).coerceIn(0f, 64f * u)
+        val blurredBg = if (blurPx > 0.75f && blurFn != null) blurFn(baseSharp, blurPx) else baseSharp
+        val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        if (!project.depthInvertColorPop && project.depthBgDesaturate > 0.01f) {
+            val sat = (1f - project.depthBgDesaturate.coerceIn(0f, 1f)).coerceIn(0f, 1f)
+            bgPaint.colorFilter = ColorMatrixColorFilter(ColorMatrix().apply { setSaturation(sat) })
+        }
+        canvas.drawBitmap(blurredBg, 0f, 0f, bgPaint)
+        if (blurredBg !== baseSharp && !blurredBg.isRecycled) {
+            blurredBg.recycle()
+        }
+
+        // 2. Subtle vignette + 3D shadow halo behind foreground subject
+        val maskMat = Matrix().apply {
+            val s = maxOf(w.toFloat() / depthMask.width.coerceAtLeast(1), h.toFloat() / depthMask.height.coerceAtLeast(1))
+            val dx = (w - depthMask.width * s) * 0.5f
+            val dy = (h - depthMask.height * s) * 0.5f
+            setScale(s, s)
+            postTranslate(dx, dy)
+        }
+        val vig = project.depthVignette.coerceIn(0f, 1f)
+        if (vig > 0.01f) {
+            val vigAlpha = (vig * 0.62f * 255f).toInt().coerceIn(0, 255)
+            val vigPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                shader = RadialGradient(
+                    w * 0.5f,
+                    h * 0.46f,
+                    maxOf(w, h) * 0.64f,
+                    intArrayOf(Color.TRANSPARENT, Color.argb(vigAlpha, 0, 0, 0)),
+                    floatArrayOf(0.32f, 1f),
+                    Shader.TileMode.CLAMP
+                )
+            }
+            canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), vigPaint)
+
+            runCatching {
+                val alphaMask = depthMask.extractAlpha()
+                val haloPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
+                    color = Color.argb((vig * 0.52f * 255f).toInt().coerceIn(0, 255), 0, 0, 0)
+                    maskFilter = BlurMaskFilter((20f * u).coerceAtLeast(2f), BlurMaskFilter.Blur.NORMAL)
+                }
+                canvas.drawBitmap(alphaMask, maskMat, haloPaint)
+                alphaMask.recycle()
+            }
+        }
+
+        // 3. Sharp foreground subject with brightness/contrast/pop filter
+        val fgPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
+            colorFilter = buildSubjectColorFilter(project)
+        }
+        canvas.drawBitmap(depthMask, maskMat, fgPaint)
+        out.setHasAlpha(false)
+        return out
     }
 }
 
@@ -155,6 +270,23 @@ object WallpaperCarousel {
 
     fun listImages(ctx: Context, treeUriStr: String?): List<Uri> {
         if (treeUriStr.isNullOrBlank()) return emptyList()
+        if (treeUriStr.startsWith("file://")) {
+            return runCatching {
+                val dir = File(Uri.parse(treeUriStr).path ?: return emptyList())
+                if (!dir.isDirectory) return emptyList()
+                val exts = setOf("jpg", "jpeg", "png", "webp", "heic", "heif", "bmp", "mp4", "webm", "mkv", "mov", "m4v")
+                val videoExts = setOf("mp4", "webm", "mkv", "mov", "m4v")
+                dir.listFiles()
+                    ?.filter { it.isFile && it.extension.lowercase() in exts }
+                    ?.sortedBy { it.name.lowercase() }
+                    ?.map { f ->
+                        val u = Uri.fromFile(f)
+                        videoCache[u.toString()] = f.extension.lowercase() in videoExts
+                        u
+                    }
+                    ?: emptyList()
+            }.getOrDefault(emptyList())
+        }
         return runCatching {
             val treeUri = Uri.parse(treeUriStr)
             val treeId = DocumentsContract.getTreeDocumentId(treeUri)
@@ -186,19 +318,24 @@ object WallpaperCarousel {
         advance: Boolean = false,
         checkInterval: Boolean = false
     ): String? = withContext(Dispatchers.IO) {
+        if (project.folderUri.isNullOrBlank() && project.imageUri.isNullOrBlank()) {
+            return@withContext null
+        }
+        if (project.folderUri.isNullOrBlank() && !project.imageUri.isNullOrBlank()) {
+            ProjectStore.setCurrentWallpaperUri(ctx, project.imageUri)
+            return@withContext project.imageUri
+        }
         val manifest = WallpaperBaker.readManifest(ctx)
-        val bakedEntries = if (manifest != null && (manifest.projectId.isEmpty() || manifest.projectId == project.id)) {
+        val bakedEntries = if (manifest != null && manifest.projectId.isNotBlank() && manifest.projectId == project.id) {
             manifest.entries
         } else null
-        val uriStrings: List<String> = if (!bakedEntries.isNullOrEmpty() && (project.folderUri != null || bakedEntries.size == 1)) {
+        val uriStrings: List<String> = if (!bakedEntries.isNullOrEmpty()) {
             bakedEntries.map { it.uri }
         } else {
             listImages(ctx, project.folderUri).map { it.toString() }
         }
         if (uriStrings.isEmpty()) {
-            val single = project.imageUri
-            ProjectStore.setCurrentWallpaperUri(ctx, single)
-            return@withContext single
+            return@withContext project.imageUri
         }
         if (advance) {
             val nextIdx = (ProjectStore.index(ctx) + 1) % uriStrings.size

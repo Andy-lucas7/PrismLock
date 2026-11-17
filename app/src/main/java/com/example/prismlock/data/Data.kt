@@ -51,6 +51,7 @@ object ProjectStore {
     private val LAST_SWITCH = longPreferencesKey("carousel_switch")
     private val CURRENT_URI = stringPreferencesKey("carousel_current_uri")
     private val ACTIVE_BAKE_VERSION = longPreferencesKey("active_bake_version")
+    private val FONT_FOLDER_URI = stringPreferencesKey("font_folder_uri")
     private val listSerializer = ListSerializer(Project.serializer())
 
     fun flow(ctx: Context): Flow<Project> = ctx.applicationContext.prismStore.data
@@ -123,12 +124,22 @@ object ProjectStore {
     }
 
     suspend fun deleteTheme(ctx: Context, themeId: String) {
+        var activeProject: Project? = null
+        var remainingList: List<Project> = emptyList()
         ctx.applicationContext.prismStore.edit { prefs ->
             val curList = prefs[THEMES_KEY]
                 ?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
                 ?: defaultStarterThemes()
             val remaining = curList.filterNot { it.id == themeId }.ifEmpty { defaultStarterThemes().take(1) }
+            remainingList = remaining
+            activeProject = prefs[KEY]?.let { runCatching { json.decodeFromString(Project.serializer(), it) }.getOrNull() }
             prefs[THEMES_KEY] = json.encodeToString(listSerializer, remaining)
+        }
+        val active = activeProject
+        val stillInUse = (active?.folderUri?.contains(themeId) == true || active?.imageUri?.contains(themeId) == true) ||
+            remainingList.any { it.folderUri?.contains(themeId) == true || it.imageUri?.contains(themeId) == true }
+        if (!stillInUse) {
+            runCatching { java.io.File(ctx.applicationContext.filesDir, "imported_themes/$themeId").deleteRecursively() }
         }
     }
 
@@ -159,11 +170,20 @@ object ProjectStore {
     suspend fun setBakeVersion(ctx: Context, version: Long) {
         ctx.applicationContext.prismStore.edit { it[ACTIVE_BAKE_VERSION] = version }
     }
+
+    suspend fun fontFolderUri(ctx: Context): String? = ctx.applicationContext.prismStore.data.first()[FONT_FOLDER_URI]
+
+    suspend fun setFontFolderUri(ctx: Context, uri: String?) {
+        ctx.applicationContext.prismStore.edit {
+            if (uri != null) it[FONT_FOLDER_URI] = uri else it.remove(FONT_FOLDER_URI)
+        }
+    }
 }
 
 data class Env(
     val battery: Int = 100,
     val charging: Boolean = false,
+    val batteryTempC: Float = 28.0f,
     val temp: Int? = null,
     val weatherCode: Int = 0,
     val isDay: Boolean = true,
@@ -196,9 +216,11 @@ object EnvProvider {
         val st = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
         val pct = if (lvl >= 0) lvl * 100 / sc else _env.value.battery
         val ch = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL
+        val rawTemp = i.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1)
+        val bTemp = if (rawTemp > 0) rawTemp / 10f else _env.value.batteryTempC
         val old = _env.value
-        if (old.battery == pct && old.charging == ch) return false
-        _env.value = old.copy(battery = pct, charging = ch)
+        if (old.battery == pct && old.charging == ch && old.batteryTempC == bTemp) return false
+        _env.value = old.copy(battery = pct, charging = ch, batteryTempC = bTemp)
         return true
     }
 

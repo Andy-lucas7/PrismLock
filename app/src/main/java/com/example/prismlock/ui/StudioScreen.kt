@@ -52,12 +52,15 @@ import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.FileDownload
+import androidx.compose.material.icons.rounded.FileUpload
+import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.Layers
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.LockOpen
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Save
 import androidx.compose.material.icons.rounded.TextFields
 import androidx.compose.material.icons.rounded.Tune
@@ -118,13 +121,16 @@ import com.example.prismlock.data.EnvProvider
 import com.example.prismlock.engine.Dynamic
 import com.example.prismlock.engine.FontManager
 import com.example.prismlock.engine.Icons
+import com.example.prismlock.engine.KustomFormulaEngine
 import com.example.prismlock.engine.LiquidGlassRenderer
+import com.example.prismlock.engine.WallpaperBaker
 import com.example.prismlock.model.Align
 import com.example.prismlock.model.Anchor
 import com.example.prismlock.model.Blend
 import com.example.prismlock.model.Cond
 import com.example.prismlock.model.Dir
 import com.example.prismlock.model.Fill
+import com.example.prismlock.model.Glass
 import com.example.prismlock.model.GradientKind
 import com.example.prismlock.model.LayerNode
 import com.example.prismlock.model.LayerType
@@ -137,9 +143,11 @@ import com.example.prismlock.model.flatten
 import com.example.prismlock.model.insertAfter
 import com.example.prismlock.model.mapNode
 import com.example.prismlock.model.move
+import com.example.prismlock.model.parentOf
 import com.example.prismlock.model.removeNode
 import com.example.prismlock.wallpaper.WallpaperCarousel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.time.LocalDateTime
@@ -284,7 +292,11 @@ fun StudioScreen(
     onSelectPreview: (String, Int) -> Unit,
     onPickFolder: () -> Unit,
     onPickImage: () -> Unit,
+    onClearWallpaper: () -> Unit = {},
     onImportFont: () -> Unit,
+    hasFontFolder: Boolean = false,
+    onPickFontFolder: () -> Unit = {},
+    onRefreshFontFolder: (Boolean) -> Unit = {},
     onImportSvg: () -> Unit
 ) {
     var tab by remember(project.id) { mutableStateOf(StudioTab.BACKGROUND) }
@@ -473,8 +485,8 @@ fun StudioScreen(
                                 }
                             )
                             DropdownMenuItem(
-                                leadingIcon = { Icon(MIcons.Rounded.FileDownload, null, tint = PrismColors.MutedZinc, modifier = Modifier.size(18.dp)) },
-                                text = { Text("Exportar Arquivo (.prism)", color = PrismColors.MutedZinc, fontSize = 13.sp) },
+                                leadingIcon = { Icon(MIcons.Rounded.FileUpload, null, tint = PrismColors.PureWhite, modifier = Modifier.size(18.dp)) },
+                                text = { Text("Exportar Pacote (.prism)", color = PrismColors.PureWhite, fontSize = 13.sp) },
                                 onClick = {
                                     showOverflowMenu = false
                                     onExportFile()
@@ -549,6 +561,7 @@ fun StudioScreen(
                             node = selected,
                             project = project,
                             activePreviewUri = activePreviewUri,
+                            onSelectLayer = onSelectLayer,
                             onUpdateNode = onUpdateSelected,
                             onStage = onStageProject,
                             onCommit = onCommitProject,
@@ -557,6 +570,7 @@ fun StudioScreen(
                             onSelectPreview = onSelectPreview,
                             onPickFolder = onPickFolder,
                             onPickImage = onPickImage,
+                            onClearWallpaper = onClearWallpaper,
                             onApplyWallpaper = onApply
                         )
                         StudioTab.LAYERS -> LayersTab(
@@ -573,15 +587,20 @@ fun StudioScreen(
                         StudioTab.CONTENT -> ContentTab(
                             node = selected,
                             env = env,
+                            wallPalette = wallPalette,
                             update = onUpdateSelected,
+                            onSaveFinished = onFlushSave,
                             onImportSvg = onImportSvg
                         )
                         StudioTab.TYPE -> TypeTab(
                             node = selected,
                             importedFonts = importedFonts,
+                            hasFontFolder = hasFontFolder,
                             update = onUpdateSelected,
                             onSaveFinished = onFlushSave,
-                            onImportFont = onImportFont
+                            onImportFont = onImportFont,
+                            onPickFontFolder = onPickFontFolder,
+                            onRefreshFontFolder = onRefreshFontFolder
                         )
                         StudioTab.PAINT -> PaintTab(
                             allLayers = project.layers,
@@ -598,95 +617,32 @@ fun StudioScreen(
 
         // Rename Current Screen dialog
         if (showRenameDialog) {
-            var editedTitle by remember(project.id, project.title) { mutableStateOf(project.title) }
-            val focusRequester = remember { FocusRequester() }
-            LaunchedEffect(Unit) { focusRequester.requestFocus() }
-            AlertDialog(
-                onDismissRequest = { showRenameDialog = false },
-                containerColor = Color(0xEB111115),
-                titleContentColor = PrismColors.PureWhite,
-                textContentColor = PrismColors.MutedZinc,
-                shape = RoundedCornerShape(24.dp),
-                title = { Text("Renomear Tela", fontWeight = FontWeight.SemiBold, fontSize = 17.sp) },
-                text = {
-                    OutlinedTextField(
-                        value = editedTitle,
-                        onValueChange = { editedTitle = it },
-                        placeholder = { Text("Default Screen", color = PrismColors.MutedZinc) },
-                        singleLine = true,
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = PrismColors.PureWhite,
-                            unfocusedBorderColor = PrismColors.GlassBorderStrong,
-                            focusedTextColor = PrismColors.PureWhite,
-                            unfocusedTextColor = PrismColors.PureWhite,
-                            cursorColor = PrismColors.PureWhite
-                        ),
-                        shape = RoundedCornerShape(14.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .focusRequester(focusRequester)
-                    )
-                },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            onRenameTheme(editedTitle.trim().ifBlank { "Default Screen" })
-                            showRenameDialog = false
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = PrismColors.PureWhite,
-                            contentColor = PrismColors.PureBlack
-                        ),
-                        shape = RoundedCornerShape(14.dp)
-                    ) {
-                        Text("Salvar Nome", fontWeight = FontWeight.Bold)
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showRenameDialog = false }) {
-                        Text("Cancelar", color = PrismColors.MutedZinc)
-                    }
+            FocusedInputDialog(
+                title = "Renomear Tela",
+                initialValue = project.title,
+                placeholder = "Default Screen",
+                exampleHint = "Ex: Minimal Cristal, Relógio Editorial",
+                confirmLabel = "Salvar Nome",
+                onDismiss = { showRenameDialog = false },
+                onConfirm = { raw ->
+                    onRenameTheme(raw.trim().ifBlank { "Default Screen" })
+                    showRenameDialog = false
                 }
             )
         }
 
         // Save as New Theme dialog
         if (showSaveAsDialog) {
-            var newTitle by remember(project.title) { mutableStateOf("${project.title} (Cópia)") }
-            AlertDialog(
-                onDismissRequest = { showSaveAsDialog = false },
-                containerColor = PrismColors.CarbonBlack,
-                titleContentColor = PrismColors.PureWhite,
-                shape = RoundedCornerShape(22.dp),
-                title = { Text("Salvar como Novo Tema", fontWeight = FontWeight.SemiBold, fontSize = 16.sp) },
-                text = {
-                    OutlinedTextField(
-                        value = newTitle,
-                        onValueChange = { newTitle = it },
-                        label = { Text("Nome do tema") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            onSaveAsNew(newTitle.trim().ifEmpty { "Novo Tema" })
-                            showSaveAsDialog = false
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = PrismColors.PureWhite,
-                            contentColor = PrismColors.PureBlack
-                        ),
-                        shape = RoundedCornerShape(14.dp)
-                    ) {
-                        Text("Salvar", fontWeight = FontWeight.Bold)
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showSaveAsDialog = false }) {
-                        Text("Cancelar", color = PrismColors.MutedZinc)
-                    }
+            FocusedInputDialog(
+                title = "Salvar como Novo Tema",
+                initialValue = "${project.title} (Cópia)",
+                placeholder = "Novo Tema",
+                exampleHint = "Ex: Minha Tela V2",
+                confirmLabel = "Salvar",
+                onDismiss = { showSaveAsDialog = false },
+                onConfirm = { raw ->
+                    onSaveAsNew(raw.trim().ifEmpty { "Novo Tema" })
+                    showSaveAsDialog = false
                 }
             )
         }
@@ -948,58 +904,237 @@ private fun LayersTab(
 }
 
 @Composable
-private fun ContentTab(node: LayerNode?, env: Env, update: ((LayerNode) -> LayerNode) -> Unit, onImportSvg: () -> Unit) {
+private fun ContentTab(
+    node: LayerNode?,
+    env: Env,
+    wallPalette: List<Int>,
+    update: ((LayerNode) -> LayerNode) -> Unit,
+    onSaveFinished: () -> Unit,
+    onImportSvg: () -> Unit
+) {
     if (node == null) {
         Text("Selecione uma camada na tela ou na aba Camadas", color = PrismColors.MutedZinc, fontSize = 12.sp)
         return
     }
+    var activeCategoryId by remember { mutableStateOf(KustomFormulaEngine.categories.first().id) }
+    val liveNow by produceState(initialValue = LocalDateTime.now(), node.text) {
+        val period = if (KustomFormulaEngine.hasSecondsToken(node.text)) 1000L else 15_000L
+        while (true) {
+            value = LocalDateTime.now()
+            delay(period)
+        }
+    }
+
+    var showNameDialog by remember(node.id) { mutableStateOf(false) }
+    var showFormulaDialog by remember(node.id) { mutableStateOf(false) }
+    var showValueDialog by remember(node.id) { mutableStateOf(false) }
+
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        OutlinedTextField(
+        FocusedFieldTrigger(
+            label = "Nome da camada",
             value = node.name,
-            onValueChange = { v -> update { it.copy(name = v) } },
-            label = { Text("Nome da camada") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth()
+            placeholder = "Camada",
+            onClick = { showNameDialog = true }
         )
-        if (node.type == LayerType.TEXT) {
-            OutlinedTextField(
-                value = node.text,
-                onValueChange = { v -> update { it.copy(text = v) } },
-                label = { Text("Texto / Fórmula Dinâmica") },
-                modifier = Modifier.fillMaxWidth()
-            )
-            Text("Resultado ao vivo: ${Dynamic.eval(node.text, env, LocalDateTime.now())}", fontSize = 12.sp, color = PrismColors.PureWhite)
-            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Dynamic.tags.forEach { t ->
-                    AssistChip(
-                        onClick = { update { it.copy(text = it.text + t) } },
-                        label = { Text(t, fontSize = 11.sp) },
-                        colors = AssistChipDefaults.assistChipColors(containerColor = Color(0x16FFFFFF), labelColor = PrismColors.PureWhite)
-                    )
+        if (showNameDialog) {
+            FocusedInputDialog(
+                title = "Nome da Camada",
+                initialValue = node.name,
+                placeholder = "Relógio Principal",
+                exampleHint = "Ex: Relógio, Data Editorial, Bateria",
+                onDismiss = { showNameDialog = false },
+                onConfirm = { v ->
+                    update { it.copy(name = v.trim().ifBlank { it.name }) }
+                    onSaveFinished()
+                    showNameDialog = false
                 }
+            )
+        }
+        if (node.type == LayerType.TEXT) {
+            FocusedFieldTrigger(
+                label = "Fórmula de Texto / KWGT (\$...\$)",
+                value = node.text,
+                placeholder = "\$df(HH)\$:\$df(mm)\$",
+                onClick = { showFormulaDialog = true }
+            )
+            if (showFormulaDialog) {
+                FocusedInputDialog(
+                    title = "Fórmula de Texto (\$...\$)",
+                    initialValue = node.text,
+                    placeholder = "\$df(HH)\$:\$df(mm)\$",
+                    exampleHint = "Ex: \$df(HH)\$:\$df(mm)\$ · \$if(bi(level) < 20, \"Bateria Baixa\", \"Normal\")\$ · {HH}:{mm}",
+                    singleLine = false,
+                    onDismiss = { showFormulaDialog = false },
+                    onConfirm = { v ->
+                        update { it.copy(text = v) }
+                        onSaveFinished()
+                        showFormulaDialog = false
+                    }
+                )
+            }
+            // Real-time evaluated formula preview card
+            val liveResult = remember(node.text, env, liveNow) {
+                Dynamic.eval(node.text, env, liveNow)
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Color(0x16FFFFFF))
+                    .border(1.dp, PrismColors.GlassBorder, RoundedCornerShape(12.dp))
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Resultado ao vivo", fontSize = 11.sp, color = PrismColors.MutedZinc)
+                Text(
+                    text = liveResult.ifBlank { "(vazio)" },
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = PrismColors.PureWhite,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            StudioSection(
+                title = "Assistente de Fórmulas (KWGT)",
+                summary = "Toque para inserir",
+                initiallyExpanded = true
+            ) {
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    KustomFormulaEngine.categories.forEach { cat ->
+                        val sel = cat.id == activeCategoryId
+                        FilterChip(
+                            selected = sel,
+                            onClick = { activeCategoryId = cat.id },
+                            label = { Text(cat.label, fontSize = 11.sp) },
+                            colors = prismFilterChipColors(),
+                            border = prismFilterChipBorder(sel)
+                        )
+                    }
+                }
+                val currentCat = KustomFormulaEngine.categories.firstOrNull { it.id == activeCategoryId }
+                    ?: KustomFormulaEngine.categories.first()
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    currentCat.items.forEach { snippet ->
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color(0x14FFFFFF))
+                                .border(1.dp, PrismColors.GlassBorder, RoundedCornerShape(12.dp))
+                                .clickable {
+                                    update { it.copy(text = if (it.text.isBlank()) snippet.code else it.text + snippet.code) }
+                                    onSaveFinished()
+                                }
+                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                        ) {
+                            Column {
+                                Text(snippet.title, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = PrismColors.PureWhite)
+                                Text(snippet.code, fontSize = 9.sp, color = PrismColors.MutedZinc, maxLines = 1)
+                            }
+                        }
+                    }
+                }
+                QuickPresetRow(
+                    items = listOf(
+                        "Substituir Relógio" to { update { it.copy(text = "\$df(HH)\$:\$df(mm)\$") }; onSaveFinished() },
+                        "Data Completa" to { update { it.copy(text = "\$tc(cap, df(EEEE))\$, \$df(dd)\$ de \$df(MMMM)\$") }; onSaveFinished() },
+                        "Clima & Bat" to { update { it.copy(text = "\$wi(temp)\$° · \$wi(cond)\$ · \$bi(level)\$%") }; onSaveFinished() },
+                        "Limpar" to { update { it.copy(text = "") }; onSaveFinished() }
+                    )
+                )
             }
         }
         if (node.type == LayerType.SHAPE) {
-            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                ShapeKind.entries.forEach { k ->
-                    val sel = node.shape == k
-                    FilterChip(selected = sel, onClick = { update { it.copy(shape = k) } }, label = { Text(shapeLabel(k)) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
+            StudioSection(title = "Geometria da Forma", summary = shapeLabel(node.shape), initiallyExpanded = true) {
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    ShapeKind.entries.forEach { k ->
+                        val sel = node.shape == k
+                        FilterChip(selected = sel, onClick = { update { it.copy(shape = k) }; onSaveFinished() }, label = { Text(shapeLabel(k), fontSize = 11.sp) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
+                    }
                 }
-            }
-            if (node.shape == ShapeKind.BAR || node.shape == ShapeKind.RING) {
-                OutlinedTextField(value = node.value, onValueChange = { v -> update { it.copy(value = v) } }, label = { Text("Variável 0..100 (bat, dayprog, hourprog)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                if (node.shape == ShapeKind.BAR || node.shape == ShapeKind.RING) {
+                    FocusedFieldTrigger(
+                        label = "Variável / Fórmula Progresso (0..100)",
+                        value = node.value,
+                        placeholder = "\$bi(level)\$ ou bat",
+                        onClick = { showValueDialog = true }
+                    )
+                    if (showValueDialog) {
+                        FocusedInputDialog(
+                            title = "Fórmula / Variável (0..100)",
+                            initialValue = node.value,
+                            placeholder = "\$bi(level)\$",
+                            exampleHint = "Ex: \$bi(level)\$, bat, dayprog, hourprog, \$=hour/24*100\$",
+                            onDismiss = { showValueDialog = false },
+                            onConfirm = { v ->
+                                update { it.copy(value = v.trim()) }
+                                onSaveFinished()
+                                showValueDialog = false
+                            }
+                        )
+                    }
+                    QuickPresetRow(
+                        items = listOf(
+                            "Bateria" to { update { it.copy(value = "\$bi(level)\$") }; onSaveFinished() },
+                            "Dia %" to { update { it.copy(value = "dayprog") }; onSaveFinished() },
+                            "Hora %" to { update { it.copy(value = "hourprog") }; onSaveFinished() },
+                            "Passos" to { update { it.copy(value = "steps") }; onSaveFinished() }
+                        )
+                    )
+                    if (node.shape == ShapeKind.RING) {
+                        PrecisionSliderField("Espessura Anel", node.strokeWidth.coerceAtLeast(2f), 2f..48f, "px", 0, onSaveFinished) { v ->
+                            update { it.copy(strokeWidth = v) }
+                        }
+                    }
+                    ColorPickerPanel("Cor da Trilha Fundo", node.trackColor, wallPalette) { c ->
+                        update { it.copy(trackColor = c) }
+                    }
+                }
             }
         }
         if (node.type == LayerType.ICON) {
-            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Icons.names.forEach { ic ->
-                    val sel = node.icon == ic
-                    FilterChip(selected = sel, onClick = { update { it.copy(icon = ic) } }, label = { Text(iconLabel(ic)) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
+            StudioSection(title = "Ícone Vetorial", summary = iconLabel(node.icon), initiallyExpanded = true) {
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Icons.names.forEach { ic ->
+                        val sel = node.icon == ic
+                        FilterChip(selected = sel, onClick = { update { it.copy(icon = ic) }; onSaveFinished() }, label = { Text(iconLabel(ic), fontSize = 11.sp) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
+                    }
                 }
             }
         }
+        if (node.type == LayerType.STACK) {
+            StudioSection(title = "Organização da Pilha", summary = "${dirLabel(node.dir)} · ${node.children.size} itens", initiallyExpanded = true) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Dir.entries.forEach { d ->
+                        val sel = node.dir == d
+                        FilterChip(selected = sel, onClick = { update { it.copy(dir = d) }; onSaveFinished() }, label = { Text(dirLabel(d), fontSize = 11.sp) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
+                    }
+                }
+                PrecisionSliderField("Espaçamento", node.spacing, -60f..160f, "px", 0, onSaveFinished) { v -> update { it.copy(spacing = v) } }
+            }
+        }
         if (node.type == LayerType.SVG) {
-            Button(onClick = onImportSvg) { Text("Substituir arquivo SVG") }
+            Button(
+                onClick = onImportSvg,
+                colors = ButtonDefaults.buttonColors(containerColor = PrismColors.PureWhite, contentColor = PrismColors.PureBlack),
+                shape = RoundedCornerShape(14.dp)
+            ) { Text("Substituir arquivo SVG", fontWeight = FontWeight.SemiBold) }
+        }
+        StudioSection(title = "Condição & Comportamento", summary = condLabel(node.cond), initiallyExpanded = false) {
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Cond.entries.forEach { c ->
+                    val sel = node.cond == c
+                    FilterChip(selected = sel, onClick = { update { it.copy(cond = c) }; onSaveFinished() }, label = { Text(condLabel(c), fontSize = 10.sp) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
+                }
+            }
         }
     }
 }
@@ -1008,60 +1143,240 @@ private fun ContentTab(node: LayerNode?, env: Env, update: ((LayerNode) -> Layer
 private fun TypeTab(
     node: LayerNode?,
     importedFonts: List<String>,
+    hasFontFolder: Boolean,
     update: ((LayerNode) -> LayerNode) -> Unit,
     onSaveFinished: () -> Unit,
-    onImportFont: () -> Unit
+    onImportFont: () -> Unit,
+    onPickFontFolder: () -> Unit,
+    onRefreshFontFolder: (Boolean) -> Unit
 ) {
+    val ctx = LocalContext.current
     if (node == null) {
         Text("Selecione uma camada", color = PrismColors.MutedZinc, fontSize = 12.sp)
         return
     }
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+    var showFontListDialog by remember { mutableStateOf(false) }
+    val allFonts = remember(importedFonts) { FontManager.availableFonts(ctx) }
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (node.type == LayerType.TEXT) {
-            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                OutlinedButton(
-                    onClick = onImportFont,
-                    shape = RoundedCornerShape(12.dp),
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
-                ) { Text("+ Fonte TTF/OTF", fontSize = 11.sp, color = PrismColors.PureWhite) }
-                (FontManager.systemFamilies + importedFonts).forEach { f ->
-                    val sel = node.font == f
-                    FilterChip(selected = sel, onClick = { update { it.copy(font = f) }; onSaveFinished() }, label = { Text(fontDisplayLabel(f), fontSize = 11.sp) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
+            StudioSection(title = "Fonte & Peso", summary = fontDisplayLabel(node.font), initiallyExpanded = true) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedButton(
+                        onClick = {
+                            if (hasFontFolder) onRefreshFontFolder(false)
+                            showFontListDialog = true
+                        },
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(containerColor = Color(0x18FFFFFF)),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, PrismColors.GlassBorderStrong),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text("Ver Lista (${allFonts.size})", fontSize = 11.sp, color = PrismColors.PureWhite, fontWeight = FontWeight.SemiBold)
+                    }
+                    OutlinedButton(
+                        onClick = onPickFontFolder,
+                        shape = RoundedCornerShape(12.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, PrismColors.GlassBorderStrong),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Icon(MIcons.Rounded.FolderOpen, contentDescription = null, tint = PrismColors.PureWhite, modifier = Modifier.size(14.dp))
+                        Spacer(Modifier.width(5.dp))
+                        Text("Pasta de Fontes", fontSize = 11.sp, color = PrismColors.PureWhite)
+                    }
+                    if (hasFontFolder) {
+                        IconButton(
+                            onClick = { onRefreshFontFolder(true) },
+                            modifier = Modifier
+                                .size(32.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(Color(0x18FFFFFF))
+                                .border(1.dp, PrismColors.GlassBorder, RoundedCornerShape(10.dp))
+                        ) {
+                            Icon(MIcons.Rounded.Refresh, contentDescription = "Atualizar fontes", tint = PrismColors.PureWhite, modifier = Modifier.size(15.dp))
+                        }
+                    }
+                    OutlinedButton(
+                        onClick = onImportFont,
+                        shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) { Text("+ TTF/OTF", fontSize = 11.sp, color = PrismColors.PureWhite) }
                 }
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    allFonts.forEach { f ->
+                        val sel = node.font == f
+                        val previewFamily = remember(f) { FontManager.composeFontFamily(f, 400) }
+                        FilterChip(
+                            selected = sel,
+                            onClick = { update { it.copy(font = f) }; onSaveFinished() },
+                            label = {
+                                Text(
+                                    text = fontDisplayLabel(f),
+                                    fontFamily = previewFamily,
+                                    fontSize = 13.sp,
+                                    maxLines = 1
+                                )
+                            },
+                            colors = prismFilterChipColors(),
+                            border = prismFilterChipBorder(sel)
+                        )
+                    }
+                }
+                if (showFontListDialog) {
+                    Dialog(onDismissRequest = { showFontListDialog = false }) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(460.dp)
+                                .frostedChrome(shape = RoundedCornerShape(24.dp), dense = true, elevation = 24.dp)
+                                .padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Seletor Tipográfico (${allFonts.size})", color = PrismColors.PureWhite, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                                TextButton(onClick = { showFontListDialog = false }) {
+                                    Text("Fechar", color = PrismColors.MutedZinc)
+                                }
+                            }
+                            LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                items(allFonts, key = { it }) { f ->
+                                    val sel = node.font == f
+                                    val previewFamily = remember(f) { FontManager.composeFontFamily(f, 400) }
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(14.dp))
+                                            .background(if (sel) PrismColors.PureWhite else Color(0x16FFFFFF))
+                                            .border(1.dp, if (sel) PrismColors.PureWhite else PrismColors.GlassBorder, RoundedCornerShape(14.dp))
+                                            .clickable {
+                                                update { it.copy(font = f) }
+                                                onSaveFinished()
+                                                showFontListDialog = false
+                                            }
+                                            .padding(horizontal = 14.dp, vertical = 11.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = fontDisplayLabel(f),
+                                            fontFamily = previewFamily,
+                                            color = if (sel) PrismColors.PureBlack else PrismColors.PureWhite,
+                                            fontSize = 16.sp,
+                                            modifier = Modifier.weight(1f),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = "12:45",
+                                            fontFamily = previewFamily,
+                                            color = if (sel) PrismColors.PureBlack else PrismColors.MutedZinc,
+                                            fontSize = 16.sp
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                QuickPresetRow(
+                    items = listOf(
+                        "Leve 300" to { update { it.copy(weight = 300) }; onSaveFinished() },
+                        "Regular 400" to { update { it.copy(weight = 400) }; onSaveFinished() },
+                        "Médio 500" to { update { it.copy(weight = 500) }; onSaveFinished() },
+                        "Negrito 700" to { update { it.copy(weight = 700) }; onSaveFinished() },
+                        "Extra 800" to { update { it.copy(weight = 800) }; onSaveFinished() }
+                    )
+                )
+                PrecisionSliderField("Tamanho", node.size, 18f..420f, "px", 0, onSaveFinished) { v -> update { it.copy(size = v) } }
+                PrecisionSliderField("Peso", node.weight.toFloat(), 100f..900f, "", 0, onSaveFinished) { v -> update { it.copy(weight = v.roundToInt()) } }
             }
-            PrecisionSliderField("Tamanho", node.size, 18f..420f, "px", 0, onSaveFinished) { v -> update { it.copy(size = v) } }
-            PrecisionSliderField("Peso", node.weight.toFloat(), 100f..900f, "", 0, onSaveFinished) { v -> update { it.copy(weight = v.roundToInt()) } }
-            PrecisionSliderField("Elasticidade", node.stretch, 1f..3f, "x", 2, onSaveFinished) { v -> update { it.copy(stretch = v) } }
-            PrecisionSliderField("Comp. Traço", node.strokeCompensation, 0f..1.2f, "x", 2, onSaveFinished) { v -> update { it.copy(strokeCompensation = v) } }
-            PrecisionSliderField("Kerning", node.letterSpacing, -0.15f..0.6f, "em", 2, onSaveFinished) { v -> update { it.copy(letterSpacing = v) } }
-            PrecisionSliderField("Entrelinha", node.lineSpacing, -0.6f..1f, "", 2, onSaveFinished) { v -> update { it.copy(lineSpacing = v) } }
-            FontManager.axes(node.font).forEach { ax ->
-                val cur = node.axes[ax.tag] ?: ax.def
-                PrecisionSliderField("Eixo ${ax.tag}", cur, ax.min..ax.max, "", 1, onSaveFinished) { v -> update { it.copy(axes = it.axes + (ax.tag to v)) } }
+
+            StudioSection(
+                title = "Elasticidade & Espaçamento",
+                summary = "${"%.2f".format(node.stretch)}x",
+                initiallyExpanded = true
+            ) {
+                QuickPresetRow(
+                    items = listOf(
+                        "Clássico 1.0x" to { update { it.copy(stretch = 1.0f) }; onSaveFinished() },
+                        "Alto 1.4x" to { update { it.copy(stretch = 1.4f, strokeCompensation = 1.0f) }; onSaveFinished() },
+                        "Editorial 1.8x" to { update { it.copy(stretch = 1.8f, strokeCompensation = 1.0f) }; onSaveFinished() },
+                        "Ultra 2.4x" to { update { it.copy(stretch = 2.4f, strokeCompensation = 1.0f) }; onSaveFinished() }
+                    )
+                )
+                PrecisionSliderField("Elasticidade", node.stretch, 1f..3f, "x", 2, onSaveFinished) { v -> update { it.copy(stretch = v) } }
+                PrecisionSliderField("Comp. Traço", node.strokeCompensation, 0f..1.2f, "x", 2, onSaveFinished) { v -> update { it.copy(strokeCompensation = v) } }
+                PrecisionSliderField("Kerning", node.letterSpacing, -0.15f..0.6f, "em", 2, onSaveFinished) { v -> update { it.copy(letterSpacing = v) } }
+                PrecisionSliderField("Entrelinha", node.lineSpacing, -0.6f..1f, "", 2, onSaveFinished) { v -> update { it.copy(lineSpacing = v) } }
+                FontManager.axes(node.font).forEach { ax ->
+                    val cur = node.axes[ax.tag] ?: ax.def
+                    PrecisionSliderField("Eixo ${ax.tag}", cur, ax.min..ax.max, "", 1, onSaveFinished) { v -> update { it.copy(axes = it.axes + (ax.tag to v)) } }
+                }
             }
         }
         if (node.type == LayerType.STACK) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Dir.entries.forEach { d ->
-                    val sel = node.dir == d
-                    FilterChip(selected = sel, onClick = { update { it.copy(dir = d) }; onSaveFinished() }, label = { Text(dirLabel(d)) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
+            StudioSection(title = "Pilha & Espaçamento", summary = dirLabel(node.dir), initiallyExpanded = true) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Dir.entries.forEach { d ->
+                        val sel = node.dir == d
+                        FilterChip(selected = sel, onClick = { update { it.copy(dir = d) }; onSaveFinished() }, label = { Text(dirLabel(d)) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
+                    }
                 }
+                QuickPresetRow(
+                    items = listOf(
+                        "Justo 0px" to { update { it.copy(spacing = 0f) }; onSaveFinished() },
+                        "Compacto 8px" to { update { it.copy(spacing = 8f) }; onSaveFinished() },
+                        "Médio 16px" to { update { it.copy(spacing = 16f) }; onSaveFinished() },
+                        "Aberto 32px" to { update { it.copy(spacing = 32f) }; onSaveFinished() }
+                    )
+                )
+                PrecisionSliderField("Espaçamento", node.spacing, -60f..160f, "px", 0, onSaveFinished) { v -> update { it.copy(spacing = v) } }
             }
-            PrecisionSliderField("Espaçamento", node.spacing, -60f..160f, "px", 0, onSaveFinished) { v -> update { it.copy(spacing = v) } }
         }
         if (node.type == LayerType.SHAPE || node.type == LayerType.ICON || node.type == LayerType.SVG) {
-            PrecisionSliderField("Largura", node.w, 16f..1080f, "px", 0, onSaveFinished) { v -> update { it.copy(w = v) } }
-            PrecisionSliderField("Altura", node.h, 2f..1080f, "px", 0, onSaveFinished) { v -> update { it.copy(h = v) } }
-            PrecisionSliderField("Canto", node.corner, 0f..300f, "px", 0, onSaveFinished) { v -> update { it.copy(corner = v) } }
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            Align.entries.forEach { a ->
-                val sel = node.align == a
-                FilterChip(selected = sel, onClick = { update { it.copy(align = a) }; onSaveFinished() }, label = { Text(alignLabel(a), fontSize = 11.sp) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
+            StudioSection(title = "Dimensões & Cantos", summary = "${node.w.roundToInt()}×${node.h.roundToInt()}", initiallyExpanded = true) {
+                QuickPresetRow(
+                    items = listOf(
+                        "Quadrado" to { update { it.copy(w = 180f, h = 180f, corner = 32f) }; onSaveFinished() },
+                        "Pílula" to { update { it.copy(w = 340f, h = 68f, corner = 34f) }; onSaveFinished() },
+                        "Card" to { update { it.copy(w = 460f, h = 180f, corner = 36f) }; onSaveFinished() },
+                        "Barra Fina" to { update { it.copy(w = 400f, h = 16f, corner = 8f) }; onSaveFinished() }
+                    )
+                )
+                PrecisionSliderField("Largura", node.w, 16f..1080f, "px", 0, onSaveFinished) { v -> update { it.copy(w = v) } }
+                PrecisionSliderField("Altura", node.h, 2f..1080f, "px", 0, onSaveFinished) { v -> update { it.copy(h = v) } }
+                PrecisionSliderField("Canto", node.corner, 0f..300f, "px", 0, onSaveFinished) { v -> update { it.copy(corner = v) } }
             }
         }
-        PrecisionSliderField("Escala", node.scale, 0.25f..4f, "x", 2, onSaveFinished) { v -> update { it.copy(scale = v) } }
-        PrecisionSliderField("Rotação", node.rotation, -180f..180f, "°", 1, onSaveFinished) { v -> update { it.copy(rotation = v) } }
+        StudioSection(
+            title = "Alinhamento & Transformação",
+            summary = "${alignLabel(node.align)} · ${"%.2f".format(node.scale)}x",
+            initiallyExpanded = node.type != LayerType.TEXT
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Align.entries.forEach { a ->
+                    val sel = node.align == a
+                    FilterChip(selected = sel, onClick = { update { it.copy(align = a) }; onSaveFinished() }, label = { Text(alignLabel(a), fontSize = 11.sp) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
+                }
+            }
+            QuickPresetRow(
+                items = listOf(
+                    "Resetar Escala" to { update { it.copy(scale = 1f) }; onSaveFinished() },
+                    "0°" to { update { it.copy(rotation = 0f) }; onSaveFinished() },
+                    "-90°" to { update { it.copy(rotation = -90f) }; onSaveFinished() },
+                    "90°" to { update { it.copy(rotation = 90f) }; onSaveFinished() }
+                )
+            )
+            PrecisionSliderField("Escala", node.scale, 0.25f..4f, "x", 2, onSaveFinished) { v -> update { it.copy(scale = v) } }
+            PrecisionSliderField("Rotação", node.rotation, -180f..180f, "°", 1, onSaveFinished) { v -> update { it.copy(rotation = v) } }
+        }
     }
 }
 
@@ -1088,75 +1403,164 @@ private fun PaintTab(
             Text("Selecione uma camada", color = PrismColors.MutedZinc, fontSize = 12.sp)
             return@Column
         }
-        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            listOf(
-                Fill.SOLID to "Sólido",
-                Fill.GRADIENT to "Gradiente",
-                Fill.GLASS to "Blur Clássico",
-                Fill.CRYSTAL to "Cristal Óptico",
-                Fill.HOLLOW to "Vazado"
-            ).forEach { (f, label) ->
-                val sel = node.fill == f
-                FilterChip(selected = sel, onClick = { update { it.copy(fill = f) }; onSaveFinished() }, label = { Text(label, fontSize = 11.sp) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
-            }
-        }
 
-        if (node.fill == Fill.SOLID || node.fill == Fill.GRADIENT || node.fill == Fill.HOLLOW) {
-            ColorPickerPanel("Cor Principal", node.color, wallPalette) { c -> update { it.copy(color = c) } }
-        }
-        if (node.fill == Fill.GRADIENT || (node.fill == Fill.HOLLOW && node.color2 != node.color)) {
-            ColorPickerPanel("Cor Secundária", node.color2, wallPalette) { c -> update { it.copy(color2 = c) } }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                GradientKind.entries.forEach { gk ->
-                    val sel = node.gradientKind == gk
-                    FilterChip(selected = sel, onClick = { update { it.copy(gradientKind = gk) }; onSaveFinished() }, label = { Text(gradientLabel(gk)) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
+        StudioSection(
+            title = "Preenchimento & Vidro",
+            summary = when (node.fill) {
+                Fill.SOLID -> "Sólido"
+                Fill.GRADIENT -> "Gradiente"
+                Fill.ADAPTIVE -> "Adaptativo"
+                Fill.GLASS -> "Blur Clássico"
+                Fill.CRYSTAL -> "Cristal Óptico"
+                Fill.HOLLOW -> "Vazado"
+            },
+            initiallyExpanded = true
+        ) {
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf(
+                    Fill.SOLID to "Sólido",
+                    Fill.GRADIENT to "Gradiente",
+                    Fill.ADAPTIVE to "Adaptativo",
+                    Fill.GLASS to "Blur Clássico",
+                    Fill.CRYSTAL to "Cristal Óptico",
+                    Fill.HOLLOW to "Vazado"
+                ).forEach { (f, label) ->
+                    val sel = node.fill == f
+                    FilterChip(selected = sel, onClick = { update { it.copy(fill = f) }; onSaveFinished() }, label = { Text(label, fontSize = 11.sp) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
                 }
             }
-            if (node.gradientKind == GradientKind.LINEAR) {
-                PrecisionSliderField("Ângulo Grad", node.gradientAngle, 0f..360f, "°", 0, onSaveFinished) { v -> update { it.copy(gradientAngle = v) } }
+
+            if (node.fill == Fill.SOLID || node.fill == Fill.GRADIENT || node.fill == Fill.HOLLOW) {
+                ColorPickerPanel("Cor Principal", node.color, wallPalette) { c -> update { it.copy(color = c) } }
+            }
+            if (node.fill == Fill.GRADIENT || (node.fill == Fill.HOLLOW && node.color2 != node.color)) {
+                ColorPickerPanel("Cor Secundária", node.color2, wallPalette) { c -> update { it.copy(color2 = c) } }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    GradientKind.entries.forEach { gk ->
+                        val sel = node.gradientKind == gk
+                        FilterChip(selected = sel, onClick = { update { it.copy(gradientKind = gk) }; onSaveFinished() }, label = { Text(gradientLabel(gk)) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
+                    }
+                }
+                if (node.gradientKind == GradientKind.LINEAR) {
+                    PrecisionSliderField("Ângulo Grad", node.gradientAngle, 0f..360f, "°", 0, onSaveFinished) { v -> update { it.copy(gradientAngle = v) } }
+                }
+            }
+            if (node.fill == Fill.GLASS) {
+                QuickPresetRow(
+                    items = listOf(
+                        "Blur Suave" to {
+                            update { it.copy(glass = it.glass.copy(blur = 18f, saturation = 1.25f, tint = 0x22FFFFFF, rim = 0.65f)) }
+                            onSaveFinished()
+                        },
+                        "Fosco Intenso" to {
+                            update { it.copy(glass = it.glass.copy(blur = 42f, saturation = 1.45f, tint = 0x33FFFFFF, rim = 0.9f)) }
+                            onSaveFinished()
+                        },
+                        "Vidro Fumê" to {
+                            update { it.copy(glass = it.glass.copy(blur = 28f, saturation = 1.15f, tint = 0x55000000, rim = 0.55f)) }
+                            onSaveFinished()
+                        }
+                    )
+                )
+                PrecisionSliderField("Blur Gauss", node.glass.blur, 0f..80f, "px", 1, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(blur = v)) } }
+                PrecisionSliderField("Saturação", node.glass.saturation, 1f..1.8f, "x", 2, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(saturation = v)) } }
+                PrecisionSliderField("Granulação", node.glass.grain, 0f..0.15f, "", 3, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(grain = v)) } }
+                PrecisionSliderField("Borda Suave", node.glass.rim.coerceIn(0f, 1f), 0f..1f, "", 2, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(rim = v)) } }
+                ColorPickerPanel("Tint Translúcido", node.glass.tint, wallPalette) { c -> update { it.copy(glass = it.glass.copy(tint = c)) } }
+            }
+            if (node.fill == Fill.CRYSTAL) {
+                QuickPresetRow(
+                    items = listOf(
+                        "Cristal Limpo" to {
+                            update { it.copy(glass = Glass(refraction = 38f, bevelWidth = 22f, chromaticAberration = 0.005f, frostAmount = 0.04f, rim = 0.85f, tint = 0x18FFFFFF)) }
+                            onSaveFinished()
+                        },
+                        "Vidro Fosco" to {
+                            update { it.copy(glass = Glass(refraction = 32f, bevelWidth = 24f, chromaticAberration = 0.004f, frostAmount = 0.55f, blur = 28f, rim = 0.8f, tint = 0x26FFFFFF)) }
+                            onSaveFinished()
+                        },
+                        "Prisma Forte" to {
+                            update { it.copy(glass = Glass(refraction = 68f, bevelWidth = 30f, chromaticAberration = 0.014f, frostAmount = 0.12f, rim = 1.0f, tint = 0x20FFFFFF)) }
+                            onSaveFinished()
+                        },
+                        "Zero Tint" to {
+                            update { it.copy(glass = it.glass.copy(tint = 0x00FFFFFF)) }
+                            onSaveFinished()
+                        }
+                    )
+                )
+                PrecisionSliderField("Refração", node.glass.refraction.coerceIn(0f, 100f), 0f..100f, "%", 0, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(refraction = v)) } }
+                PrecisionSliderField("Chanfro", node.glass.bevelWidth.coerceIn(1f, 48f), 1f..48f, "px", 1, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(bevelWidth = v)) } }
+                PrecisionSliderField("Dispersão RGB", node.glass.chromaticAberration * 1000f, 0f..20f, "‰", 1, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(chromaticAberration = v / 1000f)) } }
+                PrecisionSliderField("Brilho Fresnel", node.glass.rim.coerceIn(0f, 1f), 0f..1f, "", 2, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(rim = v)) } }
+                PrecisionSliderField("Ângulo Luz", node.glass.lightAngle, 0f..360f, "°", 0, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(lightAngle = v)) } }
+                PrecisionSliderField("Jateamento", node.glass.frostAmount.coerceIn(0f, 1f), 0f..1f, "", 2, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(frostAmount = v)) } }
+                if (node.glass.frostAmount > 0.01f) {
+                    PrecisionSliderField("Blur Jato", node.glass.blur, 0f..80f, "px", 1, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(blur = v)) } }
+                }
+                ColorPickerPanel("Tint Cristal", node.glass.tint, wallPalette) { c -> update { it.copy(glass = it.glass.copy(tint = c)) } }
             }
         }
-        if (node.fill == Fill.GLASS) {
-            PrecisionSliderField("Blur Gauss", node.glass.blur, 0f..80f, "px", 1, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(blur = v)) } }
-            PrecisionSliderField("Saturação", node.glass.saturation, 1f..1.8f, "x", 2, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(saturation = v)) } }
-            PrecisionSliderField("Granulação", node.glass.grain, 0f..0.15f, "", 3, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(grain = v)) } }
-            PrecisionSliderField("Borda Suave", node.glass.rim.coerceIn(0f, 1f), 0f..1f, "", 2, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(rim = v)) } }
-            ColorPickerPanel("Tint Translúcido", node.glass.tint, wallPalette) { c -> update { it.copy(glass = it.glass.copy(tint = c)) } }
-        }
-        if (node.fill == Fill.CRYSTAL) {
-            PrecisionSliderField("Refração", node.glass.refraction.coerceIn(0f, 100f), 0f..100f, "%", 0, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(refraction = v)) } }
-            PrecisionSliderField("Chanfro", node.glass.bevelWidth.coerceIn(1f, 48f), 1f..48f, "px", 1, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(bevelWidth = v)) } }
-            PrecisionSliderField("Dispersão RGB", node.glass.chromaticAberration * 1000f, 0f..20f, "‰", 1, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(chromaticAberration = v / 1000f)) } }
-            PrecisionSliderField("Brilho Fresnel", node.glass.rim.coerceIn(0f, 1f), 0f..1f, "", 2, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(rim = v)) } }
-            PrecisionSliderField("Ângulo Luz", node.glass.lightAngle, 0f..360f, "°", 0, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(lightAngle = v)) } }
-            PrecisionSliderField("Jateamento", node.glass.frostAmount.coerceIn(0f, 1f), 0f..1f, "", 2, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(frostAmount = v)) } }
-            if (node.glass.frostAmount > 0.01f) {
-                PrecisionSliderField("Blur Jato", node.glass.blur, 0f..80f, "px", 1, onSaveFinished) { v -> update { it.copy(glass = it.glass.copy(blur = v)) } }
+
+        StudioSection(
+            title = "Contorno / Borda",
+            summary = if (node.strokeWidth <= 0f) "Nenhum" else "${node.strokeWidth.roundToInt()}px",
+            initiallyExpanded = false
+        ) {
+            QuickPresetRow(
+                items = listOf(
+                    "Sem Borda" to { update { it.copy(strokeWidth = 0f) }; onSaveFinished() },
+                    "Fino 2px" to { update { it.copy(strokeWidth = 2f) }; onSaveFinished() },
+                    "Médio 6px" to { update { it.copy(strokeWidth = 6f) }; onSaveFinished() },
+                    "Forte 12px" to { update { it.copy(strokeWidth = 12f) }; onSaveFinished() }
+                )
+            )
+            PrecisionSliderField("Espessura", node.strokeWidth, 0f..24f, "px", 1, onSaveFinished) { v -> update { it.copy(strokeWidth = v) } }
+            if (node.strokeWidth > 0f || node.fill == Fill.HOLLOW) {
+                ColorPickerPanel("Cor Contorno", node.strokeColor, wallPalette) { c -> update { it.copy(strokeColor = c) } }
             }
-            ColorPickerPanel("Tint Cristal", node.glass.tint, wallPalette) { c -> update { it.copy(glass = it.glass.copy(tint = c)) } }
         }
 
-        PrecisionSliderField("Opacidade", node.opacity, 0f..1f, "", 2, onSaveFinished) { v -> update { it.copy(opacity = v) } }
-
-        Text("Contorno / Borda", fontSize = 12.sp, color = PrismColors.MutedZinc, fontWeight = FontWeight.Medium)
-        PrecisionSliderField("Espessura", node.strokeWidth, 0f..24f, "px", 1, onSaveFinished) { v -> update { it.copy(strokeWidth = v) } }
-        if (node.strokeWidth > 0f || node.fill == Fill.HOLLOW) {
-            ColorPickerPanel("Cor Contorno", node.strokeColor, wallPalette) { c -> update { it.copy(strokeColor = c) } }
+        StudioSection(
+            title = "Sombra Projetada",
+            summary = if (node.shadowRadius <= 0f) "Desativada" else "${node.shadowRadius.roundToInt()}px",
+            initiallyExpanded = false
+        ) {
+            QuickPresetRow(
+                items = listOf(
+                    "Sem Sombra" to { update { it.copy(shadowRadius = 0f) }; onSaveFinished() },
+                    "Suave" to { update { it.copy(shadowRadius = 14f, shadowDx = 0f, shadowDy = 6f, shadowColor = 0x70000000) }; onSaveFinished() },
+                    "Dramática" to { update { it.copy(shadowRadius = 32f, shadowDx = 0f, shadowDy = 14f, shadowColor = 0xB8000000.toInt()) }; onSaveFinished() }
+                )
+            )
+            PrecisionSliderField("Raio Sombra", node.shadowRadius, 0f..50f, "px", 1, onSaveFinished) { v -> update { it.copy(shadowRadius = v) } }
+            if (node.shadowRadius > 0f) {
+                PrecisionSliderField("Sombra X", node.shadowDx, -40f..40f, "px", 1, onSaveFinished) { v -> update { it.copy(shadowDx = v) } }
+                PrecisionSliderField("Sombra Y", node.shadowDy, -40f..40f, "px", 1, onSaveFinished) { v -> update { it.copy(shadowDy = v) } }
+                ColorPickerPanel("Cor Sombra", node.shadowColor, wallPalette) { c -> update { it.copy(shadowColor = c) } }
+            }
         }
 
-        Text("Sombra Projetada", fontSize = 12.sp, color = PrismColors.MutedZinc, fontWeight = FontWeight.Medium)
-        PrecisionSliderField("Raio Sombra", node.shadowRadius, 0f..50f, "px", 1, onSaveFinished) { v -> update { it.copy(shadowRadius = v) } }
-        if (node.shadowRadius > 0f) {
-            PrecisionSliderField("Sombra X", node.shadowDx, -40f..40f, "px", 1, onSaveFinished) { v -> update { it.copy(shadowDx = v) } }
-            PrecisionSliderField("Sombra Y", node.shadowDy, -40f..40f, "px", 1, onSaveFinished) { v -> update { it.copy(shadowDy = v) } }
-            ColorPickerPanel("Cor Sombra", node.shadowColor, wallPalette) { c -> update { it.copy(shadowColor = c) } }
-        }
-
-        Text("Modo de Mesclagem", fontSize = 12.sp, color = PrismColors.MutedZinc)
-        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            Blend.entries.forEach { b ->
-                val sel = node.blend == b
-                FilterChip(selected = sel, onClick = { update { it.copy(blend = b) }; onSaveFinished() }, label = { Text(blendLabel(b), fontSize = 10.sp) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
+        StudioSection(
+            title = "Opacidade & Mesclagem",
+            summary = "${(node.opacity * 100).roundToInt()}% · ${blendLabel(node.blend)}",
+            initiallyExpanded = false
+        ) {
+            QuickPresetRow(
+                items = listOf(
+                    "100%" to { update { it.copy(opacity = 1f) }; onSaveFinished() },
+                    "85%" to { update { it.copy(opacity = 0.85f) }; onSaveFinished() },
+                    "60%" to { update { it.copy(opacity = 0.6f) }; onSaveFinished() },
+                    "35%" to { update { it.copy(opacity = 0.35f) }; onSaveFinished() }
+                )
+            )
+            PrecisionSliderField("Opacidade", node.opacity, 0f..1f, "", 2, onSaveFinished) { v -> update { it.copy(opacity = v) } }
+            Text("Modo de Mesclagem", fontSize = 12.sp, color = PrismColors.MutedZinc)
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Blend.entries.forEach { b ->
+                    val sel = node.blend == b
+                    FilterChip(selected = sel, onClick = { update { it.copy(blend = b) }; onSaveFinished() }, label = { Text(blendLabel(b), fontSize = 10.sp) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
+                }
             }
         }
     }
@@ -1167,6 +1571,7 @@ private fun PositionAndSafTab(
     node: LayerNode?,
     project: Project,
     activePreviewUri: String?,
+    onSelectLayer: (String?) -> Unit,
     onUpdateNode: ((LayerNode) -> LayerNode) -> Unit,
     onStage: (Project) -> Unit,
     onCommit: (Project) -> Unit,
@@ -1175,6 +1580,7 @@ private fun PositionAndSafTab(
     onSelectPreview: (String, Int) -> Unit,
     onPickFolder: () -> Unit,
     onPickImage: () -> Unit,
+    onClearWallpaper: () -> Unit,
     onApplyWallpaper: () -> Unit
 ) {
     val ctx = LocalContext.current
@@ -1203,7 +1609,7 @@ private fun PositionAndSafTab(
     )
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
             Button(
                 onClick = onPickFolder,
                 modifier = Modifier.weight(1f),
@@ -1216,6 +1622,18 @@ private fun PositionAndSafTab(
                 shape = RoundedCornerShape(14.dp),
                 border = androidx.compose.foundation.BorderStroke(1.dp, PrismColors.GlassBorder)
             ) { Text("Foto / Vídeo", fontSize = 12.sp, color = PrismColors.PureWhite) }
+            if (project.folderUri != null || project.imageUri != null) {
+                IconButton(
+                    onClick = onClearWallpaper,
+                    modifier = Modifier
+                        .size(38.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color(0x16FFFFFF))
+                        .border(1.dp, PrismColors.GlassBorder, RoundedCornerShape(12.dp))
+                ) {
+                    Icon(MIcons.Rounded.DeleteOutline, contentDescription = "Remover fundo", tint = PrismColors.MutedZinc, modifier = Modifier.size(18.dp))
+                }
+            }
         }
 
         val activeIsVideo by produceState(initialValue = false, activePreviewUri) {
@@ -1336,61 +1754,172 @@ private fun PositionAndSafTab(
             }
         }
 
-        if (node != null) {
-            HorizontalDivider(color = PrismColors.GlassBorder)
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                Box(Modifier.weight(1f)) {
-                    PrecisionSliderField("Posição X", node.x * 100f, 0f..100f, "%", 1, onSaveFinished) { v -> onUpdateNode { it.copy(x = v / 100f) } }
+        if (!activeIsVideo) {
+            StudioSection(
+                title = "Profundidade 3D (Bokeh & Color Pop)",
+                summary = if (!project.depth) "Desativado" else if (project.hasDepthPostProcessing()) "Personalizado" else "Natural",
+                initiallyExpanded = true
+            ) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text("Segmentação 3D (ML Kit)", fontSize = 12.sp, color = PrismColors.PureWhite)
+                    Switch(checked = project.depth, onCheckedChange = { onCommit(project.copy(depth = it)) }, colors = switchColors)
                 }
-                OutlinedButton(onClick = { onUpdateNode { it.copy(x = (it.x - 1f / 1080f).coerceIn(0f, 1f)) }; onSaveFinished() }, contentPadding = PaddingValues(horizontal = 8.dp), modifier = Modifier.height(30.dp)) { Text("-1px", fontSize = 10.sp, color = PrismColors.PureWhite) }
-                OutlinedButton(onClick = { onUpdateNode { it.copy(x = (it.x + 1f / 1080f).coerceIn(0f, 1f)) }; onSaveFinished() }, contentPadding = PaddingValues(horizontal = 8.dp), modifier = Modifier.height(30.dp)) { Text("+1px", fontSize = 10.sp, color = PrismColors.PureWhite) }
-            }
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                Box(Modifier.weight(1f)) {
-                    PrecisionSliderField("Posição Y", node.y * 100f, 0f..100f, "%", 1, onSaveFinished) { v -> onUpdateNode { it.copy(y = v / 100f) } }
-                }
-                OutlinedButton(onClick = { onUpdateNode { it.copy(y = (it.y - 1f / 2400f).coerceIn(0f, 1f)) }; onSaveFinished() }, contentPadding = PaddingValues(horizontal = 8.dp), modifier = Modifier.height(30.dp)) { Text("-1px", fontSize = 10.sp, color = PrismColors.PureWhite) }
-                OutlinedButton(onClick = { onUpdateNode { it.copy(y = (it.y + 1f / 2400f).coerceIn(0f, 1f)) }; onSaveFinished() }, contentPadding = PaddingValues(horizontal = 8.dp), modifier = Modifier.height(30.dp)) { Text("+1px", fontSize = 10.sp, color = PrismColors.PureWhite) }
-            }
-            Text("Âncora da Camada", fontSize = 12.sp, color = PrismColors.MutedZinc)
-            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Anchor.entries.forEach { a ->
-                    val sel = node.anchor == a
-                    FilterChip(selected = sel, onClick = { onUpdateNode { it.copy(anchor = a) }; onSaveFinished() }, label = { Text(anchorLabel(a), fontSize = 10.sp) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
-                }
-            }
-            Text("Regra de Visibilidade", fontSize = 12.sp, color = PrismColors.MutedZinc)
-            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Cond.entries.forEach { c ->
-                    val sel = node.cond == c
-                    FilterChip(selected = sel, onClick = { onUpdateNode { it.copy(cond = c) }; onSaveFinished() }, label = { Text(condLabel(c), fontSize = 10.sp) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
-                }
-            }
-            HorizontalDivider(color = PrismColors.GlassBorder)
-        }
-
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-            Text("Trocar ao apagar tela", fontSize = 13.sp, color = PrismColors.PureWhite)
-            Switch(checked = project.changeOnWake, onCheckedChange = { onCommit(project.copy(changeOnWake = it)) }, colors = switchColors)
-        }
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-            Text("Trocar com toque duplo", fontSize = 13.sp, color = PrismColors.PureWhite)
-            Switch(checked = project.changeOnDoubleTap, onCheckedChange = { onCommit(project.copy(changeOnDoubleTap = it)) }, colors = switchColors)
-        }
-        PrecisionSliderField("Intervalo", project.intervalMin.toFloat(), 0f..120f, "m", 0, onSaveFinished) { v -> onStage(project.copy(intervalMin = v.roundToInt())) }
-        PrecisionSliderField("Escurecer", project.dim * 100f, 0f..70f, "%", 0, onSaveFinished) { v -> onStage(project.copy(dim = v / 100f)) }
-
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(value = cityInput, onValueChange = { cityInput = it }, label = { Text("Cidade (Open-Meteo)") }, singleLine = true, modifier = Modifier.weight(1f))
-            Button(
-                onClick = {
-                    scope.launch {
-                        val g = EnvProvider.geocode(cityInput)
-                        if (g != null) onCommit(project.copy(lat = g.first, lon = g.second, city = g.third))
+                if (project.depth) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("Proteção Cobertura Relógio", fontSize = 12.sp, color = PrismColors.MutedZinc)
+                        Switch(checked = project.depthGuard, onCheckedChange = { onCommit(project.copy(depthGuard = it)) }, colors = switchColors)
                     }
-                },
-                colors = ButtonDefaults.buttonColors(containerColor = PrismColors.PureWhite, contentColor = PrismColors.PureBlack)
-            ) { Text("Buscar", fontWeight = FontWeight.SemiBold) }
+                    QuickPresetRow(
+                        items = listOf(
+                            "Original" to {
+                                onCommit(project.copy(depthBgBlur = 0f, depthBgDesaturate = 0f, depthInvertColorPop = false, depthSubjectPop = 0f, depthVignette = 0f))
+                            },
+                            "Modo Retrato" to {
+                                onCommit(project.copy(depthBgBlur = 0.55f, depthBgDesaturate = 0f, depthInvertColorPop = false, depthSubjectPop = 0.25f, depthVignette = 0.28f))
+                            },
+                            "Color Pop P&B" to {
+                                onCommit(project.copy(depthBgBlur = 0.25f, depthBgDesaturate = 1f, depthInvertColorPop = false, depthSubjectPop = 0.30f, depthVignette = 0.25f))
+                            },
+                            "Cine 3D" to {
+                                onCommit(project.copy(depthBgBlur = 0.72f, depthBgDesaturate = 0.65f, depthInvertColorPop = false, depthSubjectPop = 0.35f, depthVignette = 0.45f))
+                            }
+                        )
+                    )
+                    PrecisionSliderField("Bokeh Fundo", project.depthBgBlur * 100f, 0f..100f, "%", 0, onSaveFinished) { v ->
+                        onStage(project.copy(depthBgBlur = (v / 100f).coerceIn(0f, 1f)))
+                    }
+                    PrecisionSliderField("Fundo P&B", project.depthBgDesaturate * 100f, 0f..100f, "%", 0, onSaveFinished) { v ->
+                        onStage(project.copy(depthBgDesaturate = (v / 100f).coerceIn(0f, 1f)))
+                    }
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("Inverter Color Pop (Sujeito P&B)", fontSize = 12.sp, color = PrismColors.MutedZinc)
+                        Switch(checked = project.depthInvertColorPop, onCheckedChange = { onCommit(project.copy(depthInvertColorPop = it)) }, colors = switchColors)
+                    }
+                    PrecisionSliderField("Destaque Sujeito", project.depthSubjectPop * 100f, 0f..100f, "%", 0, onSaveFinished) { v ->
+                        onStage(project.copy(depthSubjectPop = (v / 100f).coerceIn(0f, 1f)))
+                    }
+                    PrecisionSliderField("Vinheta & Halo 3D", project.depthVignette * 100f, 0f..100f, "%", 0, onSaveFinished) { v ->
+                        onStage(project.copy(depthVignette = (v / 100f).coerceIn(0f, 1f)))
+                    }
+                }
+            }
+        }
+
+        if (node != null) {
+            val parentStack = remember(node.id, project.layers) { project.layers.parentOf(node.id) }
+            StudioSection(
+                title = "Posição, Âncora & Visibilidade",
+                summary = if (parentStack != null) "Na pilha \"${parentStack.name}\"" else "${(node.x * 100).roundToInt()}%, ${(node.y * 100).roundToInt()}%",
+                initiallyExpanded = false
+            ) {
+                if (parentStack != null) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color(0x16FFFFFF))
+                            .border(1.dp, PrismColors.GlassBorder, RoundedCornerShape(12.dp))
+                            .padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "Camada filha da pilha \"${parentStack.name}\". Posição e âncora seguem o grupo pai.",
+                            fontSize = 11.sp,
+                            color = PrismColors.MutedZinc
+                        )
+                        OutlinedButton(
+                            onClick = { onSelectLayer(parentStack.id) },
+                            shape = RoundedCornerShape(10.dp),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, PrismColors.GlassBorderStrong),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                        ) {
+                            Text("Selecionar Pilha Pai", fontSize = 11.sp, color = PrismColors.PureWhite)
+                        }
+                    }
+                } else {
+                    QuickPresetRow(
+                        items = listOf(
+                            "Topo Centro" to { onUpdateNode { it.copy(x = 0.5f, y = 0.16f, anchor = Anchor.TOP_CENTER) }; onSaveFinished() },
+                            "Centro" to { onUpdateNode { it.copy(x = 0.5f, y = 0.5f, anchor = Anchor.CENTER) }; onSaveFinished() },
+                            "Rodapé" to { onUpdateNode { it.copy(x = 0.5f, y = 0.84f, anchor = Anchor.BOTTOM_CENTER) }; onSaveFinished() }
+                        )
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Box(Modifier.weight(1f)) {
+                            PrecisionSliderField("Posição X", node.x * 100f, 0f..100f, "%", 1, onSaveFinished) { v -> onUpdateNode { it.copy(x = v / 100f) } }
+                        }
+                        OutlinedButton(onClick = { onUpdateNode { it.copy(x = (it.x - 1f / 1080f).coerceIn(0f, 1f)) }; onSaveFinished() }, contentPadding = PaddingValues(horizontal = 8.dp), modifier = Modifier.height(30.dp)) { Text("-1px", fontSize = 10.sp, color = PrismColors.PureWhite) }
+                        OutlinedButton(onClick = { onUpdateNode { it.copy(x = (it.x + 1f / 1080f).coerceIn(0f, 1f)) }; onSaveFinished() }, contentPadding = PaddingValues(horizontal = 8.dp), modifier = Modifier.height(30.dp)) { Text("+1px", fontSize = 10.sp, color = PrismColors.PureWhite) }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Box(Modifier.weight(1f)) {
+                            PrecisionSliderField("Posição Y", node.y * 100f, 0f..100f, "%", 1, onSaveFinished) { v -> onUpdateNode { it.copy(y = v / 100f) } }
+                        }
+                        OutlinedButton(onClick = { onUpdateNode { it.copy(y = (it.y - 1f / 2400f).coerceIn(0f, 1f)) }; onSaveFinished() }, contentPadding = PaddingValues(horizontal = 8.dp), modifier = Modifier.height(30.dp)) { Text("-1px", fontSize = 10.sp, color = PrismColors.PureWhite) }
+                        OutlinedButton(onClick = { onUpdateNode { it.copy(y = (it.y + 1f / 2400f).coerceIn(0f, 1f)) }; onSaveFinished() }, contentPadding = PaddingValues(horizontal = 8.dp), modifier = Modifier.height(30.dp)) { Text("+1px", fontSize = 10.sp, color = PrismColors.PureWhite) }
+                    }
+                    Text("Âncora da Camada", fontSize = 12.sp, color = PrismColors.MutedZinc)
+                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Anchor.entries.forEach { a ->
+                            val sel = node.anchor == a
+                            FilterChip(selected = sel, onClick = { onUpdateNode { it.copy(anchor = a) }; onSaveFinished() }, label = { Text(anchorLabel(a), fontSize = 10.sp) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
+                        }
+                    }
+                }
+                Text("Regra de Visibilidade", fontSize = 12.sp, color = PrismColors.MutedZinc)
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Cond.entries.forEach { c ->
+                        val sel = node.cond == c
+                        FilterChip(selected = sel, onClick = { onUpdateNode { it.copy(cond = c) }; onSaveFinished() }, label = { Text(condLabel(c), fontSize = 10.sp) }, colors = prismFilterChipColors(), border = prismFilterChipBorder(sel))
+                    }
+                }
+            }
+        }
+
+        StudioSection(
+            title = "Automação, Clima & Escurecer",
+            summary = "${(project.dim * 100).roundToInt()}% dim",
+            initiallyExpanded = false
+        ) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("Trocar ao apagar tela", fontSize = 13.sp, color = PrismColors.PureWhite)
+                Switch(checked = project.changeOnWake, onCheckedChange = { onCommit(project.copy(changeOnWake = it)) }, colors = switchColors)
+            }
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("Trocar com toque duplo", fontSize = 13.sp, color = PrismColors.PureWhite)
+                Switch(checked = project.changeOnDoubleTap, onCheckedChange = { onCommit(project.copy(changeOnDoubleTap = it)) }, colors = switchColors)
+            }
+            PrecisionSliderField("Intervalo", project.intervalMin.toFloat(), 0f..120f, "m", 0, onSaveFinished) { v -> onStage(project.copy(intervalMin = v.roundToInt())) }
+            PrecisionSliderField("Escurecer", project.dim * 100f, 0f..70f, "%", 0, onSaveFinished) { v -> onStage(project.copy(dim = v / 100f)) }
+
+            var showCityDialog by remember { mutableStateOf(false) }
+            FocusedFieldTrigger(
+                label = "Cidade (Clima Open-Meteo)",
+                value = cityInput,
+                placeholder = "Ex: São Paulo",
+                onClick = { showCityDialog = true }
+            )
+            if (showCityDialog) {
+                FocusedInputDialog(
+                    title = "Cidade para Clima (Open-Meteo)",
+                    initialValue = cityInput,
+                    placeholder = "São Paulo",
+                    exampleHint = "Ex: São Paulo, Rio de Janeiro, Curitiba",
+                    confirmLabel = "Buscar Clima",
+                    onDismiss = { showCityDialog = false },
+                    onConfirm = { raw ->
+                        val trimmed = raw.trim()
+                        cityInput = trimmed
+                        showCityDialog = false
+                        if (trimmed.isNotEmpty()) {
+                            scope.launch {
+                                val g = EnvProvider.geocode(trimmed)
+                                if (g != null) onCommit(project.copy(lat = g.first, lon = g.second, city = g.third))
+                            }
+                        }
+                    }
+                )
+            }
         }
         Button(
             onClick = onApplyWallpaper,

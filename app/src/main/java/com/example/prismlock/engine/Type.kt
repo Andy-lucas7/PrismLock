@@ -10,10 +10,15 @@ import android.graphics.RectF
 import android.graphics.Region
 import android.graphics.Typeface
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.util.LruCache
+import androidx.compose.ui.text.font.FontFamily as ComposeFontFamily
+import com.example.prismlock.R
 import com.example.prismlock.model.Align
 import com.example.prismlock.model.LayerNode
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.RandomAccessFile
 import kotlin.math.roundToInt
@@ -22,14 +27,234 @@ import kotlin.math.sqrt
 data class FontAxis(val tag: String, val min: Float, val def: Float, val max: Float)
 
 object FontManager {
+    const val SAMSUNG_SYSTEM_FONT_ID = "system:samsung_sharp"
+
+    data class BundledFontSpec(val id: String, val label: String, val resId: Int, val fileName: String)
+
+    val bundledFonts = listOf(
+        BundledFontSpec("res:outfit", "Outfit", R.font.outfit, "outfit.ttf"),
+        BundledFontSpec("res:inter", "Inter", R.font.inter, "inter.ttf"),
+        BundledFontSpec("res:space_grotesk", "Space Grotesk", R.font.space_grotesk, "space_grotesk.ttf"),
+        BundledFontSpec("res:bebas_neue", "Bebas Neue", R.font.bebas_neue, "bebas_neue.ttf"),
+        BundledFontSpec("res:playfair_display", "Playfair Display", R.font.playfair_display, "playfair_display.ttf"),
+        BundledFontSpec("res:jetbrains_mono", "JetBrains Mono", R.font.jetbrains_mono, "jetbrains_mono.ttf"),
+        BundledFontSpec("res:syne", "Syne", R.font.syne, "syne.ttf"),
+        BundledFontSpec("res:plus_jakarta_sans", "Plus Jakarta Sans", R.font.plus_jakarta_sans, "plus_jakarta_sans.ttf")
+    )
+
     val systemFamilies = listOf("sans-serif", "sans-serif-light", "sans-serif-condensed", "sans-serif-medium", "serif", "monospace", "cursive", "casual", "serif-monospace")
     private val tfCache = HashMap<String, Typeface>()
+    private val composeFamilyCache = HashMap<String, ComposeFontFamily>()
     private val axesCache = HashMap<String, List<FontAxis>>()
+    private val familyNameCache = HashMap<String, String>()
+    private val samsungFontFiles = ArrayList<File>()
+    @Volatile private var scannedSamsung = false
+    private var appCtx: Context? = null
     private lateinit var dir: File
+    private lateinit var customDir: File
+    private lateinit var bundledDir: File
 
-    fun init(ctx: Context) { if (!::dir.isInitialized) dir = File(ctx.applicationContext.filesDir, "fonts").apply { mkdirs() } }
+    fun init(ctx: Context) {
+        appCtx = ctx.applicationContext
+        if (!::dir.isInitialized) dir = File(ctx.applicationContext.filesDir, "fonts").apply { mkdirs() }
+        if (!::customDir.isInitialized) customDir = File(ctx.applicationContext.filesDir, "custom_fonts").apply { mkdirs() }
+        if (!::bundledDir.isInitialized) bundledDir = File(ctx.applicationContext.filesDir, "bundled_fonts").apply { mkdirs() }
+        scanSamsungFontsOnce()
+    }
 
-    fun imported(ctx: Context): List<String> { init(ctx); return dir.listFiles()?.map { "file:" + it.name }?.sorted() ?: emptyList() }
+    fun customFontsDir(ctx: Context): File {
+        init(ctx)
+        return customDir
+    }
+
+    suspend fun prewarm(ctx: Context) = withContext(Dispatchers.IO) {
+        init(ctx)
+        availableFonts(ctx).forEach { f ->
+            label(f)
+            typeface(f, 400)
+            axes(f)
+        }
+    }
+
+    private fun scanSamsungFontsOnce() {
+        if (scannedSamsung) return
+        synchronized(samsungFontFiles) {
+            if (scannedSamsung) return
+            val dirs = listOf(
+                File("/system/fonts"),
+                File("/product/fonts"),
+                File("/system/product/fonts")
+            )
+            val candidates = ArrayList<Pair<Int, File>>()
+            for (d in dirs) {
+                val files = d.listFiles() ?: continue
+                for (f in files) {
+                    if (!f.isFile || !f.canRead() || f.length() < 4096L) continue
+                    val n = f.name
+                    val low = n.lowercase()
+                    if (!low.endsWith(".ttf") && !low.endsWith(".otf")) continue
+                    if ("emoji" in low || "color" in low) continue
+                    val priority = when {
+                        low.startsWith("samsungsharpsans") -> 0
+                        low.startsWith("oneuisans") -> 1
+                        low.startsWith("sec") -> 2
+                        else -> -1
+                    }
+                    if (priority >= 0 && runCatching { Typeface.Builder(f).build() }.getOrNull() != null) {
+                        candidates.add(priority to f)
+                    }
+                }
+            }
+            samsungFontFiles.clear()
+            samsungFontFiles.addAll(
+                candidates.sortedWith(compareBy<Pair<Int, File>> { it.first }.thenBy { it.second.name.length })
+                    .map { it.second }
+            )
+            scannedSamsung = true
+        }
+    }
+
+    fun hasNativeSamsungFont(): Boolean {
+        scanSamsungFontsOnce()
+        return samsungFontFiles.isNotEmpty()
+    }
+
+    private fun pickSamsungFile(weight: Int = 400): File? {
+        scanSamsungFontsOnce()
+        if (samsungFontFiles.isEmpty()) return null
+        val want = when {
+            weight >= 650 -> listOf("bold", "vf", "regular")
+            weight >= 500 -> listOf("medium", "vf", "regular")
+            weight <= 320 -> listOf("light", "vf", "regular")
+            else -> listOf("regular", "vf", "medium")
+        }
+        for (tag in want) {
+            samsungFontFiles.firstOrNull { tag in it.name.lowercase() }?.let { return it }
+        }
+        return samsungFontFiles.firstOrNull()
+    }
+
+    private fun bundledFile(font: String): File? {
+        val spec = bundledFonts.firstOrNull { it.id == font } ?: return null
+        val ctx = appCtx ?: return null
+        if (!::bundledDir.isInitialized) bundledDir = File(ctx.filesDir, "bundled_fonts").apply { mkdirs() }
+        val dst = File(bundledDir, spec.fileName)
+        if (!dst.exists() || dst.length() < 1024L) {
+            runCatching {
+                ctx.resources.openRawResource(spec.resId).use { input ->
+                    dst.outputStream().use { out -> input.copyTo(out) }
+                }
+            }
+        }
+        return dst.takeIf { it.exists() && it.length() >= 1024L }
+    }
+
+    fun availableFonts(ctx: Context): List<String> {
+        init(ctx)
+        val out = ArrayList<String>(32)
+        if (hasNativeSamsungFont()) out += SAMSUNG_SYSTEM_FONT_ID
+        bundledFonts.forEach { out += it.id }
+        out += customSynced(ctx)
+        out += imported(ctx)
+        out += systemFamilies
+        return out
+    }
+
+    fun customSynced(ctx: Context): List<String> {
+        init(ctx)
+        return customDir.listFiles()
+            ?.filter { it.isFile && (it.name.endsWith(".ttf", true) || it.name.endsWith(".otf", true)) }
+            ?.sortedBy { label("custom:" + it.name).lowercase() }
+            ?.map { "custom:" + it.name }
+            ?: emptyList()
+    }
+
+    fun imported(ctx: Context): List<String> {
+        init(ctx)
+        return dir.listFiles()
+            ?.filter { it.isFile }
+            ?.map { "file:" + it.name }
+            ?.sorted()
+            ?: emptyList()
+    }
+
+    suspend fun syncFontFolder(ctx: Context, treeUriStr: String?): Int = withContext(Dispatchers.IO) {
+        init(ctx)
+        if (treeUriStr.isNullOrBlank()) return@withContext 0
+        val treeUri = runCatching { Uri.parse(treeUriStr) }.getOrNull() ?: return@withContext 0
+        val rootDocId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull() ?: return@withContext 0
+
+        val queue = ArrayDeque<Pair<String, Int>>()
+        queue.add(rootDocId to 0)
+        var syncedCount = 0
+
+        while (queue.isNotEmpty()) {
+            val (docId, depth) = queue.removeFirst()
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
+            runCatching {
+                ctx.contentResolver.query(
+                    childrenUri,
+                    arrayOf(
+                        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                        DocumentsContract.Document.COLUMN_MIME_TYPE,
+                        DocumentsContract.Document.COLUMN_SIZE
+                    ),
+                    null,
+                    null,
+                    null
+                )?.use { cursor ->
+                    val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                    val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                    val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                    val sizeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                    while (cursor.moveToNext()) {
+                        val childId = if (idIdx >= 0) cursor.getString(idIdx) else continue
+                        val displayName = if (nameIdx >= 0) cursor.getString(nameIdx) ?: "" else ""
+                        val mime = if (mimeIdx >= 0) cursor.getString(mimeIdx) ?: "" else ""
+                        val srcSize = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) cursor.getLong(sizeIdx) else -1L
+
+                        if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                            if (depth < 2) queue.add(childId to (depth + 1))
+                            continue
+                        }
+                        val lower = displayName.lowercase()
+                        val isFontFile = lower.endsWith(".ttf") || lower.endsWith(".otf") ||
+                            mime.contains("font", ignoreCase = true)
+                        if (!isFontFile || displayName.isBlank()) continue
+
+                        val safeName = displayName.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                        val dst = File(customDir, safeName)
+                        val needsCopy = !dst.exists() || (srcSize > 0L && dst.length() != srcSize)
+                        if (needsCopy) {
+                            val fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, childId)
+                            val copied = runCatching {
+                                ctx.contentResolver.openInputStream(fileUri)?.use { input ->
+                                    dst.outputStream().use { out -> input.copyTo(out) }
+                                }
+                                Typeface.Builder(dst).build() ?: error("invalid font")
+                            }.isSuccess
+                            if (copied) {
+                                val key = "custom:$safeName"
+                                synchronized(tfCache) {
+                                    tfCache.keys.removeAll { it.startsWith("$key|") }
+                                    composeFamilyCache.keys.removeAll { it.startsWith("$key|") }
+                                }
+                                synchronized(axesCache) { axesCache.remove(key) }
+                                synchronized(familyNameCache) { familyNameCache.remove(key) }
+                                syncedCount++
+                            } else {
+                                dst.delete()
+                            }
+                        } else {
+                            syncedCount++
+                        }
+                    }
+                }
+            }
+        }
+        syncedCount
+    }
 
     fun import(ctx: Context, uri: Uri): String? = runCatching {
         init(ctx)
@@ -38,25 +263,128 @@ object FontManager {
         val f = File(dir, name)
         ctx.contentResolver.openInputStream(uri)!!.use { i -> f.outputStream().use { i.copyTo(it) } }
         Typeface.Builder(f).build() ?: error("invalid")
-        "file:$name"
+        val id = "file:$name"
+        synchronized(familyNameCache) { familyNameCache.remove(id) }
+        id
     }.getOrNull()
 
-    fun file(font: String): File? = if (font.startsWith("file:") && ::dir.isInitialized) File(dir, font.removePrefix("file:")).takeIf { it.exists() } else null
+    fun file(font: String): File? = when {
+        font == SAMSUNG_SYSTEM_FONT_ID -> pickSamsungFile(400) ?: bundledFile("res:outfit")
+        font.startsWith("res:") -> bundledFile(font)
+        font.startsWith("custom:") && ::customDir.isInitialized -> File(customDir, font.removePrefix("custom:")).takeIf { it.exists() }
+        font.startsWith("file:") && ::dir.isInitialized -> File(dir, font.removePrefix("file:")).takeIf { it.exists() }
+        else -> null
+    }
 
-    fun label(font: String) = font.removePrefix("file:")
+    fun label(font: String): String = when {
+        font == SAMSUNG_SYSTEM_FONT_ID -> if (hasNativeSamsungFont()) "Sistema (Samsung Sharp Sans)" else "Outfit (Geométrica)"
+        font.startsWith("res:") -> bundledFonts.firstOrNull { it.id == font }?.label ?: font.removePrefix("res:")
+        font.startsWith("custom:") || font.startsWith("file:") -> {
+            synchronized(familyNameCache) {
+                familyNameCache.getOrPut(font) {
+                    val f = file(font)
+                    val parsed = f?.let { runCatching { readFamilyName(it) }.getOrNull() }?.takeIf { it.isNotBlank() }
+                    parsed ?: font.removePrefix("custom:").removePrefix("file:")
+                        .replace(Regex("\\.(ttf|otf)$", RegexOption.IGNORE_CASE), "")
+                        .replace('_', ' ')
+                        .replace('-', ' ')
+                        .trim()
+                }
+            }
+        }
+        else -> font
+    }
+
+    fun composeFontFamily(font: String, weight: Int = 400): ComposeFontFamily = synchronized(composeFamilyCache) {
+        composeFamilyCache.getOrPut("$font|$weight") {
+            ComposeFontFamily(typeface(font, weight))
+        }
+    }
 
     fun typeface(font: String, weight: Int): Typeface = synchronized(tfCache) {
         tfCache.getOrPut("$font|$weight") {
-            val f = file(font)
-            if (f != null) {
-                val base = runCatching { Typeface.Builder(f).build() }.getOrNull() ?: Typeface.DEFAULT
+            val resolvedFile = if (font == SAMSUNG_SYSTEM_FONT_ID) {
+                pickSamsungFile(weight) ?: bundledFile("res:outfit")
+            } else {
+                file(font)
+            }
+            if (resolvedFile != null) {
+                val base = runCatching { Typeface.Builder(resolvedFile).build() }.getOrNull() ?: Typeface.DEFAULT
                 if (axes(font).any { it.tag == "wght" }) base else Typeface.create(base, weight.coerceIn(1, 1000), false)
-            } else Typeface.create(Typeface.create(font, Typeface.NORMAL), weight.coerceIn(1, 1000), false)
+            } else {
+                Typeface.create(Typeface.create(font, Typeface.NORMAL), weight.coerceIn(1, 1000), false)
+            }
         }
     }
 
     fun axes(font: String): List<FontAxis> = synchronized(axesCache) {
         axesCache.getOrPut(font) { file(font)?.let { runCatching { readFvar(it) }.getOrNull() } ?: emptyList() }
+    }
+
+    /**
+     * Parses OpenType 'name' table to extract real Typographic Family Name (nameID 16)
+     * or Font Family Name (nameID 1).
+     */
+    private fun readFamilyName(f: File): String? = RandomAccessFile(f, "r").use { r ->
+        var base = 0L
+        r.seek(0)
+        val tagBytes = ByteArray(4)
+        r.readFully(tagBytes)
+        if (String(tagBytes) == "ttcf") {
+            r.seek(12)
+            base = r.readInt().toLong() and 0xFFFFFFFFL
+        }
+        r.seek(base + 4)
+        val n = r.readUnsignedShort()
+        var nameOff = -1L
+        for (i in 0 until n) {
+            r.seek(base + 12 + i * 16L)
+            r.readFully(tagBytes)
+            r.readInt()
+            val o = r.readInt().toLong() and 0xFFFFFFFFL
+            if (String(tagBytes) == "name") {
+                nameOff = o
+                break
+            }
+        }
+        if (nameOff < 0) return null
+        r.seek(nameOff)
+        r.readUnsignedShort() // format
+        val count = r.readUnsignedShort()
+        val stringOffset = r.readUnsignedShort()
+        val storageStart = nameOff + stringOffset
+
+        var bestName16: String? = null
+        var bestName1: String? = null
+        for (i in 0 until count) {
+            r.seek(nameOff + 6 + i * 12L)
+            val platformId = r.readUnsignedShort()
+            r.readUnsignedShort() // encodingId
+            val languageId = r.readUnsignedShort()
+            val nameId = r.readUnsignedShort()
+            val len = r.readUnsignedShort()
+            val off = r.readUnsignedShort()
+            if (nameId != 16 && nameId != 1) continue
+            if (len <= 0 || len > 512) continue
+
+            val buf = ByteArray(len)
+            r.seek(storageStart + off)
+            r.readFully(buf)
+            val decoded = when (platformId) {
+                3, 0 -> String(buf, Charsets.UTF_16BE)
+                1 -> String(buf, Charsets.ISO_8859_1)
+                else -> continue
+            }.trim().replace("\u0000", "")
+            if (decoded.isBlank()) continue
+
+            val isEnglishWin = platformId == 3 && languageId == 0x0409
+            if (nameId == 16) {
+                if (bestName16 == null || isEnglishWin) bestName16 = decoded
+            } else {
+                if (bestName1 == null || isEnglishWin) bestName1 = decoded
+            }
+        }
+        bestName16 ?: bestName1
     }
 
     /**

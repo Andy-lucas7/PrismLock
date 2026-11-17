@@ -408,31 +408,45 @@ object WallpaperBaker {
             val rawBmp = WallpaperCarousel.loadBitmap(ctx, uriStr, baseW, baseH)
             if (rawBmp != null) {
                 val exactSharp = centerCropOpaque(rawBmp, baseW, baseH)
-                FileOutputStream(sharpFile(ctx, bakeVersion, id)).use { out ->
-                    exactSharp.compress(Bitmap.CompressFormat.WEBP_LOSSY, 96, out)
-                    out.flush()
-                }
-
-                onProgress(baseRatio + (0.25f / total), "Pré-renderizando vidro jateado ${index + 1}/$total...")
-                val frostedBmp = renderer.bakeBlurredBitmap(exactSharp, baseW, baseH, blurPx)
-                FileOutputStream(frostedFile(ctx, bakeVersion, id)).use { out ->
-                    frostedBmp.compress(Bitmap.CompressFormat.WEBP_LOSSY, 94, out)
-                    out.flush()
-                }
-
                 val wantDepth = !isVideo && project.depth && project.isDepthEnabledFor(imgKey)
                 var hasDepthMask = false
+                var finalSharp = exactSharp
+
                 if (wantDepth) {
-                    onProgress(baseRatio + (0.50f / total), "Recortando sujeito 3D ${index + 1}/$total...")
+                    onProgress(baseRatio + (0.18f / total), "Recortando sujeito 3D ${index + 1}/$total...")
                     val rawMask = SubjectDepthEngine.getOrCreateMask(ctx, uriStr, exactSharp)
                     if (rawMask != null) {
                         val croppedMask = centerCropAlpha(rawMask, baseW, baseH)
+                        val processedMask = if (project.hasDepthPostProcessing()) {
+                            onProgress(baseRatio + (0.34f / total), "Aplicando Bokeh e Color Pop 3D ${index + 1}/$total...")
+                            finalSharp = SubjectDepthEngine.composeProcessedWallpaper(
+                                baseSharp = exactSharp,
+                                depthMask = croppedMask,
+                                project = project,
+                                blurFn = { src, r -> renderer.bakeBlurredBitmap(src, baseW, baseH, r) }
+                            )
+                            SubjectDepthEngine.applySubjectColorPopMask(croppedMask, project)
+                        } else {
+                            croppedMask
+                        }
                         FileOutputStream(depthFile(ctx, bakeVersion, id)).use { out ->
-                            croppedMask.compress(Bitmap.CompressFormat.PNG, 92, out)
+                            processedMask.compress(Bitmap.CompressFormat.PNG, 92, out)
                             out.flush()
                         }
                         hasDepthMask = true
                     }
+                }
+
+                FileOutputStream(sharpFile(ctx, bakeVersion, id)).use { out ->
+                    finalSharp.compress(Bitmap.CompressFormat.WEBP_LOSSY, 96, out)
+                    out.flush()
+                }
+
+                onProgress(baseRatio + (0.55f / total), "Pré-renderizando vidro jateado ${index + 1}/$total...")
+                val frostedBmp = renderer.bakeBlurredBitmap(finalSharp, baseW, baseH, blurPx)
+                FileOutputStream(frostedFile(ctx, bakeVersion, id)).use { out ->
+                    frostedBmp.compress(Bitmap.CompressFormat.WEBP_LOSSY, 94, out)
+                    out.flush()
                 }
 
                 entries.add(BakedWallpaperEntry(id = id, uri = uriStr, imageKey = imgKey, hasDepth = hasDepthMask, isVideo = isVideo))
@@ -472,7 +486,7 @@ object WallpaperBaker {
         manifest
     }
 
-    private fun centerCropOpaque(src: Bitmap, w: Int, h: Int): Bitmap {
+    fun centerCropOpaque(src: Bitmap, w: Int, h: Int): Bitmap {
         if (src.width == w && src.height == h && !src.hasAlpha()) return src
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val c = Canvas(out)

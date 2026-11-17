@@ -1,7 +1,9 @@
 package com.example.prismlock.ui
 
 import android.graphics.Bitmap
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -30,16 +32,20 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons as MIcons
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Edit
-import androidx.compose.material.icons.rounded.FileUpload
+import androidx.compose.material.icons.rounded.FileDownload
+import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
 import androidx.compose.material.icons.rounded.Wallpaper
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
@@ -80,6 +86,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.util.lerp
 import com.example.prismlock.data.Env
+import com.example.prismlock.engine.FontManager
 import com.example.prismlock.engine.LiquidGlassRenderer
 import com.example.prismlock.engine.WallpaperBaker
 import com.example.prismlock.model.Project
@@ -103,6 +110,7 @@ fun ThemeHubScreen(
     env: Env,
     onCreateTheme: (String) -> Unit,
     onImportTheme: () -> Unit,
+    onImportFolderTheme: () -> Unit = {},
     onEditTheme: (Project) -> Unit,
     onApplyTheme: (Project) -> Unit,
     onDeleteTheme: (Project) -> Unit
@@ -119,6 +127,7 @@ fun ThemeHubScreen(
     val ambientWallpapers = remember { mutableStateMapOf<String, Bitmap?>() }
     var showCreateDialog by remember { mutableStateOf(false) }
     var newThemeName by remember { mutableStateOf("") }
+    var showImportMenu by remember { mutableStateOf(false) }
 
     DisposableEffect(cardRenderer) {
         onDispose { cardRenderer.release() }
@@ -146,6 +155,9 @@ fun ThemeHubScreen(
     // Render full preview bitmaps offscreen on Dispatchers.Default for visible themes
     val nowMinute = LocalDateTime.now().withSecond(0).withNano(0)
     LaunchedEffect(themes, env, nowMinute) {
+        val activeIds = themes.mapTo(HashSet()) { it.id }
+        previewBitmaps.keys.toList().filter { it !in activeIds }.forEach { previewBitmaps.remove(it) }
+        ambientWallpapers.keys.toList().filter { '|' !in it && it !in activeIds }.forEach { ambientWallpapers.remove(it) }
         for (theme in themes) {
             val cacheKey = "${theme.id}|${theme.hashCode()}|${env.battery}|${env.temp}|${nowMinute}"
             if (previewBitmaps[theme.id] != null && ambientWallpapers.containsKey(cacheKey)) continue
@@ -153,8 +165,17 @@ fun ThemeHubScreen(
                 renderMutex.withLock {
                     cardRenderer.clearShaderCachesForHome()
                     val uri = WallpaperCarousel.currentUri(ctx, theme, advance = false)
-                    val bgBmp = WallpaperCarousel.loadBitmap(ctx, uri, cardRenderW, cardRenderH)
-                    val depthMask = SubjectDepthEngine.getOrCreateMaskIfEnabled(ctx, uri, bgBmp, theme)
+                    val rawBg = WallpaperCarousel.loadBitmap(ctx, uri, cardRenderW, cardRenderH)
+                    val rawMask = SubjectDepthEngine.getOrCreateMaskIfEnabled(ctx, uri, rawBg, theme)
+                    val bgBmp = if (rawBg != null && rawMask != null && theme.hasDepthPostProcessing()) {
+                        val base = WallpaperBaker.centerCropOpaque(rawBg, cardRenderW, cardRenderH)
+                        SubjectDepthEngine.composeProcessedWallpaper(base, rawMask, theme) { s, r ->
+                            cardRenderer.bakeBlurredBitmap(s, cardRenderW, cardRenderH, r)
+                        }
+                    } else rawBg
+                    val depthMask = if (rawMask != null && theme.hasDepthPostProcessing()) {
+                        SubjectDepthEngine.applySubjectColorPopMask(rawMask, theme)
+                    } else rawMask
                     val bmp = cardRenderer.renderPreviewBitmap(
                         w = cardRenderW,
                         h = cardRenderH,
@@ -180,29 +201,27 @@ fun ThemeHubScreen(
     ) {
         // Real ambient blurred wallpaper glow behind the pure black hub chrome
         val ambientBmp = currentTheme?.let { ambientWallpapers[it.id] ?: previewBitmaps[it.id] }
-        if (ambientBmp != null && !ambientBmp.isRecycled) {
-            Image(
-                bitmap = ambientBmp.asImageBitmap(),
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .blur(64.dp)
-                    .alpha(0.24f)
-            )
+        Crossfade(
+            targetState = ambientBmp,
+            animationSpec = tween(320),
+            label = "AmbientGlow"
+        ) { targetBmp ->
+            if (targetBmp != null && !targetBmp.isRecycled) {
+                Image(
+                    bitmap = targetBmp.asImageBitmap(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .blur(72.dp)
+                        .alpha(0.32f)
+                )
+            }
         }
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(
-                    Brush.verticalGradient(
-                        listOf(
-                            Color(0xD0000000),
-                            Color(0x55000000),
-                            Color(0xEB000000)
-                        )
-                    )
-                )
+                .background(Color(0x9E000000))
         )
 
         Column(
@@ -212,75 +231,139 @@ fun ThemeHubScreen(
                 .navigationBarsPadding(),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Minimalist monochrome frosted TopBar
+            // Modern Circular Glass TopBar
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 18.dp, vertical = 14.dp),
+                    .padding(horizontal = 20.dp, vertical = 14.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column {
+                    val brandFamily = remember {
+                        FontManager.init(ctx)
+                        FontManager.composeFontFamily(FontManager.SAMSUNG_SYSTEM_FONT_ID, 600)
+                    }
                     Text(
                         text = "PrismLock",
                         color = PrismColors.PureWhite,
-                        fontSize = 21.sp,
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = (-0.5).sp
+                        fontFamily = brandFamily,
+                        fontSize = 25.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        letterSpacing = (-0.4).sp
                     )
                     Text(
                         text = "${themes.size} ${if (themes.size == 1) "tema salvo" else "temas salvos"}",
-                        color = PrismColors.MutedZinc,
+                        color = Color(0x99FFFFFF),
                         fontSize = 11.sp
                     )
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Box(
-                        modifier = Modifier
-                            .frostedChrome(shape = RoundedCornerShape(20.dp), elevation = 6.dp)
-                            .clickable { onImportTheme() }
-                            .padding(horizontal = 12.dp, vertical = 8.dp)
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                            Icon(MIcons.Rounded.FileUpload, contentDescription = "Importar", tint = PrismColors.PureWhite, modifier = Modifier.size(16.dp))
-                            Text("Importar", color = PrismColors.PureWhite, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Box {
+                        Box(
+                            modifier = Modifier
+                                .size(46.dp)
+                                .shadow(12.dp, CircleShape, ambientColor = Color.Black, spotColor = Color.Black)
+                                .clip(CircleShape)
+                                .background(Color(0x66222228))
+                                .clickable { showImportMenu = true },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                MIcons.Rounded.FileDownload,
+                                contentDescription = "Importar",
+                                tint = PrismColors.PureWhite,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                        DropdownMenu(
+                            expanded = showImportMenu,
+                            onDismissRequest = { showImportMenu = false },
+                            shape = RoundedCornerShape(20.dp),
+                            containerColor = Color(0xEC141418)
+                        ) {
+                            DropdownMenuItem(
+                                leadingIcon = { Icon(MIcons.Rounded.FileDownload, null, tint = PrismColors.PureWhite, modifier = Modifier.size(18.dp)) },
+                                text = { Text("Importar Arquivo (.prism / .zip)", color = PrismColors.PureWhite, fontSize = 13.sp) },
+                                onClick = {
+                                    showImportMenu = false
+                                    onImportTheme()
+                                }
+                            )
+                            DropdownMenuItem(
+                                leadingIcon = { Icon(MIcons.Rounded.FolderOpen, null, tint = PrismColors.PureWhite, modifier = Modifier.size(18.dp)) },
+                                text = { Text("Importar Pasta", color = PrismColors.PureWhite, fontSize = 13.sp) },
+                                onClick = {
+                                    showImportMenu = false
+                                    onImportFolderTheme()
+                                }
+                            )
                         }
                     }
                     Box(
                         modifier = Modifier
-                            .frostedChrome(
-                                shape = RoundedCornerShape(20.dp),
-                                elevation = 8.dp,
-                                borderColor = PrismColors.GlassBorderStrong
-                            )
+                            .size(46.dp)
+                            .shadow(14.dp, CircleShape, ambientColor = Color.Black, spotColor = Color.Black)
+                            .clip(CircleShape)
+                            .background(PrismColors.PureWhite)
                             .clickable {
                                 newThemeName = ""
                                 showCreateDialog = true
-                            }
-                            .padding(horizontal = 14.dp, vertical = 8.dp)
+                            },
+                        contentAlignment = Alignment.Center
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                            Icon(MIcons.Rounded.Add, contentDescription = "Nova Tela", tint = PrismColors.PureWhite, modifier = Modifier.size(16.dp))
-                            Text("Nova Tela", color = PrismColors.PureWhite, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                        }
+                        Icon(
+                            MIcons.Rounded.Add,
+                            contentDescription = "Nova Tela",
+                            tint = PrismColors.PureBlack,
+                            modifier = Modifier.size(22.dp)
+                        )
                     }
                 }
             }
 
-            Spacer(Modifier.weight(0.35f))
+            if (currentTheme != null) {
+                Row(
+                    modifier = Modifier
+                        .padding(bottom = 6.dp)
+                        .clip(CircleShape)
+                        .background(Color(0x5C1E1E24))
+                        .padding(horizontal = 14.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(7.dp)
+                ) {
+                    if (currentTheme.id == activeThemeId) {
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .clip(CircleShape)
+                                .background(PrismColors.PureWhite)
+                        )
+                    }
+                    Text(
+                        text = currentTheme.title,
+                        color = PrismColors.PureWhite,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1
+                    )
+                }
+            }
+
+            Spacer(Modifier.weight(0.18f))
 
             // Central Spotlight HorizontalPager
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .fillMaxHeight(0.66f),
+                    .fillMaxHeight(0.73f),
                 contentAlignment = Alignment.Center
             ) {
                 HorizontalPager(
                     state = pagerState,
                     key = { index -> themes.getOrNull(index)?.id ?: index },
-                    contentPadding = PaddingValues(horizontal = 64.dp),
-                    pageSpacing = 16.dp,
+                    contentPadding = PaddingValues(horizontal = 52.dp),
+                    pageSpacing = 14.dp,
                     modifier = Modifier.fillMaxSize()
                 ) { page ->
                     val theme = themes.getOrNull(page) ?: return@HorizontalPager
@@ -294,7 +377,7 @@ fun ThemeHubScreen(
                     val dragY = remember(theme.id) { Animatable(0f) }
                     var triggeredHaptic by remember(theme.id) { mutableStateOf(false) }
 
-                    val cardShape = RoundedCornerShape(28.dp)
+                    val cardShape = RoundedCornerShape(32.dp)
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
@@ -312,16 +395,11 @@ fun ThemeHubScreen(
                                     .aspectRatio(9f / 19.5f)
                                     .offset { IntOffset(0, dragY.value.roundToInt()) }
                                     .graphicsLayer {
-                                        shadowElevation = lerp(24.dp.toPx(), 4.dp.toPx(), pageOffset)
+                                        shadowElevation = lerp(28.dp.toPx(), 6.dp.toPx(), pageOffset)
                                         shape = cardShape
                                         clip = true
                                     }
                                     .background(PrismColors.PureBlack)
-                                    .border(
-                                        width = if (isCenter) 1.2.dp else 1.dp,
-                                        color = if (isCenter) PrismColors.GlassBorderStrong else PrismColors.GlassBorder,
-                                        shape = cardShape
-                                    )
                                 .pointerInput(theme.id, isCenter) {
                                     if (!isCenter) return@pointerInput
                                     detectVerticalDragGestures(
@@ -388,46 +466,7 @@ fun ThemeHubScreen(
                                 }
                             }
 
-                            // Subtle top gradient for theme badge legibility
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(72.dp)
-                                    .background(
-                                        Brush.verticalGradient(
-                                            listOf(Color(0x99000000), Color.Transparent)
-                                        )
-                                    )
-                            )
-
-                            // Theme label + Active indicator
-                            Row(
-                                modifier = Modifier
-                                    .align(Alignment.TopStart)
-                                    .padding(14.dp)
-                                    .frostedChrome(shape = RoundedCornerShape(16.dp), elevation = 4.dp)
-                                    .padding(horizontal = 10.dp, vertical = 5.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                if (theme.id == activeThemeId) {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(6.dp)
-                                            .clip(CircleShape)
-                                            .background(PrismColors.PureWhite)
-                                    )
-                                }
-                                Text(
-                                    text = theme.title,
-                                    color = PrismColors.PureWhite,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    maxLines = 1
-                                )
-                            }
-
-                            // Vertical gesture action pill
+                            // Vertical gesture action pill (borderless frosted glass)
                             val curDrag = dragY.value
                             val dragLabel = when {
                                 curDrag <= -dragThresholdPx * 0.6f -> "Solte ↑ para Editar"
@@ -440,12 +479,9 @@ fun ThemeHubScreen(
                                     modifier = Modifier
                                         .align(Alignment.BottomCenter)
                                         .padding(bottom = 14.dp)
-                                        .frostedChrome(
-                                            shape = RoundedCornerShape(18.dp),
-                                            dense = curDrag.absoluteValue >= dragThresholdPx,
-                                            borderColor = if (curDrag.absoluteValue >= dragThresholdPx) PrismColors.PureWhite else PrismColors.GlassBorder
-                                        )
-                                        .padding(horizontal = 12.dp, vertical = 5.dp),
+                                        .clip(CircleShape)
+                                        .background(if (curDrag.absoluteValue >= dragThresholdPx) Color(0xCC1E1E24) else Color(0x72000000))
+                                        .padding(horizontal = 13.dp, vertical = 6.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                                 ) {
@@ -468,64 +504,69 @@ fun ThemeHubScreen(
                 }
             }
 
-            Spacer(Modifier.weight(0.65f))
+            Spacer(Modifier.weight(0.45f))
 
-            // Refined Frosted Floating Dock (#121215 @ 0.85 alpha + blur feel, 1.dp White 15% border)
+            // Modern Borderless Frosted Floating Pill Dock with Circular Icons
             if (currentTheme != null) {
-                val dockShape = RoundedCornerShape(24.dp)
                 Row(
                     modifier = Modifier
                         .padding(horizontal = 24.dp, vertical = 18.dp)
-                        .shadow(20.dp, dockShape, ambientColor = Color.Black, spotColor = Color.Black)
-                        .clip(dockShape)
-                        .background(Color(0xD9121215))
-                        .border(1.dp, Color(0x26FFFFFF), dockShape)
-                        .padding(horizontal = 12.dp, vertical = 9.dp),
+                        .shadow(20.dp, CircleShape, ambientColor = Color.Black, spotColor = Color.Black)
+                        .clip(CircleShape)
+                        .background(Color(0x6E1E1E24))
+                        .padding(horizontal = 9.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    // Editar
+                    // Editar (circular frosted glass)
                     Box(
                         modifier = Modifier
-                            .clip(RoundedCornerShape(18.dp))
-                            .background(Color(0x1CFFFFFF))
-                            .clickable { onEditTheme(currentTheme) }
-                            .padding(horizontal = 18.dp, vertical = 10.dp)
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                            Icon(MIcons.Rounded.Edit, contentDescription = "Editar", tint = PrismColors.PureWhite, modifier = Modifier.size(17.dp))
-                            Text("Editar", color = PrismColors.PureWhite, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                        }
-                    }
-
-                    // Aplicar (Pure White Primary CTA)
-                    Button(
-                        onClick = { onApplyTheme(currentTheme) },
-                        shape = RoundedCornerShape(18.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = PrismColors.PureWhite,
-                            contentColor = PrismColors.PureBlack
-                        ),
-                        contentPadding = PaddingValues(horizontal = 22.dp, vertical = 10.dp)
-                    ) {
-                        Icon(MIcons.Rounded.CheckCircle, contentDescription = null, modifier = Modifier.size(17.dp))
-                        Spacer(Modifier.width(7.dp))
-                        Text("Aplicar", fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                    }
-
-                    // Excluir
-                    IconButton(
-                        onClick = { pendingDelete = currentTheme },
-                        modifier = Modifier
-                            .size(40.dp)
+                            .size(48.dp)
                             .clip(CircleShape)
-                            .background(Color(0x14FFFFFF))
+                            .background(Color(0x22FFFFFF))
+                            .clickable { onEditTheme(currentTheme) },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            MIcons.Rounded.Edit,
+                            contentDescription = "Editar",
+                            tint = PrismColors.PureWhite,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+
+                    // Aplicar (signature bright PureWhite circular CTA inside glass dock)
+                    Box(
+                        modifier = Modifier
+                            .size(48.dp)
+                            .shadow(10.dp, CircleShape, ambientColor = Color.Black, spotColor = Color.Black)
+                            .clip(CircleShape)
+                            .background(PrismColors.PureWhite)
+                            .clickable { onApplyTheme(currentTheme) },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            MIcons.Rounded.Check,
+                            contentDescription = "Aplicar na Tela de Bloqueio",
+                            tint = PrismColors.PureBlack,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+
+                    // Excluir (circular frosted glass)
+                    Box(
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(Color(0x18FFFFFF))
+                            .clickable { pendingDelete = currentTheme },
+                        contentAlignment = Alignment.Center
                     ) {
                         Icon(
                             MIcons.Rounded.DeleteOutline,
                             contentDescription = "Excluir tema",
-                            tint = PrismColors.MutedZinc,
-                            modifier = Modifier.size(18.dp)
+                            tint = Color(0xCCFFFFFF),
+                            modifier = Modifier.size(20.dp)
                         )
                     }
                 }
@@ -571,79 +612,18 @@ fun ThemeHubScreen(
         }
 
         if (showCreateDialog) {
-            val focusRequester = remember { FocusRequester() }
-            LaunchedEffect(Unit) {
-                focusRequester.requestFocus()
-            }
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color(0xA6000000))
-            )
-            AlertDialog(
-                onDismissRequest = { showCreateDialog = false },
-                containerColor = Color(0xEB111115),
-                titleContentColor = PrismColors.PureWhite,
-                textContentColor = PrismColors.MutedZinc,
-                shape = RoundedCornerShape(26.dp),
-                title = {
-                    Text(
-                        text = "Nova Tela de Bloqueio",
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 18.sp
-                    )
-                },
-                text = {
-                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text(
-                            text = "Dê um nome para identificar esta tela ou pule para usar \"Default Screen\".",
-                            color = PrismColors.MutedZinc,
-                            fontSize = 12.sp
-                        )
-                        OutlinedTextField(
-                            value = newThemeName,
-                            onValueChange = { newThemeName = it },
-                            singleLine = true,
-                            placeholder = { Text("Default Screen", color = PrismColors.MutedZinc) },
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = PrismColors.PureWhite,
-                                unfocusedBorderColor = PrismColors.GlassBorderStrong,
-                                focusedTextColor = PrismColors.PureWhite,
-                                unfocusedTextColor = PrismColors.PureWhite,
-                                cursorColor = PrismColors.PureWhite
-                            ),
-                            shape = RoundedCornerShape(14.dp),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .focusRequester(focusRequester)
-                        )
-                    }
-                },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            val finalTitle = newThemeName.trim().ifBlank { "Default Screen" }
-                            showCreateDialog = false
-                            onCreateTheme(finalTitle)
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = PrismColors.PureWhite,
-                            contentColor = PrismColors.PureBlack
-                        ),
-                        shape = RoundedCornerShape(14.dp)
-                    ) {
-                        Text("Criar Tela", fontWeight = FontWeight.Bold)
-                    }
-                },
-                dismissButton = {
-                    TextButton(
-                        onClick = {
-                            showCreateDialog = false
-                            onCreateTheme("Default Screen")
-                        }
-                    ) {
-                        Text("Pular", color = PrismColors.MutedZinc)
-                    }
+            FocusedInputDialog(
+                title = "Nova Tela de Bloqueio",
+                initialValue = newThemeName,
+                placeholder = "Default Screen",
+                exampleHint = "Ex: Minimal OLED (deixe vazio e confirme para \"Default Screen\")",
+                confirmLabel = "Criar Tela",
+                dismissLabel = "Cancelar",
+                onDismiss = { showCreateDialog = false },
+                onConfirm = { raw ->
+                    val finalTitle = raw.trim().ifBlank { "Default Screen" }
+                    showCreateDialog = false
+                    onCreateTheme(finalTitle)
                 }
             )
         }

@@ -274,6 +274,10 @@ class LiquidGlassRenderer {
 
     fun clearShaderCachesForHome() {
         liveVideoMode = false
+        lastBgId = 0
+        sharpBgBmp = null
+        sharpBgShader = null
+        runCatching { bgNode.discardDisplayList() }
         prebakedFrostedBmp = null
         prebakedFrostedShader = null
         prebakedFrostedBlurPx = -1f

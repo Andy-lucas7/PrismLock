@@ -55,12 +55,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.prismlock.data.Env
 import com.example.prismlock.engine.HitBox
+import com.example.prismlock.engine.KustomFormulaEngine
 import com.example.prismlock.engine.LiquidGlassRenderer
 import com.example.prismlock.engine.WallpaperBaker
 import com.example.prismlock.model.LayerNode
 import com.example.prismlock.model.LayerType
 import com.example.prismlock.model.Project
 import com.example.prismlock.model.find
+import com.example.prismlock.model.flatten
 import com.example.prismlock.model.parentOf
 import com.example.prismlock.wallpaper.VideoWallpaperRenderer
 import com.example.prismlock.wallpaper.WallpaperCarousel
@@ -135,6 +137,17 @@ fun InteractiveLockPreview(
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
     var preparedVersion by remember(project.id) { mutableStateOf(0) }
     var videoFrameTick by remember { mutableIntStateOf(0) }
+    var secondsTick by remember { mutableIntStateOf(0) }
+    val hasSecondsLayer = remember(project.layers) {
+        project.layers.flatten().any { (n, _) -> !n.hidden && n.type == LayerType.TEXT && KustomFormulaEngine.hasSecondsToken(n.text) }
+    }
+    LaunchedEffect(hasSecondsLayer) {
+        if (!hasSecondsLayer) return@LaunchedEffect
+        while (true) {
+            kotlinx.coroutines.delay(1000L)
+            secondsTick++
+        }
+    }
     val hitBoxes = remember(project.id) { mutableListOf<HitBox>() }
     var selectedHitRect by remember(project.id) { mutableStateOf<RectF?>(null) }
     var snapLineX by remember(project.id) { mutableStateOf<Float?>(null) }
@@ -182,7 +195,8 @@ fun InteractiveLockPreview(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    LaunchedEffect(isVideoPreview, activePreviewUri, canvasSize, previewVideoRenderer) {
+    val primaryBlurPx = WallpaperBaker.resolvePrimaryBlurPx(project, 1f)
+    LaunchedEffect(isVideoPreview, activePreviewUri, canvasSize, previewVideoRenderer, primaryBlurPx) {
         val vr = previewVideoRenderer ?: return@LaunchedEffect
         val uri = activePreviewUri ?: return@LaunchedEffect
         if (isVideoPreview && canvasSize.width > 0 && canvasSize.height > 0) {
@@ -290,9 +304,10 @@ fun InteractiveLockPreview(
                                     val rot = event.calculateRotation()
                                     if (zoom != 1f || rot != 0f) {
                                         onUpdateLayer(targetNode.id) {
+                                            val rawRot = (it.rotation + rot + 180f).mod(360f) - 180f
                                             it.copy(
                                                 scale = (it.scale * zoom).coerceIn(0.25f, 4f),
-                                                rotation = (it.rotation + rot).coerceIn(-180f, 180f)
+                                                rotation = rawRot
                                             )
                                         }
                                     }
@@ -387,7 +402,8 @@ fun InteractiveLockPreview(
 
             val ver = preparedVersion
             val vTick = videoFrameTick
-            if (ver >= 0 && vTick >= 0) {
+            val sTick = secondsTick
+            if (ver >= 0 && vTick >= 0 && sTick >= 0) {
                 drawIntoCanvas { c ->
                     c.nativeCanvas.drawColor(android.graphics.Color.BLACK, android.graphics.PorterDuff.Mode.CLEAR)
                     c.nativeCanvas.drawColor(android.graphics.Color.BLACK)

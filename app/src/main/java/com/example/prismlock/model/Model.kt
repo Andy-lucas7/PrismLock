@@ -97,6 +97,11 @@ data class Project(
     val depthGuard: Boolean = true,
     val defaultDepthForNewImages: Boolean = true,
     val depthOverrides: Map<String, Boolean> = emptyMap(),
+    val depthBgBlur: Float = 0f,
+    val depthBgDesaturate: Float = 0f,
+    val depthInvertColorPop: Boolean = false,
+    val depthSubjectPop: Float = 0f,
+    val depthVignette: Float = 0f,
     val city: String = "",
     val lat: Double = -23.55,
     val lon: Double = -46.63,
@@ -104,6 +109,9 @@ data class Project(
 ) {
     fun isDepthEnabledFor(imageKey: String): Boolean =
         depthOverrides[imageKey] ?: defaultDepthForNewImages
+
+    fun hasDepthPostProcessing(): Boolean =
+        depth && (depthBgBlur > 0.01f || depthBgDesaturate > 0.01f || depthSubjectPop > 0.01f || depthVignette > 0.01f)
 }
 
 fun LayerNode.copyDeep(newParentId: String? = null): LayerNode {

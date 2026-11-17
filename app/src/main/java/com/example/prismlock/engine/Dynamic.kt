@@ -41,19 +41,27 @@ object Dynamic {
     }
 
     fun eval(text: String, env: Env, now: LocalDateTime): String {
-        if ('{' !in text) return text
-        val stamp = "${now.withSecond(0).withNano(0)}|$env"
+        val hasDollar = '$' in text
+        val hasBraces = '{' in text
+        if (!hasDollar && !hasBraces) return text
+        val hasSec = KustomFormulaEngine.hasSecondsToken(text)
+        val stamp = if (hasSec) "${now.withNano(0)}|$env" else "${now.withSecond(0).withNano(0)}|$env"
         if (stamp != cacheStamp) { textCache.clear(); cacheStamp = stamp }
         textCache[text]?.let { return it }
+
+        var cur = if (hasDollar) KustomFormulaEngine.evalDollarBlocks(text, env, now) else text
+        if ('{' !in cur) {
+            return cur.also { textCache[text] = it }
+        }
         val v by lazy { vars(env, now) }
         val sb = StringBuilder()
         var i = 0
-        while (i < text.length) {
-            val c = text[i]
+        while (i < cur.length) {
+            val c = cur[i]
             if (c == '{') {
-                val j = text.indexOf('}', i + 1)
-                if (j < 0) { sb.append(text, i, text.length); break }
-                sb.append(tag(text.substring(i + 1, j), env, now) { v })
+                val j = cur.indexOf('}', i + 1)
+                if (j < 0) { sb.append(cur, i, cur.length); break }
+                sb.append(tag(cur.substring(i + 1, j), env, now) { v })
                 i = j + 1
             } else { sb.append(c); i++ }
         }
@@ -88,6 +96,9 @@ object Dynamic {
     }
 
     fun number(expr: String, env: Env, now: LocalDateTime): Double {
+        if ('$' in expr) {
+            KustomFormulaEngine.evalNumeric(expr, env, now)?.let { return it }
+        }
         val e = expr.trim().removePrefix("{").removeSuffix("}").removePrefix("=")
         return runCatching { Expr(e, vars(env, now)).parse() }.getOrDefault(0.0)
     }

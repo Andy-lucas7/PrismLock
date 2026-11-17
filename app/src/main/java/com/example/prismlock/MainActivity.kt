@@ -52,6 +52,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.example.prismlock.data.EnvProvider
+import com.example.prismlock.data.PrismPackageManager
 import com.example.prismlock.data.ProjectStore
 import com.example.prismlock.engine.FontManager
 import com.example.prismlock.engine.Icons
@@ -126,11 +127,27 @@ private fun PrismApp() {
         }
     }
 
+    var rawBgBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var rawDepthBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var bgBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var depthBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var previewUri by remember { mutableStateOf<String?>(null) }
-    var importedFonts by remember { mutableStateOf(FontManager.imported(ctx)) }
-    val wallPalette = remember(bgBitmap) { renderer.extractPalette(bgBitmap) }
+    var fontFolderUri by remember { mutableStateOf<String?>(null) }
+    var importedFonts by remember {
+        FontManager.init(ctx)
+        mutableStateOf(FontManager.availableFonts(ctx))
+    }
+
+    LaunchedEffect(Unit) {
+        val savedFolder = ProjectStore.fontFolderUri(ctx)
+        fontFolderUri = savedFolder
+        if (savedFolder != null) {
+            FontManager.syncFontFolder(ctx, savedFolder)
+        }
+        FontManager.prewarm(ctx)
+        importedFonts = FontManager.availableFonts(ctx)
+    }
+    val wallPalette = remember(rawBgBitmap) { renderer.extractPalette(rawBgBitmap) }
 
     var isBaking by remember { mutableStateOf(false) }
     var bakeProgress by remember { mutableFloatStateOf(0f) }
@@ -154,8 +171,40 @@ private fun PrismApp() {
         if (uri != null && previewUri != uri) previewUri = uri
         val (baseW, baseH) = WallpaperBaker.resolveDisplaySize(ctx)
         val bmp = WallpaperCarousel.loadBitmap(ctx, uri, baseW, baseH)
-        bgBitmap = bmp
-        depthBitmap = SubjectDepthEngine.getOrCreateMaskIfEnabled(ctx, uri, bmp, editingProject)
+        rawBgBitmap = bmp
+        rawDepthBitmap = SubjectDepthEngine.getOrCreateMaskIfEnabled(ctx, uri, bmp, editingProject)
+    }
+
+    LaunchedEffect(
+        rawBgBitmap,
+        rawDepthBitmap,
+        editingProject.depth,
+        editingProject.depthBgBlur,
+        editingProject.depthBgDesaturate,
+        editingProject.depthInvertColorPop,
+        editingProject.depthSubjectPop,
+        editingProject.depthVignette
+    ) {
+        val rBg = rawBgBitmap
+        val rDepth = rawDepthBitmap
+        val proj = currentProject
+        if (rBg != null && rDepth != null && proj.hasDepthPostProcessing()) {
+            kotlinx.coroutines.delay(60L)
+            val (baseW, baseH) = WallpaperBaker.resolveDisplaySize(ctx)
+            val (compBg, compDepth) = withContext(Dispatchers.Default) {
+                val base = WallpaperBaker.centerCropOpaque(rBg, baseW, baseH)
+                val bgOut = SubjectDepthEngine.composeProcessedWallpaper(base, rDepth, proj) { s, r ->
+                    renderer.bakeBlurredBitmap(s, baseW, baseH, r)
+                }
+                val maskOut = SubjectDepthEngine.applySubjectColorPopMask(rDepth, proj)
+                bgOut to maskOut
+            }
+            bgBitmap = compBg
+            depthBitmap = compDepth
+        } else {
+            bgBitmap = rBg
+            depthBitmap = rDepth
+        }
     }
 
     LaunchedEffect(editingProject.lat, editingProject.lon, editingProject.city) {
@@ -179,12 +228,20 @@ private fun PrismApp() {
 
     fun openStudio(theme: Project) {
         renderer.clearShaderCachesForHome()
+        rawBgBitmap = null
+        rawDepthBitmap = null
         bgBitmap = null
         depthBitmap = null
         previewUri = null
         editingProject = theme
         selectedLayerId = theme.layers.firstOrNull()?.id
         screen = AppScreen.STUDIO
+        fontFolderUri?.let { saved ->
+            scope.launch {
+                FontManager.syncFontFolder(ctx, saved)
+                importedFonts = FontManager.availableFonts(ctx)
+            }
+        }
     }
 
     fun returnToHub() {
@@ -237,7 +294,7 @@ private fun PrismApp() {
         if (uri != null) {
             runCatching { ctx.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
             previewUri = null
-            commit(currentProject.copy(folderUri = uri.toString()))
+            commit(currentProject.copy(folderUri = uri.toString(), imageUri = null))
         }
     }
 
@@ -254,8 +311,22 @@ private fun PrismApp() {
         if (uri != null) {
             val f = FontManager.import(ctx, uri)
             if (f != null) {
-                importedFonts = FontManager.imported(ctx)
+                importedFonts = FontManager.availableFonts(ctx)
                 updateSelected { it.copy(font = f) }
+            }
+        }
+    }
+
+    val fontFolderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            runCatching { ctx.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+            val s = uri.toString()
+            fontFolderUri = s
+            scope.launch {
+                ProjectStore.setFontFolderUri(ctx, s)
+                val count = FontManager.syncFontFolder(ctx, s)
+                importedFonts = FontManager.availableFonts(ctx)
+                snackbar.showSnackbar("$count ${if (count == 1) "fonte sincronizada" else "fontes sincronizadas"} da pasta")
             }
         }
     }
@@ -271,42 +342,45 @@ private fun PrismApp() {
         }
     }
 
-    val importJson = remember { Json { ignoreUnknownKeys = true; encodeDefaults = true } }
     val importThemePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
             scope.launch {
-                val imported = withContext(Dispatchers.IO) {
-                    runCatching {
-                        ctx.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-                            ?.let { raw -> importJson.decodeFromString(Project.serializer(), raw) }
-                    }.getOrNull()
-                }
+                val imported = PrismPackageManager.importFromDocument(ctx, uri)
                 if (imported != null) {
-                    val cleanTitle = imported.title.trim().ifBlank { "Default Screen" }
-                    val named = imported.copy(
-                        id = UUID.randomUUID().toString(),
-                        title = cleanTitle,
-                        layers = imported.layers.map { it.copyDeep() }
-                    )
-                    ProjectStore.upsertTheme(ctx, named)
-                    focusThemeId = named.id
-                    snackbar.showSnackbar("Tema \"${named.title}\" importado")
+                    FontManager.prewarm(ctx)
+                    importedFonts = FontManager.availableFonts(ctx)
+                    ProjectStore.upsertTheme(ctx, imported)
+                    focusThemeId = imported.id
+                    snackbar.showSnackbar("Pacote \"${imported.title}\" importado")
                 } else {
-                    snackbar.showSnackbar("Arquivo .prism/.json inválido")
+                    snackbar.showSnackbar("Pacote .prism / .zip inválido")
                 }
             }
         }
     }
 
-    val exportThemePicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+    val importFolderThemePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) {
             scope.launch {
-                val ok = runCatching {
-                    val toExport = currentProject.copy(title = currentProject.title.trim().ifBlank { "Default Screen" })
-                    val encoded = ProjectStore.json.encodeToString(Project.serializer(), toExport)
-                    ctx.contentResolver.openOutputStream(uri)?.bufferedWriter()?.use { it.write(encoded) }
-                }.isSuccess
-                snackbar.showSnackbar(if (ok) "Arquivo exportado com sucesso" else "Erro ao exportar arquivo")
+                val imported = PrismPackageManager.importFromFolder(ctx, uri)
+                if (imported != null) {
+                    FontManager.prewarm(ctx)
+                    importedFonts = FontManager.availableFonts(ctx)
+                    ProjectStore.upsertTheme(ctx, imported)
+                    focusThemeId = imported.id
+                    snackbar.showSnackbar("Pasta \"${imported.title}\" importada")
+                } else {
+                    snackbar.showSnackbar("Pasta sem theme.json válido")
+                }
+            }
+        }
+    }
+
+    val exportThemePicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+        if (uri != null) {
+            scope.launch {
+                val ok = PrismPackageManager.exportPackage(ctx, currentProject, uri)
+                snackbar.showSnackbar(if (ok) "Pacote .prism exportado com mídia e fontes" else "Erro ao exportar pacote")
             }
         }
     }
@@ -344,6 +418,7 @@ private fun PrismApp() {
                         openStudio(fresh)
                     },
                     onImportTheme = { importThemePicker.launch(arrayOf("*/*")) },
+                    onImportFolderTheme = { importFolderThemePicker.launch(null) },
                     onEditTheme = { openStudio(it) },
                     onApplyTheme = { applyAndBake(it, forcePicker = false) },
                     onDeleteTheme = { t ->
@@ -390,13 +465,7 @@ private fun PrismApp() {
                     },
                     onApply = { applyAndBake(currentProject, forcePicker = false) },
                     onExportFile = {
-                        val safeName = currentProject.title.trim()
-                            .ifBlank { "Default Screen" }
-                            .replace(Regex("\\s+"), "_")
-                            .replace(Regex("[^A-Za-z0-9_-]"), "_")
-                            .replace(Regex("_+"), "_")
-                            .trim('_')
-                            .ifBlank { "Default_Screen" }
+                        val safeName = PrismPackageManager.sanitizeArchiveFileName(currentProject.title)
                         exportThemePicker.launch("$safeName.prism")
                     },
                     onToggleDepth = { imageKey, enabled ->
@@ -419,7 +488,32 @@ private fun PrismApp() {
                     },
                     onPickFolder = { folderPicker.launch(null) },
                     onPickImage = { imagePicker.launch(arrayOf("image/*", "video/*")) },
+                    onClearWallpaper = {
+                        previewUri = null
+                        rawBgBitmap = null
+                        rawDepthBitmap = null
+                        bgBitmap = null
+                        depthBitmap = null
+                        renderer.clearShaderCachesForHome()
+                        commit(currentProject.copy(folderUri = null, imageUri = null))
+                    },
                     onImportFont = { fontPicker.launch(arrayOf("font/*", "application/x-font-ttf", "application/x-font-opentype", "*/*")) },
+                    hasFontFolder = fontFolderUri != null,
+                    onPickFontFolder = { fontFolderPicker.launch(null) },
+                    onRefreshFontFolder = { showToast ->
+                        val saved = fontFolderUri
+                        if (saved == null) {
+                            fontFolderPicker.launch(null)
+                        } else {
+                            scope.launch {
+                                val count = FontManager.syncFontFolder(ctx, saved)
+                                importedFonts = FontManager.availableFonts(ctx)
+                                if (showToast) {
+                                    snackbar.showSnackbar("$count ${if (count == 1) "fonte atualizada" else "fontes atualizadas"}")
+                                }
+                            }
+                        }
+                    },
                     onImportSvg = { svgPicker.launch(arrayOf("image/svg+xml", "*/*")) }
                 )
             }
