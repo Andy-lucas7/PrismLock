@@ -3,6 +3,7 @@ package com.example.prismlock.ui
 import android.graphics.Bitmap
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -11,6 +12,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -27,11 +29,13 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons as MIcons
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.DeleteOutline
@@ -40,7 +44,9 @@ import androidx.compose.material.icons.rounded.FileDownload
 import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
+import androidx.compose.material.icons.rounded.PushPin
 import androidx.compose.material.icons.rounded.Wallpaper
+import androidx.compose.material.icons.rounded.Widgets
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -67,7 +73,9 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.BlurredEdgeTreatment
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
@@ -75,6 +83,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp as lerpColor
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -86,6 +95,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.util.lerp
+import androidx.compose.ui.window.Dialog
 import com.example.prismlock.data.Env
 import com.example.prismlock.engine.FontManager
 import com.example.prismlock.engine.LiquidGlassRenderer
@@ -93,6 +103,7 @@ import com.example.prismlock.engine.WallpaperBaker
 import com.example.prismlock.model.Project
 import com.example.prismlock.wallpaper.SubjectDepthEngine
 import com.example.prismlock.wallpaper.WallpaperCarousel
+import com.example.prismlock.widget.PrismWidgetProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -102,6 +113,7 @@ import java.time.LocalDateTime
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.absoluteValue
 import kotlin.math.roundToInt
+import kotlin.math.sin
 
 private data class HubCachedCard(
     val signature: String,
@@ -112,6 +124,10 @@ private data class HubCachedCard(
 
 private object HubPreviewCache {
     val map = ConcurrentHashMap<String, HubCachedCard>()
+}
+
+fun clearHubPreviewCache() {
+    HubPreviewCache.map.clear()
 }
 
 private fun bakeTinyAmbientBitmap(src: Bitmap, outW: Int = 72, outH: Int = 156): Bitmap {
@@ -177,27 +193,59 @@ private val HUB_MOCK_ENV: Env = Env(
     locked = true
 )
 
+private enum class HubMode { SCREENS, WIDGETS }
+
 @Composable
 fun ThemeHubScreen(
     themes: List<Project>,
     activeThemeId: String,
+    widgets: List<Project> = emptyList(),
+    activeWidgetId: String = "",
     focusThemeId: String? = null,
     onFocusConsumed: () -> Unit = {},
     @Suppress("UNUSED_PARAMETER") env: Env,
     onCreateTheme: (String) -> Unit,
+    onCreateWidget: (String) -> Unit = {},
     onImportTheme: () -> Unit,
     onImportFolderTheme: () -> Unit = {},
     onEditTheme: (Project) -> Unit,
+    onEditWidget: (Project) -> Unit = {},
     onApplyTheme: (Project) -> Unit,
-    onDeleteTheme: (Project) -> Unit
+    onApplyWidget: (Project) -> Unit = {},
+    onDeleteTheme: (Project) -> Unit,
+    onDeleteWidget: (Project) -> Unit = {},
+    onReplayHero: () -> Unit = {},
+    showBatteryPrompt: Boolean = false,
+    onDismissBatteryPrompt: () -> Unit = {},
+    onRequestIgnoreBatteryOptimizations: () -> Unit = {}
 ) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
     val density = LocalDensity.current
 
-    val pagerState = rememberPagerState(pageCount = { themes.size.coerceAtLeast(1) })
-    val cardRenderer = remember { LiquidGlassRenderer() }
+    var mode by remember { mutableStateOf(HubMode.SCREENS) }
+    val modeTransition = remember { Animatable(0f) }
+    LaunchedEffect(mode) {
+        val target = if (mode == HubMode.WIDGETS) 1f else 0f
+        if (kotlin.math.abs(modeTransition.value - target) > 0.001f) {
+            modeTransition.animateTo(
+                targetValue = target,
+                animationSpec = tween(durationMillis = 420, easing = FastOutSlowInEasing)
+            )
+        }
+    }
+    val mp = modeTransition.value
+    val morphPulse = sin(mp * Math.PI).toFloat().coerceIn(0f, 1f)
+
+    val activeItems = if (mode == HubMode.SCREENS) themes else widgets
+    val activeItemId = if (mode == HubMode.SCREENS) activeThemeId else activeWidgetId
+
+    val screensPagerState = rememberPagerState(pageCount = { themes.size.coerceAtLeast(1) })
+    val widgetsPagerState = rememberPagerState(pageCount = { widgets.size.coerceAtLeast(1) })
+    val pagerState = if (mode == HubMode.SCREENS) screensPagerState else widgetsPagerState
+
+    val cardRenderer = remember { LiquidGlassRenderer().apply { attachContext(ctx) } }
     val renderMutex = remember { Mutex() }
     val previewImages = remember { mutableStateMapOf<String, ImageBitmap>() }
     val ambientImages = remember { mutableStateMapOf<String, ImageBitmap>() }
@@ -211,35 +259,46 @@ fun ThemeHubScreen(
 
     var pendingDelete by remember { mutableStateOf<Project?>(null) }
 
-    val settledIndex by remember(themes.size) {
-        derivedStateOf { pagerState.settledPage.coerceIn(0, (themes.size - 1).coerceAtLeast(0)) }
+    val settledIndex by remember(activeItems.size, mode) {
+        derivedStateOf { pagerState.settledPage.coerceIn(0, (activeItems.size - 1).coerceAtLeast(0)) }
     }
-    val currentTheme = themes.getOrNull(settledIndex)
+    val currentTheme = activeItems.getOrNull(settledIndex)
     val dragThresholdPx = with(density) { 86.dp.toPx() }
     val (baseW, baseH) = remember { WallpaperBaker.resolveDisplaySize(ctx) }
     val cardRenderW = 420
     val cardRenderH = (cardRenderW * (baseH.toFloat() / baseW.coerceAtLeast(1))).roundToInt().coerceAtLeast(1)
 
-    LaunchedEffect(focusThemeId, themes) {
+    LaunchedEffect(focusThemeId, themes, widgets) {
         if (focusThemeId != null) {
-            val idx = themes.indexOfFirst { it.id == focusThemeId }
-            if (idx >= 0) {
-                pagerState.animateScrollToPage(idx)
+            val themeIdx = themes.indexOfFirst { it.id == focusThemeId }
+            if (themeIdx >= 0) {
+                mode = HubMode.SCREENS
+                screensPagerState.animateScrollToPage(themeIdx)
                 onFocusConsumed()
+            } else {
+                val widgetIdx = widgets.indexOfFirst { it.id == focusThemeId }
+                if (widgetIdx >= 0) {
+                    mode = HubMode.WIDGETS
+                    widgetsPagerState.animateScrollToPage(widgetIdx)
+                    onFocusConsumed()
+                }
             }
         }
     }
 
     // Static mock preview cards (18:45 + mock telemetry) cached across navigations
-    LaunchedEffect(themes) {
-        val activeIds = themes.mapTo(HashSet()) { it.id }
+    LaunchedEffect(themes, widgets) {
+        val allItems = themes + widgets
+        val activeIds = allItems.mapTo(HashSet()) { it.id }
         previewImages.keys.toList().filter { it !in activeIds }.forEach { previewImages.remove(it) }
         ambientImages.keys.toList().filter { it !in activeIds }.forEach { ambientImages.remove(it) }
         HubPreviewCache.map.keys.toList().filter { it !in activeIds }.forEach { HubPreviewCache.map.remove(it) }
 
         val pending = ArrayList<Pair<Int, Project>>()
-        themes.forEachIndexed { idx, theme ->
-            val sig = "${theme.id}|${theme.hashCode()}|${cardRenderW}x${cardRenderH}"
+        allItems.forEachIndexed { idx, theme ->
+            val wW = if (theme.isWidget) 560 else cardRenderW
+            val wH = if (theme.isWidget) (wW / theme.widgetAspect.coerceIn(0.6f, 4.5f)).roundToInt().coerceAtLeast(140) else cardRenderH
+            val sig = "${theme.id}|${theme.hashCode()}|${wW}x${wH}"
             val cached = HubPreviewCache.map[theme.id]
             if (cached != null && cached.signature == sig && !cached.preview.isRecycled) {
                 previewImages[theme.id] = cached.previewImage
@@ -249,47 +308,76 @@ fun ThemeHubScreen(
             }
         }
 
-        val anchor = pagerState.settledPage.coerceIn(0, (themes.size - 1).coerceAtLeast(0))
-        pending.sortBy { (idx, _) -> (idx - anchor).absoluteValue }
+        val anchor = pagerState.settledPage.coerceIn(0, (activeItems.size - 1).coerceAtLeast(0))
+        pending.sortBy { (idx, item) ->
+            val modeBonus = if ((item.isWidget && mode == HubMode.WIDGETS) || (!item.isWidget && mode == HubMode.SCREENS)) 0 else 100
+            modeBonus + (idx - anchor).absoluteValue
+        }
 
         for ((_, theme) in pending) {
-            val sig = "${theme.id}|${theme.hashCode()}|${cardRenderW}x${cardRenderH}"
+            val wW = if (theme.isWidget) 560 else cardRenderW
+            val wH = if (theme.isWidget) (wW / theme.widgetAspect.coerceIn(0.6f, 4.5f)).roundToInt().coerceAtLeast(140) else cardRenderH
+            val sig = "${theme.id}|${theme.hashCode()}|${wW}x${wH}"
             val entry = withContext(Dispatchers.Default) {
                 renderMutex.withLock {
                     cardRenderer.clearShaderCachesForHome()
-                    val uri = WallpaperCarousel.currentUri(ctx, theme, advance = false)
-                    val rawBg = WallpaperCarousel.loadBitmap(ctx, uri, cardRenderW, cardRenderH)
-                    val rawMask = SubjectDepthEngine.getOrCreateMaskIfEnabled(ctx, uri, rawBg, theme)
-                    val bgBmp = if (rawBg != null && rawMask != null && theme.hasDepthPostProcessing()) {
-                        val base = WallpaperBaker.centerCropOpaque(rawBg, cardRenderW, cardRenderH)
-                        SubjectDepthEngine.composeProcessedWallpaper(base, rawMask, theme) { s, r ->
-                            cardRenderer.bakeBlurredBitmap(s, cardRenderW, cardRenderH, r)
-                        }
-                    } else rawBg
-                    val depthMask = if (rawMask != null && theme.hasDepthPostProcessing()) {
-                        SubjectDepthEngine.applySubjectColorPopMask(rawMask, theme)
-                    } else rawMask
-                    val bmp = cardRenderer.renderPreviewBitmap(
-                        w = cardRenderW,
-                        h = cardRenderH,
-                        project = theme,
-                        bg = bgBmp,
-                        depthMask = depthMask,
-                        env = HUB_MOCK_ENV,
-                        now = HUB_MOCK_TIME
-                    )
-                    val tinyAmb = bakeTinyAmbientBitmap(bgBmp ?: bmp)
-                    HubCachedCard(
-                        signature = sig,
-                        preview = bmp,
-                        previewImage = bmp.asImageBitmap(),
-                        ambientImage = tinyAmb.asImageBitmap()
-                    )
+                    if (theme.isWidget) {
+                        val refBg = PrismWidgetProvider.resolveReferenceBg(ctx, theme, wW, wH)
+                        val bmp = cardRenderer.renderPreviewBitmap(
+                            w = wW,
+                            h = wH,
+                            project = theme,
+                            bg = refBg,
+                            depthMask = null,
+                            env = HUB_MOCK_ENV.copy(locked = false),
+                            now = HUB_MOCK_TIME
+                        )
+                        val tinyAmb = bakeTinyAmbientBitmap(refBg ?: bmp)
+                        HubCachedCard(
+                            signature = sig,
+                            preview = bmp,
+                            previewImage = bmp.asImageBitmap(),
+                            ambientImage = tinyAmb.asImageBitmap()
+                        )
+                    } else {
+                        val uri = WallpaperCarousel.currentUri(ctx, theme, advance = false)
+                        val rawBg = WallpaperCarousel.loadBitmap(ctx, uri, cardRenderW, cardRenderH)
+                        val rawMask = SubjectDepthEngine.getOrCreateMaskIfEnabled(ctx, uri, rawBg, theme)
+                        val bgBmp = if (rawBg != null && rawMask != null && theme.hasDepthPostProcessing()) {
+                            val base = WallpaperBaker.centerCropOpaque(rawBg, cardRenderW, cardRenderH)
+                            SubjectDepthEngine.composeProcessedWallpaper(base, rawMask, theme) { s, r ->
+                                cardRenderer.bakeBlurredBitmap(s, cardRenderW, cardRenderH, r)
+                            }
+                        } else rawBg
+                        val depthMask = if (rawMask != null && theme.hasDepthPostProcessing()) {
+                            SubjectDepthEngine.applySubjectColorPopMask(rawMask, theme)
+                        } else rawMask
+                        val bmp = cardRenderer.renderPreviewBitmap(
+                            w = cardRenderW,
+                            h = cardRenderH,
+                            project = theme,
+                            bg = bgBmp,
+                            depthMask = depthMask,
+                            env = HUB_MOCK_ENV,
+                            now = HUB_MOCK_TIME
+                        )
+                        val tinyAmb = bakeTinyAmbientBitmap(bgBmp ?: bmp)
+                        HubCachedCard(
+                            signature = sig,
+                            preview = bmp,
+                            previewImage = bmp.asImageBitmap(),
+                            ambientImage = tinyAmb.asImageBitmap()
+                        )
+                    }
                 }
             }
             HubPreviewCache.map[theme.id] = entry
             previewImages[theme.id] = entry.previewImage
             ambientImages[theme.id] = entry.ambientImage
+        }
+        if (pending.isNotEmpty()) {
+            cardRenderer.clearShaderCachesForHome()
+            cardRenderer.releaseOffscreenResources()
         }
     }
 
@@ -351,16 +439,36 @@ fun ThemeHubScreen(
                         letterSpacing = (-0.4).sp
                     )
                     Text(
-                        text = "${themes.size} ${if (themes.size == 1) "tema salvo" else "temas salvos"}",
+                        text = if (mode == HubMode.SCREENS) {
+                            "${themes.size} ${if (themes.size == 1) "tema salvo" else "temas salvos"}"
+                        } else {
+                            "${widgets.size} ${if (widgets.size == 1) "widget salvo" else "widgets salvos"}"
+                        },
                         color = Color(0x99FFFFFF),
                         fontSize = 11.sp
                     )
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(44.dp)
+                            .shadow(10.dp, CircleShape, ambientColor = Color.Black, spotColor = Color.Black)
+                            .clip(CircleShape)
+                            .background(Color(0x52222228))
+                            .clickable { onReplayHero() },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            MIcons.Rounded.AutoAwesome,
+                            contentDescription = "Rever Apresentação",
+                            tint = Color(0xCCFFFFFF),
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
                     Box {
                         Box(
                             modifier = Modifier
-                                .size(46.dp)
+                                .size(44.dp)
                                 .shadow(12.dp, CircleShape, ambientColor = Color.Black, spotColor = Color.Black)
                                 .clip(CircleShape)
                                 .background(Color(0x66222228))
@@ -371,7 +479,7 @@ fun ThemeHubScreen(
                                 MIcons.Rounded.FileDownload,
                                 contentDescription = "Importar",
                                 tint = PrismColors.PureWhite,
-                                modifier = Modifier.size(20.dp)
+                                modifier = Modifier.size(19.dp)
                             )
                         }
                         DropdownMenu(
@@ -400,7 +508,7 @@ fun ThemeHubScreen(
                     }
                     Box(
                         modifier = Modifier
-                            .size(46.dp)
+                            .size(44.dp)
                             .shadow(14.dp, CircleShape, ambientColor = Color.Black, spotColor = Color.Black)
                             .clip(CircleShape)
                             .background(PrismColors.PureWhite)
@@ -412,10 +520,76 @@ fun ThemeHubScreen(
                     ) {
                         Icon(
                             MIcons.Rounded.Add,
-                            contentDescription = "Nova Tela",
+                            contentDescription = if (mode == HubMode.SCREENS) "Nova Tela" else "Novo Widget",
                             tint = PrismColors.PureBlack,
                             modifier = Modifier.size(22.dp)
                         )
+                    }
+                }
+            }
+
+            // Liquid Elastic Mode Selector Pill (Telas <-> Widgets)
+            BoxWithConstraints(
+                modifier = Modifier
+                    .padding(bottom = 8.dp)
+                    .width(276.dp)
+                    .height(38.dp)
+                    .clip(CircleShape)
+                    .background(Color(0x521B1B22))
+                    .border(1.dp, PrismColors.GlassBorder, CircleShape)
+                    .padding(3.dp)
+            ) {
+                val segW = maxWidth * 0.5f
+                val segWPx = with(density) { segW.toPx() }
+                Box(
+                    modifier = Modifier
+                        .width(segW)
+                        .fillMaxHeight()
+                        .graphicsLayer {
+                            translationX = mp * segWPx
+                            scaleX = 1f + 0.08f * morphPulse
+                        }
+                        .clip(CircleShape)
+                        .background(PrismColors.PureWhite)
+                )
+                Row(
+                    modifier = Modifier.fillMaxSize(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    listOf(
+                        Triple(HubMode.SCREENS, "Telas (Lock)", MIcons.Rounded.Wallpaper),
+                        Triple(HubMode.WIDGETS, "Widgets (KWGT)", MIcons.Rounded.Widgets)
+                    ).forEach { (m, label, ic) ->
+                        val frac = if (m == HubMode.SCREENS) (1f - mp).coerceIn(0f, 1f) else mp.coerceIn(0f, 1f)
+                        val contentColor = lerpColor(Color(0xCCFFFFFF), PrismColors.PureBlack, frac)
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxHeight()
+                                .clip(CircleShape)
+                                .clickable {
+                                    if (mode != m) {
+                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        mode = m
+                                    }
+                                },
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Icon(
+                                imageVector = ic,
+                                contentDescription = null,
+                                tint = contentColor,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = label,
+                                color = contentColor,
+                                fontSize = 11.sp,
+                                fontWeight = if (frac > 0.5f) FontWeight.Bold else FontWeight.Medium
+                            )
+                        }
                     }
                 }
             }
@@ -424,13 +598,19 @@ fun ThemeHubScreen(
                 Row(
                     modifier = Modifier
                         .padding(bottom = 6.dp)
+                        .graphicsLayer {
+                            val s = 1f - 0.07f * morphPulse
+                            scaleX = s
+                            scaleY = s
+                            alpha = 1f - 0.35f * morphPulse
+                        }
                         .clip(CircleShape)
                         .background(Color(0x5C1E1E24))
                         .padding(horizontal = 14.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(7.dp)
                 ) {
-                    if (currentTheme.id == activeThemeId) {
+                    if (currentTheme.id == activeItemId) {
                         Box(
                             modifier = Modifier
                                 .size(6.dp)
@@ -450,156 +630,71 @@ fun ThemeHubScreen(
 
             Spacer(Modifier.weight(0.18f))
 
-            // Central Spotlight HorizontalPager
+            // Suave transição Fade + Blur óptico entre Telas e Widgets
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .fillMaxHeight(0.73f),
+                    .fillMaxHeight(0.70f),
                 contentAlignment = Alignment.Center
             ) {
-                HorizontalPager(
-                    state = pagerState,
-                    beyondViewportPageCount = 1,
-                    key = { index -> themes.getOrNull(index)?.id ?: index },
-                    contentPadding = PaddingValues(horizontal = 52.dp),
-                    pageSpacing = 14.dp,
-                    modifier = Modifier.fillMaxSize()
-                ) { page ->
-                    val theme = themes.getOrNull(page) ?: return@HorizontalPager
-                    val isCenter by remember(page) {
-                        derivedStateOf { pagerState.settledPage == page }
+                if (mp < 0.999f) {
+                    val blurMod = if (mp > 0.015f) {
+                        Modifier.blur((mp * 18f).dp, edgeTreatment = BlurredEdgeTreatment.Unbounded)
+                    } else {
+                        Modifier
                     }
-
-                    val dragY = remember(theme.id) { Animatable(0f) }
-                    var triggeredHaptic by remember(theme.id) { mutableStateOf(false) }
-
-                    val cardShape = RoundedCornerShape(32.dp)
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
                             .graphicsLayer {
-                                val pageOffset = ((pagerState.currentPage - page) + pagerState.currentPageOffsetFraction)
-                                    .absoluteValue
-                                    .coerceIn(0f, 1f)
-                                val scale = lerp(1.0f, 0.86f, pageOffset)
-                                scaleX = scale
-                                scaleY = scale
-                                alpha = lerp(1.0f, 0.55f, pageOffset)
-                            },
-                        contentAlignment = Alignment.Center
+                                val s = lerp(1f, 0.96f, mp)
+                                scaleX = s
+                                scaleY = s
+                                alpha = (1f - mp).coerceIn(0f, 1f)
+                            }
+                            .then(blurMod)
                     ) {
-                        androidx.compose.runtime.key(theme.id) {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxHeight()
-                                    .aspectRatio(9f / 19.5f)
-                                    .offset { IntOffset(0, dragY.value.roundToInt()) }
-                                    .graphicsLayer {
-                                        shadowElevation = 16.dp.toPx()
-                                        shape = cardShape
-                                        clip = true
-                                    }
-                                    .background(PrismColors.PureBlack)
-                                .pointerInput(theme.id, isCenter) {
-                                    if (!isCenter) return@pointerInput
-                                    detectVerticalDragGestures(
-                                        onDragStart = { triggeredHaptic = false },
-                                        onVerticalDrag = { change, dragAmount ->
-                                            change.consume()
-                                            scope.launch {
-                                                val next = (dragY.value + dragAmount).coerceIn(-dragThresholdPx * 1.45f, dragThresholdPx * 1.45f)
-                                                dragY.snapTo(next)
-                                                if (!triggeredHaptic && next.absoluteValue >= dragThresholdPx) {
-                                                    triggeredHaptic = true
-                                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                                } else if (triggeredHaptic && next.absoluteValue < dragThresholdPx * 0.7f) {
-                                                    triggeredHaptic = false
-                                                }
-                                            }
-                                        },
-                                        onDragEnd = {
-                                            val cur = dragY.value
-                                            scope.launch {
-                                                when {
-                                                    cur <= -dragThresholdPx -> {
-                                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                                        dragY.animateTo(0f, PrismMotion.FloatSpring)
-                                                        onEditTheme(theme)
-                                                    }
-                                                    cur >= dragThresholdPx -> {
-                                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                                        dragY.animateTo(0f, PrismMotion.FloatSpring)
-                                                        onApplyTheme(theme)
-                                                    }
-                                                    else -> dragY.animateTo(0f, PrismMotion.FloatSpring)
-                                                }
-                                            }
-                                        },
-                                        onDragCancel = {
-                                            scope.launch { dragY.animateTo(0f, PrismMotion.FloatSpring) }
-                                        }
-                                    )
-                                }
-                                .clickable(enabled = isCenter) { onEditTheme(theme) }
-                        ) {
-                            val img = previewImages[theme.id]
-                            if (img != null) {
-                                Image(
-                                    bitmap = img,
-                                    contentDescription = theme.title,
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier.fillMaxSize()
-                                )
-                            } else {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .background(PrismColors.CarbonBlack),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        MIcons.Rounded.Wallpaper,
-                                        contentDescription = null,
-                                        tint = PrismColors.TrackZinc,
-                                        modifier = Modifier.size(44.dp)
-                                    )
-                                }
-                            }
+                        HubCarouselPager(
+                            items = themes,
+                            pagerState = screensPagerState,
+                            isWidgetMode = false,
+                            isInteractive = mode == HubMode.SCREENS && mp < 0.05f,
+                            previewImages = previewImages,
+                            dragThresholdPx = dragThresholdPx,
+                            onEditItem = onEditTheme,
+                            onApplyItem = onApplyTheme
+                        )
+                    }
+                }
 
-                            // Vertical gesture action pill (borderless frosted glass)
-                            val curDrag = dragY.value
-                            val dragLabel = when {
-                                curDrag <= -dragThresholdPx * 0.6f -> "Solte ↑ para Editar"
-                                curDrag >= dragThresholdPx * 0.6f -> "Solte ↓ para Aplicar"
-                                isCenter -> "↑ Editar  ·  ↓ Aplicar"
-                                else -> null
+                if (mp > 0.001f) {
+                    val inv = 1f - mp
+                    val blurMod = if (inv > 0.015f) {
+                        Modifier.blur((inv * 18f).dp, edgeTreatment = BlurredEdgeTreatment.Unbounded)
+                    } else {
+                        Modifier
+                    }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .graphicsLayer {
+                                val s = lerp(0.96f, 1f, mp)
+                                scaleX = s
+                                scaleY = s
+                                alpha = mp.coerceIn(0f, 1f)
                             }
-                            if (dragLabel != null) {
-                                Row(
-                                    modifier = Modifier
-                                        .align(Alignment.BottomCenter)
-                                        .padding(bottom = 14.dp)
-                                        .clip(CircleShape)
-                                        .background(if (curDrag.absoluteValue >= dragThresholdPx) Color(0xCC1E1E24) else Color(0x72000000))
-                                        .padding(horizontal = 13.dp, vertical = 6.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                ) {
-                                    if (curDrag <= -dragThresholdPx * 0.6f) {
-                                        Icon(MIcons.Rounded.KeyboardArrowUp, null, tint = PrismColors.PureWhite, modifier = Modifier.size(14.dp))
-                                    } else if (curDrag >= dragThresholdPx * 0.6f) {
-                                        Icon(MIcons.Rounded.KeyboardArrowDown, null, tint = PrismColors.PureWhite, modifier = Modifier.size(14.dp))
-                                    }
-                                    Text(
-                                        text = dragLabel,
-                                        color = PrismColors.PureWhite,
-                                        fontSize = 10.sp,
-                                        fontWeight = FontWeight.Medium
-                                    )
-                                }
-                            }
-                        }
-                        }
+                            .then(blurMod)
+                    ) {
+                        HubCarouselPager(
+                            items = widgets,
+                            pagerState = widgetsPagerState,
+                            isWidgetMode = true,
+                            isInteractive = mode == HubMode.WIDGETS && mp > 0.95f,
+                            previewImages = previewImages,
+                            dragThresholdPx = dragThresholdPx,
+                            onEditItem = onEditWidget,
+                            onApplyItem = onApplyWidget
+                        )
                     }
                 }
             }
@@ -624,7 +719,9 @@ fun ThemeHubScreen(
                             .size(48.dp)
                             .clip(CircleShape)
                             .background(Color(0x22FFFFFF))
-                            .clickable { onEditTheme(currentTheme) },
+                            .clickable {
+                                if (currentTheme.isWidget) onEditWidget(currentTheme) else onEditTheme(currentTheme)
+                            },
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
@@ -635,19 +732,26 @@ fun ThemeHubScreen(
                         )
                     }
 
-                    // Aplicar (signature bright PureWhite circular CTA inside glass dock)
+                    // Aplicar / Fixar Widget
                     Box(
                         modifier = Modifier
                             .size(48.dp)
+                            .graphicsLayer {
+                                val s = 1f - 0.06f * morphPulse
+                                scaleX = s
+                                scaleY = s
+                            }
                             .shadow(10.dp, CircleShape, ambientColor = Color.Black, spotColor = Color.Black)
                             .clip(CircleShape)
                             .background(PrismColors.PureWhite)
-                            .clickable { onApplyTheme(currentTheme) },
+                            .clickable {
+                                if (currentTheme.isWidget) onApplyWidget(currentTheme) else onApplyTheme(currentTheme)
+                            },
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
-                            MIcons.Rounded.Check,
-                            contentDescription = "Aplicar na Tela de Bloqueio",
+                            if (mp >= 0.5f) MIcons.Rounded.PushPin else MIcons.Rounded.Check,
+                            contentDescription = if (mp >= 0.5f) "Aplicar e Fixar Widget" else "Aplicar na Tela de Bloqueio",
                             tint = PrismColors.PureBlack,
                             modifier = Modifier.size(22.dp)
                         )
@@ -664,7 +768,7 @@ fun ThemeHubScreen(
                     ) {
                         Icon(
                             MIcons.Rounded.DeleteOutline,
-                            contentDescription = "Excluir tema",
+                            contentDescription = "Excluir",
                             tint = Color(0xCCFFFFFF),
                             modifier = Modifier.size(20.dp)
                         )
@@ -687,11 +791,19 @@ fun ThemeHubScreen(
                 textContentColor = PrismColors.MutedZinc,
                 shape = RoundedCornerShape(24.dp),
                 title = { Text("Excluir \"${target.title}\"?", fontWeight = FontWeight.SemiBold) },
-                text = { Text("Esta configuração salva será removida do carrossel de temas.") },
+                text = {
+                    Text(
+                        if (target.isWidget) {
+                            "Este widget salvo será removido do carrossel de widgets."
+                        } else {
+                            "Esta configuração salva será removida do carrossel de temas."
+                        }
+                    )
+                },
                 confirmButton = {
                     Button(
                         onClick = {
-                            onDeleteTheme(target)
+                            if (target.isWidget) onDeleteWidget(target) else onDeleteTheme(target)
                             pendingDelete = null
                         },
                         colors = ButtonDefaults.buttonColors(
@@ -712,20 +824,250 @@ fun ThemeHubScreen(
         }
 
         if (showCreateDialog) {
+            val isWidgetCreate = mode == HubMode.WIDGETS
             FocusedInputDialog(
-                title = "Nova Tela de Bloqueio",
+                title = if (isWidgetCreate) "Novo Widget (KWGT)" else "Nova Tela de Bloqueio",
                 initialValue = newThemeName,
-                placeholder = "Default Screen",
-                exampleHint = "Ex: Minimal OLED (deixe vazio e confirme para \"Default Screen\")",
-                confirmLabel = "Criar Tela",
+                placeholder = if (isWidgetCreate) "Prism Widget" else "Default Screen",
+                exampleHint = if (isWidgetCreate) {
+                    "Ex: Relógio Vidro Home (deixe vazio para \"Prism Widget\")"
+                } else {
+                    "Ex: Minimal OLED (deixe vazio e confirme para \"Default Screen\")"
+                },
+                confirmLabel = if (isWidgetCreate) "Criar Widget" else "Criar Tela",
                 dismissLabel = "Cancelar",
                 onDismiss = { showCreateDialog = false },
                 onConfirm = { raw ->
-                    val finalTitle = raw.trim().ifBlank { "Default Screen" }
+                    val finalTitle = raw.trim().ifBlank {
+                        if (isWidgetCreate) "Prism Widget" else "Default Screen"
+                    }
                     showCreateDialog = false
-                    onCreateTheme(finalTitle)
+                    if (isWidgetCreate) onCreateWidget(finalTitle) else onCreateTheme(finalTitle)
                 }
             )
+        }
+
+        // First-run Frosted Glass Battery Optimization Protection Modal
+        if (showBatteryPrompt) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color(0xA6000000))
+            )
+            Dialog(onDismissRequest = onDismissBatteryPrompt) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .frostedChrome(shape = RoundedCornerShape(26.dp), dense = true, elevation = 24.dp)
+                        .padding(horizontal = 22.dp, vertical = 20.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text(
+                        text = "Proteção de Relógio em Tempo Real",
+                        color = PrismColors.PureWhite,
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "O Android / One UI costuma suspender apps em segundo plano, o que pode atrasar os minutos do relógio ou fechar o motor óptico. Desativar a restrição de bateria mantém a sincronia exata sem consumir bateria com a tela apagada (0% de loop em repouso).",
+                        color = PrismColors.MutedZinc,
+                        fontSize = 12.sp,
+                        lineHeight = 18.sp
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        TextButton(
+                            onClick = onDismissBatteryPrompt,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Agora não", color = PrismColors.MutedZinc, fontSize = 13.sp)
+                        }
+                        Button(
+                            onClick = onRequestIgnoreBatteryOptimizations,
+                            modifier = Modifier.weight(1.3f),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = PrismColors.PureWhite,
+                                contentColor = PrismColors.PureBlack
+                            ),
+                            shape = RoundedCornerShape(14.dp)
+                        ) {
+                            Text("Permitir Agora", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HubCarouselPager(
+    items: List<Project>,
+    pagerState: PagerState,
+    isWidgetMode: Boolean,
+    isInteractive: Boolean,
+    previewImages: Map<String, ImageBitmap>,
+    dragThresholdPx: Float,
+    onEditItem: (Project) -> Unit,
+    onApplyItem: (Project) -> Unit
+) {
+    val scope = rememberCoroutineScope()
+    val haptic = LocalHapticFeedback.current
+
+    HorizontalPager(
+        state = pagerState,
+        beyondViewportPageCount = 1,
+        userScrollEnabled = isInteractive,
+        key = { index -> items.getOrNull(index)?.id ?: index },
+        contentPadding = PaddingValues(horizontal = if (isWidgetMode) 28.dp else 52.dp),
+        pageSpacing = 14.dp,
+        modifier = Modifier.fillMaxSize()
+    ) { page ->
+        val item = items.getOrNull(page) ?: return@HorizontalPager
+        val isCenter by remember(page) {
+            derivedStateOf { pagerState.settledPage == page }
+        }
+
+        val dragY = remember(item.id) { Animatable(0f) }
+        var triggeredHaptic by remember(item.id) { mutableStateOf(false) }
+        val cardShape = RoundedCornerShape(if (isWidgetMode) 28.dp else 32.dp)
+
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer {
+                    val pageOffset = ((pagerState.currentPage - page) + pagerState.currentPageOffsetFraction)
+                        .absoluteValue
+                        .coerceIn(0f, 1f)
+                    val scale = lerp(1.0f, 0.86f, pageOffset)
+                    scaleX = scale
+                    scaleY = scale
+                    alpha = lerp(1.0f, 0.55f, pageOffset)
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            androidx.compose.runtime.key(item.id) {
+                val cardModifier = if (isWidgetMode) {
+                    Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(item.widgetAspect.coerceIn(0.75f, 3.8f))
+                } else {
+                    Modifier
+                        .fillMaxHeight()
+                        .aspectRatio(9f / 19.5f)
+                }
+                Box(
+                    modifier = cardModifier
+                        .offset { IntOffset(0, dragY.value.roundToInt()) }
+                        .graphicsLayer {
+                            shadowElevation = 16.dp.toPx()
+                            shape = cardShape
+                            clip = true
+                        }
+                        .background(PrismColors.PureBlack)
+                        .pointerInput(item.id, isCenter, isInteractive) {
+                            if (!isCenter || !isInteractive) return@pointerInput
+                            detectVerticalDragGestures(
+                                onDragStart = { triggeredHaptic = false },
+                                onVerticalDrag = { change, dragAmount ->
+                                    change.consume()
+                                    scope.launch {
+                                        val next = (dragY.value + dragAmount).coerceIn(-dragThresholdPx * 1.45f, dragThresholdPx * 1.45f)
+                                        dragY.snapTo(next)
+                                        if (!triggeredHaptic && next.absoluteValue >= dragThresholdPx) {
+                                            triggeredHaptic = true
+                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        } else if (triggeredHaptic && next.absoluteValue < dragThresholdPx * 0.7f) {
+                                            triggeredHaptic = false
+                                        }
+                                    }
+                                },
+                                onDragEnd = {
+                                    val cur = dragY.value
+                                    scope.launch {
+                                        when {
+                                            cur <= -dragThresholdPx -> {
+                                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                dragY.animateTo(0f, PrismMotion.FloatSpring)
+                                                onEditItem(item)
+                                            }
+                                            cur >= dragThresholdPx -> {
+                                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                dragY.animateTo(0f, PrismMotion.FloatSpring)
+                                                onApplyItem(item)
+                                            }
+                                            else -> dragY.animateTo(0f, PrismMotion.FloatSpring)
+                                        }
+                                    }
+                                },
+                                onDragCancel = {
+                                    scope.launch { dragY.animateTo(0f, PrismMotion.FloatSpring) }
+                                }
+                            )
+                        }
+                        .clickable(enabled = isCenter && isInteractive) { onEditItem(item) }
+                ) {
+                    val img = previewImages[item.id]
+                    if (img != null) {
+                        Image(
+                            bitmap = img,
+                            contentDescription = item.title,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(PrismColors.CarbonBlack),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                if (isWidgetMode) MIcons.Rounded.Widgets else MIcons.Rounded.Wallpaper,
+                                contentDescription = null,
+                                tint = PrismColors.TrackZinc,
+                                modifier = Modifier.size(44.dp)
+                            )
+                        }
+                    }
+
+                    val curDrag = dragY.value
+                    val applyWord = if (isWidgetMode) "Fixar" else "Aplicar"
+                    val dragLabel = when {
+                        curDrag <= -dragThresholdPx * 0.6f -> "Solte ↑ para Editar"
+                        curDrag >= dragThresholdPx * 0.6f -> "Solte ↓ para $applyWord"
+                        isCenter -> "↑ Editar  ·  ↓ $applyWord"
+                        else -> null
+                    }
+                    if (dragLabel != null) {
+                        Row(
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(bottom = 14.dp)
+                                .clip(CircleShape)
+                                .background(if (curDrag.absoluteValue >= dragThresholdPx) Color(0xCC1E1E24) else Color(0x72000000))
+                                .padding(horizontal = 13.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            if (curDrag <= -dragThresholdPx * 0.6f) {
+                                Icon(MIcons.Rounded.KeyboardArrowUp, null, tint = PrismColors.PureWhite, modifier = Modifier.size(14.dp))
+                            } else if (curDrag >= dragThresholdPx * 0.6f) {
+                                Icon(MIcons.Rounded.KeyboardArrowDown, null, tint = PrismColors.PureWhite, modifier = Modifier.size(14.dp))
+                            }
+                            Text(
+                                text = dragLabel,
+                                color = PrismColors.PureWhite,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }

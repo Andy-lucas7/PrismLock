@@ -1,5 +1,7 @@
 package com.example.prismlock.wallpaper
 
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
 import android.animation.ValueAnimator
 import android.app.KeyguardManager
 import android.app.WallpaperManager
@@ -29,16 +31,17 @@ import com.example.prismlock.engine.LiquidGlassRenderer
 import com.example.prismlock.engine.TouchActionExecutor
 import com.example.prismlock.engine.WallpaperBaker
 import com.example.prismlock.model.Cond
+import com.example.prismlock.model.Fill
 import com.example.prismlock.model.LayerType
 import com.example.prismlock.model.Project
 import com.example.prismlock.model.flatten
+import com.example.prismlock.widget.PrismWidgetProvider
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -64,6 +67,15 @@ class PrismWallpaperService : WallpaperService() {
     }
 
     override fun onCreateEngine(): Engine = PrismEngine()
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= TRIM_MEMORY_UI_HIDDEN) {
+            WallpaperBaker.clearMemoryCache()
+            SubjectDepthEngine.releaseMemory()
+            WallpaperCarousel.clearMemoryCache()
+        }
+    }
 
     inner class PrismEngine : Engine() {
         private val engineId = engineCounter.incrementAndGet()
@@ -91,7 +103,6 @@ class PrismWallpaperService : WallpaperService() {
         private var visibilityJob: Job? = null
         private var screenOffJob: Job? = null
         private var initJob: Job? = null
-        private var bakeVersionJob: Job? = null
         @Volatile private var isDestroyed = false
         private var surfaceVisible = false
         private var wakeProgress = 1f
@@ -117,21 +128,32 @@ class PrismWallpaperService : WallpaperService() {
                 if (!isCurrentEngine()) return
                 when (intent.action) {
                     Intent.ACTION_TIME_TICK -> {
-                        if (!surfaceVisible || !isVisible) return
+                        if (PrismWidgetProvider.hasPinnedWidgets(this@PrismWallpaperService)) {
+                            PrismWidgetProvider.updateAll(this@PrismWallpaperService)
+                        }
                         if (!isDeviceLocked() && hasOnlyLockLayers()) return
                         EnvProvider.refreshAlarm(this@PrismWallpaperService)
                         scope.launchSafe {
                             ensureBakedMinuteScene(force = false)
-                            if (surfaceVisible && isVisible && isCurrentEngine()) drawOnce()
+                            if (!isCurrentEngine()) return@launchSafe
+                            if (surfaceVisible && isVisible) drawOnce() else drawStaticFrameForAod()
                         }
                     }
                     Intent.ACTION_BATTERY_CHANGED -> {
-                        if (!surfaceVisible || !isVisible) return
-                        if (!isDeviceLocked() && hasOnlyLockLayers()) return
+                        val prev = EnvProvider.env.value
                         if (EnvProvider.applyBattery(intent)) {
-                            scope.launchSafe {
-                                ensureBakedMinuteScene(force = true)
-                                if (surfaceVisible && isVisible && isCurrentEngine()) drawOnce()
+                            val cur = EnvProvider.env.value
+                            if (prev.battery != cur.battery || prev.charging != cur.charging) {
+                                if (PrismWidgetProvider.hasPinnedWidgets(this@PrismWallpaperService)) {
+                                    PrismWidgetProvider.updateAll(this@PrismWallpaperService)
+                                }
+                                if (isDeviceLocked() || (surfaceVisible && isVisible && !hasOnlyLockLayers())) {
+                                    scope.launchSafe {
+                                        ensureBakedMinuteScene(force = true)
+                                        if (!isCurrentEngine()) return@launchSafe
+                                        if (surfaceVisible && isVisible) drawOnce() else drawStaticFrameForAod()
+                                    }
+                                }
                             }
                         }
                     }
@@ -153,6 +175,14 @@ class PrismWallpaperService : WallpaperService() {
                     }
                     Intent.ACTION_SCREEN_ON -> {
                         syncVideoPlaybackState()
+                        if (isDeviceLocked() || !hasOnlyLockLayers()) {
+                            EnvProvider.refreshAlarm(this@PrismWallpaperService)
+                            scope.launchSafe {
+                                ensureBakedMinuteScene(force = false)
+                                if (!isCurrentEngine()) return@launchSafe
+                                if (surfaceVisible && isVisible) drawOnce() else drawStaticFrameForAod()
+                            }
+                        }
                     }
                     Intent.ACTION_SCREEN_OFF -> {
                         EnvProvider.update { it.copy(locked = true) }
@@ -166,16 +196,24 @@ class PrismWallpaperService : WallpaperService() {
                         screenOffJob = scope.launchSafe {
                             delay(150L)
                             if (!isCurrentEngine()) return@launchSafe
-                            loadWallpaperAndMask(
-                                advance = project.changeOnWake,
-                                checkInterval = project.intervalMin > 0
-                            )
-                            ensureBakedMinuteScene(force = true)
+                            val shouldAdvance = project.changeOnWake || project.intervalMin > 0
+                            if (shouldAdvance) {
+                                loadWallpaperAndMask(
+                                    advance = project.changeOnWake,
+                                    checkInterval = project.intervalMin > 0
+                                )
+                            }
+                            if (shouldAdvance || cachedScene == null) {
+                                ensureBakedMinuteScene(force = true)
+                            }
                             drawStaticFrameForAod()
+                            cachedScene = cachedScene?.trimToCompleteRgb565()
+                            releaseIntermediateBakeBuffers()
                         }
                     }
-                    WallpaperBaker.ACTION_BAKED_READY -> {
+                    WallpaperBaker.ACTION_BAKED_READY, ProjectStore.ACTION_RELOAD_PROJECT -> {
                         scope.launchSafe {
+                            project = ProjectStore.readActiveProject(this@PrismWallpaperService)
                             val ver = ProjectStore.bakeVersion(this@PrismWallpaperService)
                             reloadAfterBakeVersionChange(ver)
                         }
@@ -191,10 +229,17 @@ class PrismWallpaperService : WallpaperService() {
         private fun isCurrentEngine(): Boolean =
             !isDestroyed && (if (isPreview) engineId == activePreviewEngineId else engineId == activeLiveEngineId)
 
+        private fun prewarmIfCrystal(p: Project) {
+            if (p.layers.flatten().any { (n, _) -> !n.hidden && n.fill == Fill.CRYSTAL && n.type == LayerType.TEXT }) {
+                WallpaperBaker.prewarmGlyphAtlases(p, baseW)
+            }
+        }
+
         override fun onCreate(surfaceHolder: SurfaceHolder) {
             super.onCreate(surfaceHolder)
             claimEngineSlot()
             FontManager.init(this@PrismWallpaperService)
+            renderer.attachContext(this@PrismWallpaperService)
             setTouchEventsEnabled(true)
 
             val (bw, bh) = WallpaperBaker.resolveDisplaySize(this@PrismWallpaperService)
@@ -208,6 +253,7 @@ class PrismWallpaperService : WallpaperService() {
                 addAction(Intent.ACTION_SCREEN_ON)
                 addAction(Intent.ACTION_SCREEN_OFF)
                 addAction(WallpaperBaker.ACTION_BAKED_READY)
+                addAction(ProjectStore.ACTION_RELOAD_PROJECT)
             }
             registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
 
@@ -216,28 +262,21 @@ class PrismWallpaperService : WallpaperService() {
             EnvProvider.refreshAudio(this@PrismWallpaperService)
             EnvProvider.update { it.copy(locked = isDeviceLocked()) }
 
-            bakeVersionJob = scope.launchSafe {
-                ProjectStore.bakeVersionFlow(this@PrismWallpaperService).collectLatest { version ->
-                    if (isCurrentEngine() && version > 0L && version != loadedBakeVersion) {
-                        reloadAfterBakeVersionChange(version)
-                    }
-                }
-            }
-
             initJob = scope.launchSafe {
-                ProjectStore.flow(this@PrismWallpaperService).collectLatest { p ->
-                    if (!isCurrentEngine()) return@collectLatest
-                    project = p
-                    withContext(Dispatchers.Default) {
-                        WallpaperBaker.prewarmGlyphAtlases(p, baseW)
-                    }
-                    loadWallpaperAndMask(advance = false, checkInterval = false)
+                val loaded = ProjectStore.readActiveProject(this@PrismWallpaperService)
+                if (!isCurrentEngine()) return@launchSafe
+                project = loaded
+                loadedBakeVersion = ProjectStore.bakeVersion(this@PrismWallpaperService)
+                withContext(Dispatchers.Default) {
+                    prewarmIfCrystal(loaded)
+                }
+                loadWallpaperAndMask(advance = false, checkInterval = false)
+                ensureBakedMinuteScene(force = true)
+                if (!isCurrentEngine()) return@launchSafe
+                if (surfaceVisible && isVisible) drawOnce() else drawStaticFrameForAod()
+                if (refreshWeatherIfNeeded() && isCurrentEngine()) {
                     ensureBakedMinuteScene(force = true)
-                    if (surfaceVisible && isVisible && isCurrentEngine()) drawOnce()
-                    if (refreshWeatherIfNeeded() && surfaceVisible && isVisible && isCurrentEngine()) {
-                        ensureBakedMinuteScene(force = true)
-                        drawOnce()
-                    }
+                    if (surfaceVisible && isVisible) drawOnce() else drawStaticFrameForAod()
                 }
             }
         }
@@ -247,7 +286,7 @@ class PrismWallpaperService : WallpaperService() {
             if (!isCurrentEngine()) return
             val (bw, bh) = WallpaperBaker.baseSizeForPhysical(width, height)
             if (bw == baseW && bh == baseH && cachedScene != null) {
-                if (surfaceVisible && isVisible) drawOnce()
+                if (surfaceVisible && isVisible) drawOnce() else drawStaticFrameForAod()
                 return
             }
             baseW = bw
@@ -255,12 +294,13 @@ class PrismWallpaperService : WallpaperService() {
             scope.launchSafe {
                 if (!isCurrentEngine()) return@launchSafe
                 withContext(Dispatchers.Default) {
-                    WallpaperBaker.prewarmGlyphAtlases(project, baseW)
+                    prewarmIfCrystal(project)
                 }
                 currentUri = null
                 loadWallpaperAndMask(advance = false, checkInterval = false)
                 ensureBakedMinuteScene(force = true)
-                if (surfaceVisible && isVisible && isCurrentEngine()) drawOnce()
+                if (!isCurrentEngine()) return@launchSafe
+                if (surfaceVisible && isVisible) drawOnce() else drawStaticFrameForAod()
             }
         }
 
@@ -290,6 +330,10 @@ class PrismWallpaperService : WallpaperService() {
                     startWakeAnimation()
                     visibilityJob?.cancel()
                     visibilityJob = scope.launchSafe {
+                        ensureBakedMinuteScene(force = false)
+                        if (surfaceVisible && isVisible && activeAnimator?.isRunning != true && isCurrentEngine()) {
+                            drawOnce()
+                        }
                         if (refreshWeatherIfNeeded() && surfaceVisible && isVisible && activeAnimator?.isRunning != true && isCurrentEngine()) {
                             ensureBakedMinuteScene(force = true)
                             drawOnce()
@@ -435,7 +479,6 @@ class PrismWallpaperService : WallpaperService() {
             videoRenderer?.release()
             videoRenderer = null
             initJob?.cancel()
-            bakeVersionJob?.cancel()
             screenOffJob?.cancel()
             visibilityJob?.cancel()
             stopAnimations()
@@ -450,7 +493,7 @@ class PrismWallpaperService : WallpaperService() {
             if (!isVideoActive || isDestroyed || !isCurrentEngine()) return false
             if (!isVisible || !surfaceVisible) return false
             if (powerManager?.isInteractive != true) return false
-            if (!isPreview && !isDeviceLocked() && hasOnlyLockLayers()) return false
+            if (!isPreview && !isDeviceLocked()) return false
             return true
         }
 
@@ -463,7 +506,7 @@ class PrismWallpaperService : WallpaperService() {
             val vr = videoRenderer ?: return
             if (canPlayVideo()) {
                 vr.play()
-            } else if (!isPreview && !isDeviceLocked() && hasOnlyLockLayers()) {
+            } else if (!isPreview && !isDeviceLocked()) {
                 vr.pauseAtFirstFrame()
             } else {
                 vr.pause()
@@ -490,6 +533,7 @@ class PrismWallpaperService : WallpaperService() {
             stopAnimations()
             videoRenderer?.pause()
             isVideoActive = false
+            cachedScene?.recycle()
             cachedScene = null
             cachedSceneKey = ""
             currentUri = null
@@ -506,7 +550,7 @@ class PrismWallpaperService : WallpaperService() {
             loadedBakeVersion = newVersion
             clearAllRamCaches()
             withContext(Dispatchers.Default) {
-                WallpaperBaker.prewarmGlyphAtlases(project, baseW)
+                prewarmIfCrystal(project)
             }
             loadWallpaperAndMask(advance = false, checkInterval = false)
             ensureBakedMinuteScene(force = true)
@@ -522,16 +566,33 @@ class PrismWallpaperService : WallpaperService() {
             return km?.isKeyguardLocked ?: true
         }
 
-        private fun hasOnlyLockLayers(): Boolean =
-            project.layers.flatten().all { (node, _) ->
-                node.hidden || node.type == LayerType.DEPTH || node.cond == Cond.LOCK_ONLY
+        private fun needsActiveHomeLayerRendering(): Boolean =
+            project.layers.flatten().any { (node, _) ->
+                !node.hidden && node.type != LayerType.DEPTH && (node.cond == Cond.HOME_ONLY || node.touch.isActive)
             }
+
+        private fun hasOnlyLockLayers(): Boolean = !needsActiveHomeLayerRendering()
+
+        private fun releaseIntermediateBakeBuffers() {
+            val f = frostedBitmap
+            if (f != null && f !== bgBitmap && !f.isRecycled) {
+                runCatching { f.recycle() }
+            }
+            frostedBitmap = null
+            val d = depthMask
+            if (d != null && !d.isRecycled) {
+                runCatching { d.recycle() }
+            }
+            depthMask = null
+            renderer.release()
+        }
 
         private fun releaseLockscreenBuffersIfHomeOnly() {
             if (hasOnlyLockLayers()) {
+                cachedScene?.recycle()
                 cachedScene = null
                 cachedSceneKey = ""
-                renderer.clearShaderCachesForHome()
+                releaseIntermediateBakeBuffers()
             }
         }
 
@@ -619,8 +680,24 @@ class PrismWallpaperService : WallpaperService() {
             }
             val now = LocalDateTime.now()
             val env = EnvProvider.env.value.copy(locked = if (isPreview) true else isDeviceLocked())
-            val key = "${loadedBakeVersion}|${currentUri}|${baseW}x${baseH}|${now.year}-${now.dayOfYear}-${now.hour}:${now.minute}|${env.locked}|${env.battery}|${env.charging}|${env.temp}|${env.weatherCode}|${env.mediaVolume}|${env.mediaPlaying}|${project.hashCode()}|${depthMask != null}"
+            val uri = currentUri
+            val wantDepthNow = !isVideoActive && uri != null && project.depth &&
+                project.isDepthEnabledFor(WallpaperCarousel.imageKey(this@PrismWallpaperService, uri))
+            val key = "${loadedBakeVersion}|${uri}|${baseW}x${baseH}|${now.year}-${now.dayOfYear}-${now.hour}:${now.minute}|${env.locked}|${env.battery}|${env.charging}|${env.temp}|${env.weatherCode}|${env.mediaVolume}|${env.mediaPlaying}|${project.hashCode()}|$wantDepthNow"
             if (!force && key == cachedSceneKey && cachedScene != null) return@withLock
+
+            if (uri != null && loadedBakeVersion > 0L && !isVideoActive) {
+                if (frostedBitmap == null) {
+                    frostedBitmap = withContext(Dispatchers.IO) {
+                        WallpaperBaker.loadBakedFrostedBitmap(this@PrismWallpaperService, uri, loadedBakeVersion)
+                    }
+                }
+                if (wantDepthNow && depthMask == null) {
+                    depthMask = withContext(Dispatchers.IO) {
+                        WallpaperBaker.loadBakedDepthBitmap(this@PrismWallpaperService, uri, loadedBakeVersion)
+                    }
+                }
+            }
 
             val sharp = bgBitmap
             val frosted = frostedBitmap
@@ -629,6 +706,7 @@ class PrismWallpaperService : WallpaperService() {
             val proj = project
             val bw = baseW
             val bh = baseH
+            val isSteady = wakeProgress >= 0.998f && activeAnimator?.isRunning != true
             val freshHits = ArrayList<HitBox>()
             val scene = withContext(Dispatchers.Default) {
                 renderer.bakeMinuteScene(
@@ -641,13 +719,23 @@ class PrismWallpaperService : WallpaperService() {
                     env = env,
                     now = now,
                     prebakedBlurPx = preBlur,
-                    hits = freshHits
+                    hits = freshHits,
+                    includeCompleteBitmap = true,
+                    useRgb565ForComplete = true,
+                    retainOnlyComplete = isSteady
                 )
             }
             if (isCurrentEngine()) {
+                val old = cachedScene
                 cachedScene = scene
                 cachedSceneKey = key
                 activeHits = freshHits
+                if (old != null && old !== scene) old.recycle()
+                if (isSteady) {
+                    releaseIntermediateBakeBuffers()
+                }
+            } else {
+                scene.recycle()
             }
         }
 
@@ -667,6 +755,14 @@ class PrismWallpaperService : WallpaperService() {
                     wakeProgress = anim.animatedValue as Float
                     drawOnce()
                 }
+                addListener(object : AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: Animator) {
+                        if (isCurrentEngine() && wakeProgress >= 0.998f) {
+                            cachedScene = cachedScene?.trimToCompleteRgb565()
+                            releaseIntermediateBakeBuffers()
+                        }
+                    }
+                })
                 start()
             }
         }

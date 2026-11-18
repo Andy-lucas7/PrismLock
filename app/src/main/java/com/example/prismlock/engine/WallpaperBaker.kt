@@ -93,6 +93,14 @@ object GlyphAtlasBaker {
 
     fun getRegisteredNode(nodeId: String): LayerNode? = nodeLookup[nodeId]
 
+    fun clearCache() {
+        lensAtlasCache.values.forEach { atlas ->
+            atlas.glyphs.values.forEach { runCatching { it.bitmap.recycle() } }
+        }
+        lensAtlasCache.clear()
+        nodeLookup.clear()
+    }
+
     fun lensAtlasKey(node: LayerNode, u: Float, bevelPx: Float, strokePx: Float): String =
         "${StemStretch.atlasKey(node, u)}|bevel=${bevelPx.roundToInt()}|stroke=${strokePx.roundToInt()}"
 
@@ -160,6 +168,9 @@ object GlyphAtlasBaker {
             )
         }
 
+        if (lensAtlasCache.size >= 2) {
+            clearCache()
+        }
         lensAtlasCache[lKey] = BakedNodeLensAtlas(
             key = lKey,
             glyphs = glyphLensMap,
@@ -305,6 +316,9 @@ object WallpaperBaker {
 
     fun clearMemoryCache() {
         memAssetsCache.clear()
+        GlyphAtlasBaker.clearCache()
+        SubjectDepthEngine.releaseMemory()
+        WallpaperCarousel.clearMemoryCache()
     }
 
     fun loadBakedForUri(
@@ -319,38 +333,53 @@ object WallpaperBaker {
         if (requiredVersion > 0L && manifest.version != requiredVersion) return null
         val ver = manifest.version
         val id = imageId(uriStr)
-        val memKey = "${ver}_$id"
-        memAssetsCache[memKey]?.let { cached ->
-            if (!cached.sharp.isRecycled && !cached.frosted.isRecycled &&
-                (expectedW == 0 || (cached.sharp.width == expectedW && cached.sharp.height == expectedH))
-            ) {
-                return cached
-            }
-        }
         val sf = sharpFile(ctx, ver, id)
         val ff = frostedFile(ctx, ver, id)
         if (!sf.exists() || !ff.exists()) return null
 
-        val opts = BitmapFactory.Options().apply {
-            inPreferredConfig = Bitmap.Config.ARGB_8888
-            inMutable = true
+        val opaqueOpts = BitmapFactory.Options().apply {
+            inPreferredConfig = Bitmap.Config.RGB_565
+            inMutable = false
         }
-        val sharp = BitmapFactory.decodeFile(sf.absolutePath, opts)?.apply { setHasAlpha(false) } ?: return null
+        val alphaOpts = BitmapFactory.Options().apply {
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+            inMutable = false
+        }
+        val sharp = BitmapFactory.decodeFile(sf.absolutePath, opaqueOpts)?.apply { if (hasAlpha()) setHasAlpha(false) } ?: return null
         if (expectedW > 0 && expectedH > 0 && (sharp.width != expectedW || sharp.height != expectedH)) {
             sharp.recycle()
             return null
         }
-        val frosted = BitmapFactory.decodeFile(ff.absolutePath, opts)?.apply { setHasAlpha(false) } ?: run {
+        val frosted = BitmapFactory.decodeFile(ff.absolutePath, opaqueOpts)?.apply { if (hasAlpha()) setHasAlpha(false) } ?: run {
             sharp.recycle()
             return null
         }
         val df = depthFile(ctx, ver, id)
-        val depth = if (df.exists()) BitmapFactory.decodeFile(df.absolutePath, opts) else null
+        val depth = if (df.exists()) BitmapFactory.decodeFile(df.absolutePath, alphaOpts) else null
 
-        val assets = BakedWallAssets(ver, id, uriStr, sharp, frosted, depth, manifest.blurPx)
-        if (memAssetsCache.size >= 3) memAssetsCache.clear()
-        memAssetsCache[memKey] = assets
-        return assets
+        return BakedWallAssets(ver, id, uriStr, sharp, frosted, depth, manifest.blurPx)
+    }
+
+    fun loadBakedFrostedBitmap(ctx: Context, uriStr: String?, version: Long): Bitmap? {
+        if (uriStr.isNullOrBlank() || version <= 0L) return null
+        val ff = frostedFile(ctx, version, imageId(uriStr))
+        if (!ff.exists()) return null
+        val opts = BitmapFactory.Options().apply {
+            inPreferredConfig = Bitmap.Config.RGB_565
+            inMutable = false
+        }
+        return BitmapFactory.decodeFile(ff.absolutePath, opts)?.apply { if (hasAlpha()) setHasAlpha(false) }
+    }
+
+    fun loadBakedDepthBitmap(ctx: Context, uriStr: String?, version: Long): Bitmap? {
+        if (uriStr.isNullOrBlank() || version <= 0L) return null
+        val df = depthFile(ctx, version, imageId(uriStr))
+        if (!df.exists()) return null
+        val opts = BitmapFactory.Options().apply {
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+            inMutable = false
+        }
+        return BitmapFactory.decodeFile(df.absolutePath, opts)
     }
 
     fun prewarmGlyphAtlases(project: Project, baseWidth: Int) {
@@ -398,59 +427,68 @@ object WallpaperBaker {
         val entries = ArrayList<BakedWallpaperEntry>(uris.size)
         val total = uris.size.coerceAtLeast(1)
 
-        for ((index, uriStr) in uris.withIndex()) {
-            val baseRatio = 0.16f + (index.toFloat() / total) * 0.76f
-            val imgKey = WallpaperCarousel.imageKey(ctx, uriStr)
-            val id = imageId(uriStr)
-            val isVideo = WallpaperCarousel.isVideoUri(ctx, uriStr)
+        try {
+            for ((index, uriStr) in uris.withIndex()) {
+                val baseRatio = 0.16f + (index.toFloat() / total) * 0.76f
+                val imgKey = WallpaperCarousel.imageKey(ctx, uriStr)
+                val id = imageId(uriStr)
+                val isVideo = WallpaperCarousel.isVideoUri(ctx, uriStr)
 
-            onProgress(baseRatio, if (isVideo) "Processando vídeo ${index + 1}/$total ($imgKey)..." else "Processando imagem ${index + 1}/$total ($imgKey)...")
-            val rawBmp = WallpaperCarousel.loadBitmap(ctx, uriStr, baseW, baseH)
-            if (rawBmp != null) {
-                val exactSharp = centerCropOpaque(rawBmp, baseW, baseH)
-                val wantDepth = !isVideo && project.depth && project.isDepthEnabledFor(imgKey)
-                var hasDepthMask = false
-                var finalSharp = exactSharp
+                onProgress(baseRatio, if (isVideo) "Processando vídeo ${index + 1}/$total ($imgKey)..." else "Processando imagem ${index + 1}/$total ($imgKey)...")
+                val rawBmp = WallpaperCarousel.loadBitmap(ctx, uriStr, baseW, baseH)
+                if (rawBmp != null) {
+                    val exactSharp = centerCropOpaque(rawBmp, baseW, baseH)
+                    val wantDepth = !isVideo && project.depth && project.isDepthEnabledFor(imgKey)
+                    var hasDepthMask = false
+                    var finalSharp = exactSharp
 
-                if (wantDepth) {
-                    onProgress(baseRatio + (0.18f / total), "Recortando sujeito 3D ${index + 1}/$total...")
-                    val rawMask = SubjectDepthEngine.getOrCreateMask(ctx, uriStr, exactSharp)
-                    if (rawMask != null) {
-                        val croppedMask = centerCropAlpha(rawMask, baseW, baseH)
-                        val processedMask = if (project.hasDepthPostProcessing()) {
-                            onProgress(baseRatio + (0.34f / total), "Aplicando Bokeh e Color Pop 3D ${index + 1}/$total...")
-                            finalSharp = SubjectDepthEngine.composeProcessedWallpaper(
-                                baseSharp = exactSharp,
-                                depthMask = croppedMask,
-                                project = project,
-                                blurFn = { src, r -> renderer.bakeBlurredBitmap(src, baseW, baseH, r) }
-                            )
-                            SubjectDepthEngine.applySubjectColorPopMask(croppedMask, project)
-                        } else {
-                            croppedMask
+                    if (wantDepth) {
+                        onProgress(baseRatio + (0.18f / total), "Recortando sujeito 3D ${index + 1}/$total...")
+                        val rawMask = SubjectDepthEngine.getOrCreateMask(ctx, uriStr, exactSharp)
+                        if (rawMask != null) {
+                            val croppedMask = centerCropAlpha(rawMask, baseW, baseH)
+                            val processedMask = if (project.hasDepthPostProcessing()) {
+                                onProgress(baseRatio + (0.34f / total), "Aplicando Bokeh e Color Pop 3D ${index + 1}/$total...")
+                                finalSharp = SubjectDepthEngine.composeProcessedWallpaper(
+                                    baseSharp = exactSharp,
+                                    depthMask = croppedMask,
+                                    project = project,
+                                    blurFn = { src, r -> renderer.bakeBlurredBitmap(src, baseW, baseH, r) }
+                                )
+                                SubjectDepthEngine.applySubjectColorPopMask(croppedMask, project)
+                            } else {
+                                croppedMask
+                            }
+                            FileOutputStream(depthFile(ctx, bakeVersion, id)).use { out ->
+                                processedMask.compress(Bitmap.CompressFormat.PNG, 92, out)
+                                out.flush()
+                            }
+                            hasDepthMask = true
                         }
-                        FileOutputStream(depthFile(ctx, bakeVersion, id)).use { out ->
-                            processedMask.compress(Bitmap.CompressFormat.PNG, 92, out)
-                            out.flush()
-                        }
-                        hasDepthMask = true
                     }
-                }
 
-                FileOutputStream(sharpFile(ctx, bakeVersion, id)).use { out ->
-                    finalSharp.compress(Bitmap.CompressFormat.WEBP_LOSSY, 96, out)
-                    out.flush()
-                }
+                    FileOutputStream(sharpFile(ctx, bakeVersion, id)).use { out ->
+                        finalSharp.compress(Bitmap.CompressFormat.WEBP_LOSSY, 96, out)
+                        out.flush()
+                    }
 
-                onProgress(baseRatio + (0.55f / total), "Pré-renderizando vidro jateado ${index + 1}/$total...")
-                val frostedBmp = renderer.bakeBlurredBitmap(finalSharp, baseW, baseH, blurPx)
-                FileOutputStream(frostedFile(ctx, bakeVersion, id)).use { out ->
-                    frostedBmp.compress(Bitmap.CompressFormat.WEBP_LOSSY, 94, out)
-                    out.flush()
-                }
+                    onProgress(baseRatio + (0.55f / total), "Pré-renderizando vidro jateado ${index + 1}/$total...")
+                    val frostedBmp = renderer.bakeBlurredBitmap(finalSharp, baseW, baseH, blurPx)
+                    FileOutputStream(frostedFile(ctx, bakeVersion, id)).use { out ->
+                        frostedBmp.compress(Bitmap.CompressFormat.WEBP_LOSSY, 94, out)
+                        out.flush()
+                    }
+                    if (frostedBmp !== finalSharp && !frostedBmp.isRecycled) frostedBmp.recycle()
+                    if (finalSharp !== exactSharp && !finalSharp.isRecycled) finalSharp.recycle()
+                    if (exactSharp !== rawBmp && !exactSharp.isRecycled) exactSharp.recycle()
 
-                entries.add(BakedWallpaperEntry(id = id, uri = uriStr, imageKey = imgKey, hasDepth = hasDepthMask, isVideo = isVideo))
+                    entries.add(BakedWallpaperEntry(id = id, uri = uriStr, imageKey = imgKey, hasDepth = hasDepthMask, isVideo = isVideo))
+                }
             }
+        } finally {
+            renderer.releaseOffscreenResources()
+            SubjectDepthEngine.releaseMemory()
+            WallpaperCarousel.clearMemoryCache()
         }
 
         val manifest = BakedManifest(

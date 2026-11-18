@@ -1,5 +1,6 @@
 package com.example.prismlock.engine
 
+import android.app.Application
 import android.content.Context
 import android.graphics.Matrix
 import android.graphics.Paint
@@ -62,7 +63,6 @@ object FontManager {
         if (!::dir.isInitialized) dir = File(ctx.applicationContext.filesDir, "fonts").apply { mkdirs() }
         if (!::customDir.isInitialized) customDir = File(ctx.applicationContext.filesDir, "custom_fonts").apply { mkdirs() }
         if (!::bundledDir.isInitialized) bundledDir = File(ctx.applicationContext.filesDir, "bundled_fonts").apply { mkdirs() }
-        scanSamsungFontsOnce()
     }
 
     fun customFontsDir(ctx: Context): File {
@@ -71,6 +71,9 @@ object FontManager {
     }
 
     suspend fun prewarm(ctx: Context) = withContext(Dispatchers.IO) {
+        if (runCatching { Application.getProcessName().endsWith(":wallpaper") }.getOrDefault(false)) {
+            return@withContext
+        }
         init(ctx)
         availableFonts(ctx).forEach { f ->
             label(f)
@@ -457,8 +460,13 @@ class GlyphAtlas(
 object StemStretch {
     private const val EM = 1000f
     private const val ATLAS_CHARS = "0123456789:"
-    private val cache = LruCache<String, TextShape>(192)
-    private val atlasCache = LruCache<String, GlyphAtlas>(24)
+    private val cache = LruCache<String, TextShape>(64)
+    private val atlasCache = LruCache<String, GlyphAtlas>(6)
+
+    fun clearCaches() {
+        cache.evictAll()
+        atlasCache.evictAll()
+    }
 
     fun atlasKey(node: LayerNode, u: Float): String {
         val targetPx = (node.size * u).coerceAtLeast(1f)

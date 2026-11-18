@@ -2,12 +2,14 @@ package com.example.prismlock.data
 
 import android.annotation.SuppressLint
 import android.app.AlarmManager
+import android.app.Application
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.location.LocationManager
 import android.media.AudioManager
 import android.os.BatteryManager
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
@@ -27,6 +29,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.double
@@ -34,6 +37,7 @@ import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -44,10 +48,24 @@ import java.util.UUID
 
 val Context.prismStore by preferencesDataStore("prismlock")
 
+@Serializable
+private data class CarouselIpcState(
+    val index: Int = 0,
+    val lastSwitch: Long = 0L,
+    val currentUri: String? = null,
+    val bakeVersion: Long = 0L
+)
+
 object ProjectStore {
     val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+    const val ACTION_RELOAD_PROJECT = "com.example.prismlock.ACTION_RELOAD_PROJECT"
+    private val ipcLock = Any()
     private val KEY = stringPreferencesKey("project")
     private val THEMES_KEY = stringPreferencesKey("saved_themes_v1")
+    private val WIDGETS_KEY = stringPreferencesKey("saved_widgets_v1")
+    private val ACTIVE_WIDGET_KEY = stringPreferencesKey("active_widget_project")
+    private val HERO_SEEN_KEY = booleanPreferencesKey("hero_seen_v1")
+    private val BATTERY_PROMPT_DISMISSED_KEY = booleanPreferencesKey("battery_prompt_dismissed_v1")
     private val IDX = intPreferencesKey("carousel_index")
     private val LAST_SWITCH = longPreferencesKey("carousel_switch")
     private val CURRENT_URI = stringPreferencesKey("carousel_current_uri")
@@ -95,17 +113,76 @@ object ProjectStore {
         layers = Presets.iosGlass().map { it.copyDeep() }
     )
 
+    fun isWallpaperProcess(): Boolean = runCatching {
+        Application.getProcessName().endsWith(":wallpaper")
+    }.getOrDefault(false)
+
+    private fun ipcDir(ctx: Context): File =
+        File(ctx.applicationContext.filesDir, "ipc_state").apply { mkdirs() }
+
+    private fun activeProjectFile(ctx: Context): File = File(ipcDir(ctx), "active_project.json")
+    private fun activeWidgetFile(ctx: Context): File = File(ipcDir(ctx), "active_widget.json")
+    private fun carouselFile(ctx: Context): File = File(ipcDir(ctx), "carousel_state.json")
+
+    private fun writeAtomicText(file: File, text: String) {
+        synchronized(ipcLock) {
+            runCatching {
+                val tmp = File(file.parentFile, "${file.name}.tmp")
+                tmp.writeText(text, Charsets.UTF_8)
+                if (!tmp.renameTo(file)) {
+                    file.writeText(text, Charsets.UTF_8)
+                    tmp.delete()
+                }
+            }
+        }
+    }
+
+    private fun readCarouselIpc(ctx: Context): CarouselIpcState? = synchronized(ipcLock) {
+        val f = carouselFile(ctx)
+        if (!f.exists()) return@synchronized null
+        runCatching { json.decodeFromString(CarouselIpcState.serializer(), f.readText()) }.getOrNull()
+    }
+
+    private fun updateCarouselIpc(ctx: Context, transform: (CarouselIpcState) -> CarouselIpcState) {
+        synchronized(ipcLock) {
+            val f = carouselFile(ctx)
+            val cur = if (f.exists()) {
+                runCatching { json.decodeFromString(CarouselIpcState.serializer(), f.readText()) }.getOrNull()
+            } else null
+            val next = transform(cur ?: CarouselIpcState())
+            writeAtomicText(f, json.encodeToString(CarouselIpcState.serializer(), next))
+        }
+    }
+
+    suspend fun readActiveProject(ctx: Context): Project {
+        val f = activeProjectFile(ctx)
+        if (f.exists()) {
+            val disk = synchronized(ipcLock) {
+                runCatching { json.decodeFromString(Project.serializer(), f.readText()) }.getOrNull()
+            }
+            if (disk != null) return disk
+        }
+        val ds = ctx.applicationContext.prismStore.data.first()[KEY]
+            ?.let { runCatching { json.decodeFromString(Project.serializer(), it) }.getOrNull() }
+            ?: Project()
+        writeAtomicText(f, json.encodeToString(Project.serializer(), ds))
+        return ds
+    }
+
     suspend fun save(ctx: Context, p: Project) {
         val s = json.encodeToString(Project.serializer(), p)
-        ctx.applicationContext.prismStore.edit { prefs ->
-            prefs[KEY] = s
-            val curList = prefs[THEMES_KEY]
-                ?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
-                ?.toMutableList()
-                ?: mutableListOf()
-            val idx = curList.indexOfFirst { it.id == p.id }
-            if (idx >= 0) curList[idx] = p else curList.add(0, p)
-            prefs[THEMES_KEY] = json.encodeToString(listSerializer, curList)
+        writeAtomicText(activeProjectFile(ctx), s)
+        if (!isWallpaperProcess()) {
+            ctx.applicationContext.prismStore.edit { prefs ->
+                prefs[KEY] = s
+                val curList = prefs[THEMES_KEY]
+                    ?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
+                    ?.toMutableList()
+                    ?: mutableListOf()
+                val idx = curList.indexOfFirst { it.id == p.id }
+                if (idx >= 0) curList[idx] = p else curList.add(0, p)
+                prefs[THEMES_KEY] = json.encodeToString(listSerializer, curList)
+            }
         }
     }
 
@@ -144,21 +221,40 @@ object ProjectStore {
         }
     }
 
-    suspend fun index(ctx: Context): Int = ctx.applicationContext.prismStore.data.first()[IDX] ?: 0
-    suspend fun lastSwitch(ctx: Context): Long = ctx.applicationContext.prismStore.data.first()[LAST_SWITCH] ?: 0L
-    suspend fun currentWallpaperUri(ctx: Context): String? = ctx.applicationContext.prismStore.data.first()[CURRENT_URI]
+    suspend fun index(ctx: Context): Int {
+        readCarouselIpc(ctx)?.let { return it.index }
+        return ctx.applicationContext.prismStore.data.first()[IDX] ?: 0
+    }
+
+    suspend fun lastSwitch(ctx: Context): Long {
+        readCarouselIpc(ctx)?.let { return it.lastSwitch }
+        return ctx.applicationContext.prismStore.data.first()[LAST_SWITCH] ?: 0L
+    }
+
+    suspend fun currentWallpaperUri(ctx: Context): String? {
+        val ipc = readCarouselIpc(ctx)
+        if (ipc != null) return ipc.currentUri
+        return ctx.applicationContext.prismStore.data.first()[CURRENT_URI]
+    }
 
     suspend fun setCurrentWallpaperUri(ctx: Context, uri: String?) {
-        ctx.applicationContext.prismStore.edit {
-            if (uri != null) it[CURRENT_URI] = uri else it.remove(CURRENT_URI)
+        updateCarouselIpc(ctx) { it.copy(currentUri = uri) }
+        if (!isWallpaperProcess()) {
+            ctx.applicationContext.prismStore.edit {
+                if (uri != null) it[CURRENT_URI] = uri else it.remove(CURRENT_URI)
+            }
         }
     }
 
     suspend fun setIndex(ctx: Context, i: Int, uri: String? = null) {
-        ctx.applicationContext.prismStore.edit {
-            it[IDX] = i
-            it[LAST_SWITCH] = System.currentTimeMillis()
-            if (uri != null) it[CURRENT_URI] = uri
+        val now = System.currentTimeMillis()
+        updateCarouselIpc(ctx) { it.copy(index = i, lastSwitch = now, currentUri = uri ?: it.currentUri) }
+        if (!isWallpaperProcess()) {
+            ctx.applicationContext.prismStore.edit {
+                it[IDX] = i
+                it[LAST_SWITCH] = now
+                if (uri != null) it[CURRENT_URI] = uri
+            }
         }
     }
 
@@ -166,10 +262,16 @@ object ProjectStore {
         .map { it[ACTIVE_BAKE_VERSION] ?: 0L }
         .distinctUntilChanged()
 
-    suspend fun bakeVersion(ctx: Context): Long = ctx.applicationContext.prismStore.data.first()[ACTIVE_BAKE_VERSION] ?: 0L
+    suspend fun bakeVersion(ctx: Context): Long {
+        readCarouselIpc(ctx)?.let { if (it.bakeVersion > 0L) return it.bakeVersion }
+        return ctx.applicationContext.prismStore.data.first()[ACTIVE_BAKE_VERSION] ?: 0L
+    }
 
     suspend fun setBakeVersion(ctx: Context, version: Long) {
-        ctx.applicationContext.prismStore.edit { it[ACTIVE_BAKE_VERSION] = version }
+        updateCarouselIpc(ctx) { it.copy(bakeVersion = version) }
+        if (!isWallpaperProcess()) {
+            ctx.applicationContext.prismStore.edit { it[ACTIVE_BAKE_VERSION] = version }
+        }
     }
 
     suspend fun fontFolderUri(ctx: Context): String? = ctx.applicationContext.prismStore.data.first()[FONT_FOLDER_URI]
@@ -178,6 +280,140 @@ object ProjectStore {
         ctx.applicationContext.prismStore.edit {
             if (uri != null) it[FONT_FOLDER_URI] = uri else it.remove(FONT_FOLDER_URI)
         }
+    }
+
+    fun defaultStarterWidgets(): List<Project> = listOf(
+        Project(
+            id = "widget_crystal_clock",
+            title = "Relógio Cristal Elástico",
+            layers = Presets.widgetElasticClock(),
+            isWidget = true,
+            widgetAspect = 2.0f
+        ),
+        Project(
+            id = "widget_weather_battery",
+            title = "Clima & Bateria Vidro",
+            layers = Presets.widgetWeatherBatteryCard(),
+            isWidget = true,
+            widgetAspect = 2.0f
+        ),
+        Project(
+            id = "widget_music_smart",
+            title = "Capsula Mídia Cristal",
+            layers = Presets.widgetMusicSmartCard(),
+            isWidget = true,
+            widgetAspect = 2.2f
+        )
+    )
+
+    fun newWidget(title: String = "Prism Widget"): Project = Project(
+        id = UUID.randomUUID().toString(),
+        title = title,
+        layers = Presets.widgetElasticClock().map { it.copyDeep() },
+        isWidget = true,
+        widgetAspect = 2.0f
+    )
+
+    fun widgetsFlow(ctx: Context): Flow<List<Project>> = ctx.applicationContext.prismStore.data
+        .map { it[WIDGETS_KEY] }
+        .distinctUntilChanged()
+        .map { raw ->
+            val decoded = raw?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
+            if (!decoded.isNullOrEmpty()) decoded.map { it.copy(isWidget = true) } else defaultStarterWidgets()
+        }
+
+    fun activeWidgetFlow(ctx: Context): Flow<Project> = ctx.applicationContext.prismStore.data
+        .map { it[ACTIVE_WIDGET_KEY] }
+        .distinctUntilChanged()
+        .map { raw ->
+            raw?.let { runCatching { json.decodeFromString(Project.serializer(), it) }.getOrNull() }?.copy(isWidget = true)
+                ?: defaultStarterWidgets().first()
+        }
+
+    suspend fun getActiveWidget(ctx: Context): Project {
+        val f = activeWidgetFile(ctx)
+        if (f.exists()) {
+            val disk = synchronized(ipcLock) {
+                runCatching { json.decodeFromString(Project.serializer(), f.readText()) }.getOrNull()?.copy(isWidget = true)
+            }
+            if (disk != null) return disk
+        }
+        val raw = ctx.applicationContext.prismStore.data.first()[ACTIVE_WIDGET_KEY]
+        val w = raw?.let { runCatching { json.decodeFromString(Project.serializer(), it) }.getOrNull() }?.copy(isWidget = true)
+            ?: defaultStarterWidgets().first()
+        writeAtomicText(f, json.encodeToString(Project.serializer(), w))
+        return w
+    }
+
+    suspend fun saveActiveWidget(ctx: Context, p: Project) {
+        val clean = p.copy(isWidget = true)
+        val encoded = json.encodeToString(Project.serializer(), clean)
+        writeAtomicText(activeWidgetFile(ctx), encoded)
+        if (!isWallpaperProcess()) {
+            ctx.applicationContext.prismStore.edit { prefs ->
+                prefs[ACTIVE_WIDGET_KEY] = encoded
+                val curList = prefs[WIDGETS_KEY]
+                    ?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
+                    ?.toMutableList()
+                    ?: defaultStarterWidgets().toMutableList()
+                val idx = curList.indexOfFirst { it.id == clean.id }
+                if (idx >= 0) curList[idx] = clean else curList.add(0, clean)
+                prefs[WIDGETS_KEY] = json.encodeToString(listSerializer, curList)
+            }
+        }
+    }
+
+    suspend fun upsertWidget(ctx: Context, p: Project) {
+        val clean = p.copy(isWidget = true)
+        if (isWallpaperProcess()) {
+            saveActiveWidget(ctx, clean)
+            return
+        }
+        var shouldWriteActiveIpc = false
+        ctx.applicationContext.prismStore.edit { prefs ->
+            val baseList = prefs[WIDGETS_KEY]
+                ?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
+                ?.toMutableList()
+                ?: defaultStarterWidgets().toMutableList()
+            val idx = baseList.indexOfFirst { it.id == clean.id }
+            if (idx >= 0) baseList[idx] = clean else baseList.add(clean)
+            prefs[WIDGETS_KEY] = json.encodeToString(listSerializer, baseList)
+            val activeRaw = prefs[ACTIVE_WIDGET_KEY]
+            val active = activeRaw?.let { runCatching { json.decodeFromString(Project.serializer(), it) }.getOrNull() }
+            if (active?.id == clean.id) {
+                prefs[ACTIVE_WIDGET_KEY] = json.encodeToString(Project.serializer(), clean)
+                shouldWriteActiveIpc = true
+            }
+        }
+        if (shouldWriteActiveIpc) {
+            writeAtomicText(activeWidgetFile(ctx), json.encodeToString(Project.serializer(), clean))
+        }
+    }
+
+    suspend fun deleteWidget(ctx: Context, widgetId: String) {
+        ctx.applicationContext.prismStore.edit { prefs ->
+            val curList = prefs[WIDGETS_KEY]
+                ?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
+                ?: defaultStarterWidgets()
+            val remaining = curList.filterNot { it.id == widgetId }.ifEmpty { defaultStarterWidgets().take(1) }
+            prefs[WIDGETS_KEY] = json.encodeToString(listSerializer, remaining)
+        }
+    }
+
+    fun heroSeenFlow(ctx: Context): Flow<Boolean> = ctx.applicationContext.prismStore.data
+        .map { it[HERO_SEEN_KEY] ?: false }
+        .distinctUntilChanged()
+
+    suspend fun setHeroSeen(ctx: Context, seen: Boolean) {
+        ctx.applicationContext.prismStore.edit { it[HERO_SEEN_KEY] = seen }
+    }
+
+    fun batteryPromptDismissedFlow(ctx: Context): Flow<Boolean> = ctx.applicationContext.prismStore.data
+        .map { it[BATTERY_PROMPT_DISMISSED_KEY] ?: false }
+        .distinctUntilChanged()
+
+    suspend fun setBatteryPromptDismissed(ctx: Context, dismissed: Boolean) {
+        ctx.applicationContext.prismStore.edit { it[BATTERY_PROMPT_DISMISSED_KEY] = dismissed }
     }
 }
 
@@ -223,7 +459,7 @@ object EnvProvider {
         val rawTemp = i.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1)
         val bTemp = if (rawTemp > 0) rawTemp / 10f else _env.value.batteryTempC
         val old = _env.value
-        if (old.battery == pct && old.charging == ch && old.batteryTempC == bTemp) return false
+        if (old.battery == pct && old.charging == ch && kotlin.math.abs(old.batteryTempC - bTemp) < 1.0f) return false
         _env.value = old.copy(battery = pct, charging = ch, batteryTempC = bTemp)
         return true
     }

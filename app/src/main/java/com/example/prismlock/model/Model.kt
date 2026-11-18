@@ -3,7 +3,7 @@ package com.example.prismlock.model
 import kotlinx.serialization.Serializable
 import java.util.UUID
 
-@Serializable enum class LayerType { TEXT, STACK, SHAPE, ICON, SVG, DEPTH }
+@Serializable enum class LayerType { TEXT, STACK, SHAPE, ICON, SVG, IMAGE, DEPTH }
 @Serializable enum class Cond { ALWAYS, LOCK_ONLY, HOME_ONLY, CHARGING, NOT_CHARGING, LOW_BATTERY, DAY, NIGHT }
 @Serializable enum class Blend { NORMAL, MULTIPLY, SCREEN, OVERLAY, DARKEN, LIGHTEN, COLOR_DODGE, COLOR_BURN, SOFT_LIGHT, HARD_LIGHT, DIFFERENCE, EXCLUSION, PLUS, HUE, SATURATION, COLOR, LUMINOSITY }
 @Serializable enum class Fill { SOLID, GRADIENT, ADAPTIVE, GLASS, CRYSTAL, HOLLOW }
@@ -118,6 +118,7 @@ data class LayerNode(
     val svgData: List<String> = emptyList(),
     val svgW: Float = 24f,
     val svgH: Float = 24f,
+    val imageUri: String = "",
     val dir: Dir = Dir.VERTICAL,
     val spacing: Float = 12f,
     val parentId: String? = null,
@@ -129,7 +130,9 @@ data class LayerNode(
     val fxRotation: String = "",
     val fxScale: String = "",
     val fxOffsetX: String = "",
-    val fxOffsetY: String = ""
+    val fxOffsetY: String = "",
+    val fxSize: String = "",
+    val fxAsset: String = ""
 ) {
     fun hasFx(): Boolean =
         fxColor.isNotEmpty() ||
@@ -137,7 +140,9 @@ data class LayerNode(
             fxRotation.isNotEmpty() ||
             fxScale.isNotEmpty() ||
             fxOffsetX.isNotEmpty() ||
-            fxOffsetY.isNotEmpty()
+            fxOffsetY.isNotEmpty() ||
+            fxSize.isNotEmpty() ||
+            fxAsset.isNotEmpty()
 }
 
 @Serializable
@@ -163,7 +168,10 @@ data class Project(
     val lat: Double = -23.55,
     val lon: Double = -46.63,
     val dim: Float = 0.12f,
-    val globals: List<GlobalVar> = emptyList()
+    val globals: List<GlobalVar> = emptyList(),
+    val isWidget: Boolean = false,
+    val widgetAspect: Float = 2.0f,
+    val customAssets: Map<String, String> = emptyMap()
 ) {
     fun isDepthEnabledFor(imageKey: String): Boolean =
         depthOverrides[imageKey] ?: defaultDepthForNewImages
@@ -346,10 +354,182 @@ object Presets {
         LayerNode(name = "Sujeito 3D", type = LayerType.DEPTH)
     )
 
+    fun widgetElasticClock(): List<LayerNode> = listOf(
+        LayerNode(
+            name = "Base Cristal Widget",
+            type = LayerType.SHAPE,
+            shape = ShapeKind.RECT,
+            x = 0.5f,
+            y = 0.5f,
+            anchor = Anchor.CENTER,
+            w = 980f,
+            h = 460f,
+            corner = 72f,
+            fill = Fill.CRYSTAL,
+            glass = Glass(blur = 28f, refraction = 44f, bevelWidth = 24f, frostAmount = 0.24f, tint = 0x28FFFFFF, rim = 0.9f)
+        ),
+        LayerNode(
+            name = "Bloco Relógio Widget",
+            type = LayerType.STACK,
+            dir = Dir.VERTICAL,
+            x = 0.5f,
+            y = 0.5f,
+            anchor = Anchor.CENTER,
+            align = Align.CENTER,
+            spacing = 8f,
+            children = listOf(
+                LayerNode(
+                    name = "Hora Elástica",
+                    text = "\$df(HH)\$:\$df(mm)\$",
+                    size = 215f,
+                    weight = 700,
+                    font = "sans-serif-condensed",
+                    stretch = 1.65f,
+                    fill = Fill.CRYSTAL,
+                    glass = Glass(blur = 14f, refraction = 54f, bevelWidth = 18f, frostAmount = 0.12f, tint = 0x44FFFFFF, rim = 0.95f)
+                ),
+                LayerNode(
+                    name = "Data & Clima",
+                    text = "\$tc(cap, df(EEE))\$, \$df(dd)\$ \$df(MMM)\$ · \$wi(temp)\$° · \$bi(level)\$%",
+                    size = 38f,
+                    weight = 500,
+                    fill = Fill.SOLID,
+                    color = 0xEEFFFFFF.toInt()
+                )
+            )
+        )
+    )
+
+    fun widgetWeatherBatteryCard(): List<LayerNode> = listOf(
+        LayerNode(
+            name = "Card Vidro Fosco",
+            type = LayerType.SHAPE,
+            shape = ShapeKind.RECT,
+            x = 0.5f,
+            y = 0.5f,
+            anchor = Anchor.CENTER,
+            w = 980f,
+            h = 460f,
+            corner = 68f,
+            fill = Fill.GLASS,
+            glass = Glass(blur = 32f, refraction = 28f, bevelWidth = 18f, frostAmount = 0.55f, tint = 0x36FFFFFF, rim = 0.85f)
+        ),
+        LayerNode(
+            name = "Linha Clima & Bateria",
+            type = LayerType.STACK,
+            dir = Dir.HORIZONTAL,
+            x = 0.5f,
+            y = 0.5f,
+            anchor = Anchor.CENTER,
+            align = Align.CENTER,
+            spacing = 54f,
+            children = listOf(
+                LayerNode(
+                    name = "Ícone Dinâmico",
+                    type = LayerType.ICON,
+                    icon = "weather",
+                    fxAsset = "\$if(bi(charging), \"bolt\", \"weather\")\$",
+                    w = 132f,
+                    h = 132f,
+                    fill = Fill.SOLID,
+                    color = 0xFFFFFFFF.toInt()
+                ),
+                LayerNode(
+                    name = "Clima Agora",
+                    type = LayerType.STACK,
+                    dir = Dir.VERTICAL,
+                    align = Align.START,
+                    spacing = 8f,
+                    children = listOf(
+                        LayerNode(name = "Temp", text = "\$wi(temp)\$°", size = 128f, weight = 700, align = Align.START),
+                        LayerNode(name = "Resumo", text = "\$wi(cond)\$ · \$wi(city)\$", size = 34f, weight = 500, align = Align.START, color = 0xCCFFFFFF.toInt())
+                    )
+                ),
+                LayerNode(
+                    name = "Anel Bateria",
+                    type = LayerType.SHAPE,
+                    shape = ShapeKind.RING,
+                    w = 136f,
+                    h = 136f,
+                    strokeWidth = 14f,
+                    value = "\$bi(level)\$",
+                    fxColor = "\$if(bi(level) <= 20, \"#FFFF5252\", if(bi(charging), \"#FF80FFB5\", \"#FFFFFFFF\"))\$"
+                )
+            )
+        )
+    )
+
+    fun widgetMusicSmartCard(): List<LayerNode> = listOf(
+        LayerNode(
+            name = "Capsula Mídia Vidro",
+            type = LayerType.SHAPE,
+            shape = ShapeKind.RECT,
+            x = 0.5f,
+            y = 0.5f,
+            anchor = Anchor.CENTER,
+            w = 980f,
+            h = 420f,
+            corner = 72f,
+            fill = Fill.CRYSTAL,
+            glass = Glass(blur = 28f, refraction = 38f, bevelWidth = 22f, frostAmount = 0.35f, tint = 0x30101420, rim = 0.9f),
+            touch = TouchAction(type = TouchActionType.MEDIA_PLAY_PAUSE)
+        ),
+        LayerNode(
+            name = "Conteúdo Mídia",
+            type = LayerType.STACK,
+            dir = Dir.HORIZONTAL,
+            x = 0.5f,
+            y = 0.5f,
+            anchor = Anchor.CENTER,
+            align = Align.CENTER,
+            spacing = 40f,
+            children = listOf(
+                LayerNode(
+                    name = "Ícone Mídia",
+                    type = LayerType.ICON,
+                    icon = "music",
+                    fxAsset = "\$if(si(mplaying), \"music\", \"weather\")\$",
+                    w = 120f,
+                    h = 120f
+                ),
+                LayerNode(
+                    name = "Faixa & Status",
+                    type = LayerType.STACK,
+                    dir = Dir.VERTICAL,
+                    align = Align.START,
+                    spacing = 8f,
+                    children = listOf(
+                        LayerNode(
+                            name = "Título",
+                            text = "\$if(si(mplaying), \"Tocando Agora\", df(HH) + \":\" + df(mm))\$",
+                            size = 66f,
+                            weight = 700,
+                            align = Align.START
+                        ),
+                        LayerNode(
+                            name = "Subtítulo",
+                            text = "\$if(si(mplaying), \"Toque para Pausar/Play\", tc(cap, df(EEEE)) + \" · \" + wi(temp) + \"°\")\$",
+                            size = 34f,
+                            weight = 400,
+                            align = Align.START,
+                            color = 0xCCFFFFFF.toInt()
+                        )
+                    )
+                )
+            )
+        )
+    )
+
     val all: List<Pair<String, () -> List<LayerNode>>> = listOf(
         "Xiaomi Canto Clássico" to ::xiaomi,
         "iOS Vidro 3D" to ::iosGlass,
         "Samsung Esticado" to ::samsung,
         "Huawei Editorial" to ::huawei
+    )
+
+    val allWidgets: List<Pair<String, () -> List<LayerNode>>> = listOf(
+        "Relógio Cristal Elástico" to ::widgetElasticClock,
+        "Card Clima & Bateria Vidro" to ::widgetWeatherBatteryCard,
+        "Card Mídia & Status Cristal" to ::widgetMusicSmartCard
     )
 }

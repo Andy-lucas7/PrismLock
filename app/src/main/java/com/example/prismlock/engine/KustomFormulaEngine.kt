@@ -545,6 +545,7 @@ object KustomFormulaEngine {
             "si" -> evalSi(args.getOrNull(0)?.text ?: "model")
             "wi" -> evalWi(args.getOrNull(0)?.text ?: "temp")
             "mi" -> evalMi(args.getOrNull(0)?.text ?: "state")
+            "ai" -> evalAi(args.getOrNull(0)?.text ?: "isday")
             "gv" -> evalGv(args)
             "ce" -> evalCe(args)
             "fl" -> evalFl(args)
@@ -644,6 +645,27 @@ object KustomFormulaEngine {
             "state" -> KVal.ofText(if (env.mediaPlaying) "PLAYING" else "PAUSED")
             "playing" -> KVal.ofBool(env.mediaPlaying)
             else -> KVal.ofText("")
+        }
+
+        private fun evalAi(param: String): KVal = when (param.lowercase()) {
+            "isday" -> KVal.ofBool(env.isDay)
+            "sunrise" -> KVal.ofText("06:00")
+            "sunset" -> KVal.ofText("18:00")
+            "season" -> {
+                val s = when (now.monthValue) {
+                    12, 1, 2 -> "Verão"
+                    3, 4, 5 -> "Outono"
+                    6, 7, 8 -> "Inverno"
+                    else -> "Primavera"
+                }
+                KVal.ofText(s)
+            }
+            "mphase" -> {
+                val daysSinceNew = ((now.toLocalDate().toEpochDay() - 18285L) % 29L + 29L) % 29L
+                val pct = ((daysSinceNew / 29.0) * 100.0).roundToInt().coerceIn(0, 100)
+                KVal.ofNum(pct.toDouble())
+            }
+            else -> KVal.ofBool(env.isDay)
         }
 
         private fun evalGv(args: List<KVal>): KVal {

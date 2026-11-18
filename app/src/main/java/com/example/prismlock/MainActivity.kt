@@ -1,10 +1,15 @@
 package com.example.prismlock
 
+import android.app.Application
 import android.app.WallpaperManager
 import android.content.ComponentName
 import android.content.Intent
 import android.graphics.Bitmap
+import android.net.Uri
 import android.os.Bundle
+import android.os.PowerManager
+import android.os.Process
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -37,6 +42,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -51,12 +57,16 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.prismlock.data.EnvProvider
 import com.example.prismlock.data.PrismPackageManager
 import com.example.prismlock.data.ProjectStore
 import com.example.prismlock.engine.FontManager
 import com.example.prismlock.engine.Icons
 import com.example.prismlock.engine.LiquidGlassRenderer
+import com.example.prismlock.engine.StemStretch
 import com.example.prismlock.engine.WallpaperBaker
 import com.example.prismlock.model.LayerNode
 import com.example.prismlock.model.LayerType
@@ -64,19 +74,23 @@ import com.example.prismlock.model.Project
 import com.example.prismlock.model.copyDeep
 import com.example.prismlock.model.mapNode
 import com.example.prismlock.ui.PrismColors
+import com.example.prismlock.ui.PrismHeroScreen
 import com.example.prismlock.ui.PrismLockTheme
 import com.example.prismlock.ui.PrismMotion
 import com.example.prismlock.ui.StudioScreen
 import com.example.prismlock.ui.ThemeHubScreen
+import com.example.prismlock.ui.clearHubPreviewCache
 import com.example.prismlock.ui.frostedChrome
 import com.example.prismlock.wallpaper.PrismWallpaperService
 import com.example.prismlock.wallpaper.SubjectDepthEngine
 import com.example.prismlock.wallpaper.WallpaperCarousel
+import com.example.prismlock.widget.PrismWidgetProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -96,6 +110,41 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onStop() {
+        super.onStop()
+        if (!isChangingConfigurations) {
+            releaseUiMemory()
+        }
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= TRIM_MEMORY_UI_HIDDEN && !isChangingConfigurations) {
+            releaseUiMemory()
+        }
+    }
+
+    private fun releaseUiMemory() {
+        WallpaperBaker.clearMemoryCache()
+        SubjectDepthEngine.releaseMemory()
+        WallpaperCarousel.clearMemoryCache()
+        StemStretch.clearCaches()
+        clearHubPreviewCache()
+        System.gc()
+    }
+
+    override fun onDestroy() {
+        val shouldKillUiProcess = !isChangingConfigurations &&
+            runCatching { !Application.getProcessName().endsWith(":wallpaper") }.getOrDefault(false)
+        if (shouldKillUiProcess) {
+            releaseUiMemory()
+        }
+        super.onDestroy()
+        if (shouldKillUiProcess) {
+            Process.killProcess(Process.myPid())
+        }
+    }
 }
 
 private enum class AppScreen { HUB, STUDIO }
@@ -104,34 +153,67 @@ private enum class AppScreen { HUB, STUDIO }
 @Composable
 private fun PrismApp() {
     val ctx = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
-    val renderer = remember { LiquidGlassRenderer() }
+    val renderer = remember { LiquidGlassRenderer().apply { attachContext(ctx) } }
+    var rawBgBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var rawDepthBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var bgBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var depthBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var reloadTrigger by remember { mutableIntStateOf(0) }
+
     DisposableEffect(renderer) {
         onDispose { renderer.release() }
     }
+    DisposableEffect(lifecycleOwner, renderer) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_STOP -> {
+                    renderer.releaseOffscreenResources()
+                    renderer.clearShaderCachesForHome()
+                    rawBgBitmap = null
+                    rawDepthBitmap = null
+                    bgBitmap = null
+                    depthBitmap = null
+                }
+                Lifecycle.Event.ON_START -> {
+                    reloadTrigger++
+                }
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     val themes by ProjectStore.themesFlow(ctx).collectAsState(initial = ProjectStore.defaultStarterThemes())
+    val widgets by ProjectStore.widgetsFlow(ctx).collectAsState(initial = ProjectStore.defaultStarterWidgets())
     val activeApplied by ProjectStore.flow(ctx).collectAsState(initial = Project())
-    val env by EnvProvider.env.collectAsState()
+    val activeWidget by ProjectStore.activeWidgetFlow(ctx).collectAsState(initial = ProjectStore.defaultStarterWidgets().first())
+    val heroSeenState by ProjectStore.heroSeenFlow(ctx).map<Boolean, Boolean?> { it }.collectAsState(initial = null)
+    val batteryDismissedState by ProjectStore.batteryPromptDismissedFlow(ctx).map<Boolean, Boolean?> { it }.collectAsState(initial = null)
+    var replayingHero by remember { mutableStateOf(false) }
 
     var screen by remember { mutableStateOf(AppScreen.HUB) }
     var editingProject by remember { mutableStateOf(Project()) }
     var selectedLayerId by remember { mutableStateOf<String?>(null) }
     var focusThemeId by remember { mutableStateOf<String?>(null) }
+    var pendingAssetAlias by remember { mutableStateOf<String?>(null) }
     val saveFlow = remember { MutableSharedFlow<Project>(extraBufferCapacity = 64) }
 
     LaunchedEffect(Unit) {
         saveFlow.debounce(400).collectLatest { pending ->
-            ProjectStore.upsertTheme(ctx, pending)
+            if (pending.isWidget) {
+                ProjectStore.upsertWidget(ctx, pending)
+            } else {
+                ProjectStore.upsertTheme(ctx, pending)
+            }
         }
     }
 
-    var rawBgBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var rawDepthBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var bgBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    var depthBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var previewUri by remember { mutableStateOf<String?>(null) }
+    val env by EnvProvider.env.collectAsState()
     var fontFolderUri by remember { mutableStateOf<String?>(null) }
     var importedFonts by remember {
         FontManager.init(ctx)
@@ -162,18 +244,28 @@ private fun PrismApp() {
         editingProject.id,
         editingProject.folderUri,
         editingProject.imageUri,
+        editingProject.isWidget,
         editingProject.depth,
         editingProject.defaultDepthForNewImages,
         editingProject.depthOverrides,
-        previewUri
+        previewUri,
+        reloadTrigger
     ) {
         if (screen != AppScreen.STUDIO) return@LaunchedEffect
-        val uri = previewUri ?: WallpaperCarousel.currentUri(ctx, editingProject, advance = false)
-        if (uri != null && previewUri != uri) previewUri = uri
         val (baseW, baseH) = WallpaperBaker.resolveDisplaySize(ctx)
-        val bmp = WallpaperCarousel.loadBitmap(ctx, uri, baseW, baseH)
-        rawBgBitmap = bmp
-        rawDepthBitmap = SubjectDepthEngine.getOrCreateMaskIfEnabled(ctx, uri, bmp, editingProject)
+        if (editingProject.isWidget) {
+            val uri = previewUri ?: WallpaperCarousel.currentUri(ctx, editingProject, advance = false)
+            if (uri != null && previewUri != uri) previewUri = uri
+            val bmp = PrismWidgetProvider.resolveReferenceBg(ctx, editingProject, baseW, (baseW / editingProject.widgetAspect.coerceIn(0.6f, 4.5f)).roundToInt().coerceAtLeast(200))
+            rawBgBitmap = bmp
+            rawDepthBitmap = null
+        } else {
+            val uri = previewUri ?: WallpaperCarousel.currentUri(ctx, editingProject, advance = false)
+            if (uri != null && previewUri != uri) previewUri = uri
+            val bmp = WallpaperCarousel.loadBitmap(ctx, uri, baseW, baseH)
+            rawBgBitmap = bmp
+            rawDepthBitmap = SubjectDepthEngine.getOrCreateMaskIfEnabled(ctx, uri, bmp, editingProject)
+        }
     }
 
     LaunchedEffect(
@@ -218,14 +310,23 @@ private fun PrismApp() {
         saveFlow.tryEmit(newProj)
     }
 
+    fun persistProject(snapshot: Project) {
+        scope.launch {
+            if (snapshot.isWidget) {
+                ProjectStore.upsertWidget(ctx, snapshot)
+            } else {
+                ProjectStore.upsertTheme(ctx, snapshot)
+            }
+        }
+    }
+
     fun flushSave() {
-        val snapshot = currentProject
-        scope.launch { ProjectStore.upsertTheme(ctx, snapshot) }
+        persistProject(currentProject)
     }
 
     fun commit(newProj: Project) {
         editingProject = newProj
-        scope.launch { ProjectStore.upsertTheme(ctx, newProj) }
+        persistProject(newProj)
     }
 
     fun openStudio(theme: Project) {
@@ -248,11 +349,30 @@ private fun PrismApp() {
 
     fun returnToHub() {
         val snapshot = currentProject
-        scope.launch { ProjectStore.upsertTheme(ctx, snapshot) }
+        persistProject(snapshot)
+        renderer.clearShaderCachesForHome()
+        renderer.releaseOffscreenResources()
+        rawBgBitmap = null
+        rawDepthBitmap = null
+        bgBitmap = null
+        depthBitmap = null
+        focusThemeId = snapshot.id
         screen = AppScreen.HUB
     }
 
     fun applyAndBake(target: Project, forcePicker: Boolean = false) {
+        if (target.isWidget) {
+            scope.launch {
+                ProjectStore.saveActiveWidget(ctx, target)
+                PrismWidgetProvider.updateAll(ctx)
+                val pinned = PrismWidgetProvider.requestPin(ctx)
+                snackbar.showSnackbar(
+                    if (pinned) "Widget \"${target.title}\" aplicado e pronto para fixar!"
+                    else "Widget \"${target.title}\" atualizado na Tela Inicial!"
+                )
+            }
+            return
+        }
         if (isBaking) return
         isBaking = true
         bakeProgress = 0.04f
@@ -351,9 +471,15 @@ private fun PrismApp() {
                 if (imported != null) {
                     FontManager.prewarm(ctx)
                     importedFonts = FontManager.availableFonts(ctx)
-                    ProjectStore.upsertTheme(ctx, imported)
-                    focusThemeId = imported.id
-                    snackbar.showSnackbar("Pacote \"${imported.title}\" importado")
+                    if (imported.isWidget) {
+                        ProjectStore.upsertWidget(ctx, imported)
+                        focusThemeId = imported.id
+                        snackbar.showSnackbar("Widget \"${imported.title}\" importado")
+                    } else {
+                        ProjectStore.upsertTheme(ctx, imported)
+                        focusThemeId = imported.id
+                        snackbar.showSnackbar("Tema \"${imported.title}\" importado")
+                    }
                 } else {
                     snackbar.showSnackbar("Pacote .prism / .zip inválido")
                 }
@@ -368,11 +494,17 @@ private fun PrismApp() {
                 if (imported != null) {
                     FontManager.prewarm(ctx)
                     importedFonts = FontManager.availableFonts(ctx)
-                    ProjectStore.upsertTheme(ctx, imported)
-                    focusThemeId = imported.id
-                    snackbar.showSnackbar("Pasta \"${imported.title}\" importada")
+                    if (imported.isWidget) {
+                        ProjectStore.upsertWidget(ctx, imported)
+                        focusThemeId = imported.id
+                        snackbar.showSnackbar("Widget \"${imported.title}\" importado da pasta")
+                    } else {
+                        ProjectStore.upsertTheme(ctx, imported)
+                        focusThemeId = imported.id
+                        snackbar.showSnackbar("Pasta \"${imported.title}\" importada")
+                    }
                 } else {
-                    snackbar.showSnackbar("Pasta sem theme.json válido")
+                    snackbar.showSnackbar("Pasta sem theme.json ou widget.json válido")
                 }
             }
         }
@@ -381,11 +513,65 @@ private fun PrismApp() {
     val exportThemePicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
         if (uri != null) {
             scope.launch {
-                val ok = PrismPackageManager.exportPackage(ctx, currentProject, uri)
-                snackbar.showSnackbar(if (ok) "Pacote .prism exportado com mídia e fontes" else "Erro ao exportar pacote")
+                val exporting = currentProject
+                val ok = PrismPackageManager.exportPackage(ctx, exporting, uri)
+                snackbar.showSnackbar(
+                    if (ok) {
+                        if (exporting.isWidget) "Widget .prism exportado com ativos e fontes"
+                        else "Tema .prism exportado com mídia e fontes"
+                    } else "Erro ao exportar pacote"
+                )
             }
         }
     }
+
+    val layerImagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            runCatching { ctx.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+            val s = uri.toString()
+            updateSelected { it.copy(imageUri = s) }
+        }
+    }
+
+    val customAssetPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        val alias = pendingAssetAlias
+        pendingAssetAlias = null
+        if (uri != null && !alias.isNullOrBlank()) {
+            runCatching { ctx.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+            val mime = ctx.contentResolver.getType(uri).orEmpty().lowercase()
+            val svg = if ("svg" in mime || uri.toString().lowercase().endsWith(".svg")) {
+                Icons.importSvg(ctx, uri)
+            } else {
+                val bmp = WallpaperCarousel.loadCustomAssetBitmap(ctx, uri.toString(), 64, 64)
+                if (bmp == null) Icons.importSvg(ctx, uri) else null
+            }
+            if (svg != null) {
+                val encoded = Icons.encodeSvgAsset(svg)
+                commit(currentProject.copy(customAssets = currentProject.customAssets + (alias to encoded)))
+                updateSelected { node ->
+                    when (node.type) {
+                        LayerType.SVG -> if (node.svgData.isEmpty()) node.copy(svgData = svg.data, svgW = svg.w, svgH = svg.h) else node
+                        LayerType.ICON -> if (node.fxAsset.isBlank()) node.copy(fxAsset = alias) else node
+                        else -> node
+                    }
+                }
+                scope.launch { snackbar.showSnackbar("SVG \"$alias\" salvo para uso em fórmulas") }
+            } else {
+                val s = uri.toString()
+                commit(currentProject.copy(customAssets = currentProject.customAssets + (alias to s)))
+                updateSelected { it.copy(imageUri = if (it.imageUri.isBlank()) alias else it.imageUri) }
+                scope.launch { snackbar.showSnackbar("Ativo \"$alias\" salvo para uso em fórmulas") }
+            }
+        }
+    }
+
+    val powerManager = remember { ctx.getSystemService(PowerManager::class.java) }
+    var batteryRestricted by remember { mutableStateOf(false) }
+    LaunchedEffect(heroSeenState, replayingHero, reloadTrigger) {
+        batteryRestricted = powerManager?.isIgnoringBatteryOptimizations(ctx.packageName) == false
+    }
+    val showBatteryPrompt = heroSeenState == true && !replayingHero && screen == AppScreen.HUB &&
+        batteryRestricted && batteryDismissedState == false
 
     BackHandler(enabled = screen == AppScreen.STUDIO) {
         returnToHub()
@@ -409,6 +595,8 @@ private fun PrismApp() {
                 AppScreen.HUB -> ThemeHubScreen(
                     themes = themes,
                     activeThemeId = activeApplied.id,
+                    widgets = widgets,
+                    activeWidgetId = activeWidget.id,
                     focusThemeId = focusThemeId,
                     onFocusConsumed = { focusThemeId = null },
                     env = env,
@@ -419,15 +607,42 @@ private fun PrismApp() {
                         focusThemeId = fresh.id
                         openStudio(fresh)
                     },
+                    onCreateWidget = { title ->
+                        val finalTitle = title.trim().ifBlank { "Prism Widget" }
+                        val fresh = ProjectStore.newWidget(finalTitle)
+                        scope.launch { ProjectStore.upsertWidget(ctx, fresh) }
+                        focusThemeId = fresh.id
+                        openStudio(fresh)
+                    },
                     onImportTheme = { importThemePicker.launch(arrayOf("*/*")) },
                     onImportFolderTheme = { importFolderThemePicker.launch(null) },
                     onEditTheme = { openStudio(it) },
+                    onEditWidget = { openStudio(it) },
                     onApplyTheme = { applyAndBake(it, forcePicker = false) },
+                    onApplyWidget = { applyAndBake(it, forcePicker = false) },
                     onDeleteTheme = { t ->
                         scope.launch {
                             ProjectStore.deleteTheme(ctx, t.id)
                             snackbar.showSnackbar("Tema \"${t.title}\" removido")
                         }
+                    },
+                    onDeleteWidget = { w ->
+                        scope.launch {
+                            ProjectStore.deleteWidget(ctx, w.id)
+                            snackbar.showSnackbar("Widget \"${w.title}\" removido")
+                        }
+                    },
+                    onReplayHero = { replayingHero = true },
+                    showBatteryPrompt = showBatteryPrompt,
+                    onDismissBatteryPrompt = {
+                        scope.launch { ProjectStore.setBatteryPromptDismissed(ctx, true) }
+                    },
+                    onRequestIgnoreBatteryOptimizations = {
+                        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                            data = Uri.parse("package:${ctx.packageName}")
+                        }
+                        runCatching { ctx.startActivity(intent) }
+                        scope.launch { ProjectStore.setBatteryPromptDismissed(ctx, true) }
                     }
                 )
 
@@ -449,12 +664,14 @@ private fun PrismApp() {
                     onFlushSave = ::flushSave,
                     onBack = ::returnToHub,
                     onRenameTheme = { newTitle ->
-                        val cleanTitle = newTitle.trim().ifBlank { "Default Screen" }
+                        val cleanTitle = newTitle.trim().ifBlank {
+                            if (currentProject.isWidget) "Prism Widget" else "Default Screen"
+                        }
                         commit(currentProject.copy(title = cleanTitle))
                     },
                     onSaveExplicit = {
                         flushSave()
-                        scope.launch { snackbar.showSnackbar("Tema \"${currentProject.title}\" salvo") }
+                        scope.launch { snackbar.showSnackbar("\"${currentProject.title}\" salvo") }
                     },
                     onSaveAsNew = { title ->
                         val cloned = currentProject.copy(
@@ -468,7 +685,8 @@ private fun PrismApp() {
                     onApply = { applyAndBake(currentProject, forcePicker = false) },
                     onExportFile = {
                         val safeName = PrismPackageManager.sanitizeArchiveFileName(currentProject.title)
-                        exportThemePicker.launch("$safeName.prism")
+                        val extName = if (currentProject.isWidget) "$safeName.widget.prism" else "$safeName.prism"
+                        exportThemePicker.launch(extName)
                     },
                     onToggleDepth = { imageKey, enabled ->
                         val nextMap = currentProject.depthOverrides.toMutableMap().apply {
@@ -529,6 +747,11 @@ private fun PrismApp() {
                         }
                     },
                     onImportSvg = { svgPicker.launch(arrayOf("image/svg+xml", "*/*")) },
+                    onPickLayerImage = { layerImagePicker.launch(arrayOf("image/*")) },
+                    onAddCustomAsset = { alias ->
+                        pendingAssetAlias = alias
+                        customAssetPicker.launch(arrayOf("image/*", "image/svg+xml", "*/*"))
+                    },
                     onNextWallpaper = {
                         scope.launch {
                             val next = WallpaperCarousel.currentUri(ctx, currentProject, advance = true)
@@ -537,6 +760,19 @@ private fun PrismApp() {
                     }
                 )
             }
+        }
+
+        if (heroSeenState == null) {
+            Box(Modifier.fillMaxSize().background(PrismColors.PureBlack))
+        } else if (heroSeenState == false || replayingHero) {
+            PrismHeroScreen(
+                onEnterComplete = {
+                    replayingHero = false
+                    if (heroSeenState == false) {
+                        scope.launch { ProjectStore.setHeroSeen(ctx, true) }
+                    }
+                }
+            )
         }
 
         SnackbarHost(

@@ -1,5 +1,6 @@
 package com.example.prismlock.wallpaper
 
+import android.app.Application
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -33,14 +34,25 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
 
 object SubjectDepthEngine {
-    private val segmenter by lazy {
-        SubjectSegmentation.getClient(
+    private val segLock = Any()
+    private var segmenter: com.google.mlkit.vision.segmentation.subject.SubjectSegmenter? = null
+    private val memCache = LruCache<String, Bitmap>(1)
+
+    private fun obtainSegmenter(): com.google.mlkit.vision.segmentation.subject.SubjectSegmenter = synchronized(segLock) {
+        segmenter ?: SubjectSegmentation.getClient(
             SubjectSegmenterOptions.Builder()
                 .enableForegroundBitmap()
                 .build()
-        )
+        ).also { segmenter = it }
     }
-    private val memCache = LruCache<String, Bitmap>(4)
+
+    fun releaseMemory() {
+        synchronized(segLock) {
+            runCatching { segmenter?.close() }
+            segmenter = null
+        }
+        memCache.evictAll()
+    }
 
     private fun key(uri: String): String =
         MessageDigest.getInstance("SHA-256").digest(uri.toByteArray()).joinToString("") { "%02x".format(it) }.take(20)
@@ -66,7 +78,18 @@ object SubjectDepthEngine {
                 return@withContext cached
             }
         }
-        val fg = runSegment(source) ?: return@withContext null
+        if (runCatching { Application.getProcessName().endsWith(":wallpaper") }.getOrDefault(false)) {
+            return@withContext null
+        }
+        val fg = try {
+            runSegment(source)
+        } finally {
+            synchronized(segLock) {
+                runCatching { segmenter?.close() }
+                segmenter = null
+            }
+        }
+        if (fg == null) return@withContext null
         runCatching {
             file.outputStream().use { fg.compress(Bitmap.CompressFormat.PNG, 92, it) }
         }
@@ -76,7 +99,7 @@ object SubjectDepthEngine {
 
     private suspend fun runSegment(bmp: Bitmap): Bitmap? = suspendCancellableCoroutine { cont ->
         val input = InputImage.fromBitmap(bmp, 0)
-        segmenter.process(input)
+        obtainSegmenter().process(input)
             .addOnSuccessListener { res ->
                 if (cont.isActive) cont.resume(res.foregroundBitmap)
             }
@@ -193,10 +216,17 @@ object SubjectDepthEngine {
 }
 
 object WallpaperCarousel {
-    private val bmpCache = LruCache<String, Bitmap>(4)
-    private val thumbCache = LruCache<String, Bitmap>(48)
+    private val bmpCache = LruCache<String, Bitmap>(1)
+    private val thumbCache = LruCache<String, Bitmap>(12)
+    private val customAssetCache = LruCache<String, Bitmap>(6)
     private val keyCache = ConcurrentHashMap<String, String>()
     private val videoCache = ConcurrentHashMap<String, Boolean>()
+
+    fun clearMemoryCache() {
+        bmpCache.evictAll()
+        thumbCache.evictAll()
+        customAssetCache.evictAll()
+    }
 
     fun isVideoUri(ctx: Context, uriStr: String?): Boolean {
         if (uriStr.isNullOrBlank()) return false
@@ -362,10 +392,16 @@ object WallpaperCarousel {
         uri
     }
 
-    suspend fun loadBitmap(ctx: Context, uriStr: String?, reqW: Int, reqH: Int): Bitmap? = withContext(Dispatchers.IO) {
+    suspend fun loadBitmap(
+        ctx: Context,
+        uriStr: String?,
+        reqW: Int,
+        reqH: Int,
+        preferRgb565: Boolean = true
+    ): Bitmap? = withContext(Dispatchers.IO) {
         if (uriStr.isNullOrBlank()) return@withContext null
-        val key = "$uriStr@${reqW}x${reqH}"
-        bmpCache.get(key)?.let { return@withContext it }
+        val key = "$uriStr@${reqW}x${reqH}|$preferRgb565"
+        bmpCache.get(key)?.takeIf { !it.isRecycled }?.let { return@withContext it }
         if (isVideoUri(ctx, uriStr)) {
             val frame = loadVideoFrame(ctx, uriStr, reqW, reqH) ?: return@withContext null
             bmpCache.put(key, frame)
@@ -374,14 +410,38 @@ object WallpaperCarousel {
         runCatching {
             val uri = Uri.parse(uriStr)
             val src = ImageDecoder.createSource(ctx.contentResolver, uri)
-            val bmp = ImageDecoder.decodeBitmap(src) { decoder, info, _ ->
+            val decoded = ImageDecoder.decodeBitmap(src) { decoder, info, _ ->
                 decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
                 val w = info.size.width.coerceAtLeast(1)
                 val h = info.size.height.coerceAtLeast(1)
                 val scale = maxOf(reqW.toFloat() / w, reqH.toFloat() / h).coerceAtMost(1f)
                 decoder.setTargetSize((w * scale).toInt().coerceAtLeast(1), (h * scale).toInt().coerceAtLeast(1))
             }
+            val bmp = if (preferRgb565 && decoded.config != Bitmap.Config.RGB_565 && !decoded.hasAlpha()) {
+                decoded.copy(Bitmap.Config.RGB_565, false)?.also { decoded.recycle() } ?: decoded
+            } else decoded
             bmpCache.put(key, bmp)
+            bmp
+        }.getOrNull()
+    }
+
+    fun loadCustomAssetBitmap(ctx: Context, uriStr: String?, reqW: Int, reqH: Int): Bitmap? {
+        if (uriStr.isNullOrBlank() || ("://" !in uriStr && !uriStr.startsWith("/"))) return null
+        val tw = reqW.coerceIn(16, 1080)
+        val th = reqH.coerceIn(16, 1080)
+        val key = "$uriStr@${tw}x$th"
+        customAssetCache.get(key)?.takeIf { !it.isRecycled }?.let { return it }
+        return runCatching {
+            val uri = if (uriStr.startsWith("/")) Uri.fromFile(File(uriStr)) else Uri.parse(uriStr)
+            val src = ImageDecoder.createSource(ctx.contentResolver, uri)
+            val bmp = ImageDecoder.decodeBitmap(src) { decoder, info, _ ->
+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                val w = info.size.width.coerceAtLeast(1)
+                val h = info.size.height.coerceAtLeast(1)
+                val scale = maxOf(tw.toFloat() / w, th.toFloat() / h).coerceAtMost(1f)
+                decoder.setTargetSize((w * scale).toInt().coerceAtLeast(1), (h * scale).toInt().coerceAtLeast(1))
+            }
+            customAssetCache.put(key, bmp)
             bmp
         }.getOrNull()
     }

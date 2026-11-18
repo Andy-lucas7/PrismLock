@@ -1,5 +1,6 @@
 package com.example.prismlock.engine
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapShader
 import android.graphics.BlendMode
@@ -42,6 +43,8 @@ import com.example.prismlock.model.LayerType
 import com.example.prismlock.model.Project
 import com.example.prismlock.model.ShapeKind
 import com.example.prismlock.model.collectNestedChildIds
+import com.example.prismlock.model.flatten
+import com.example.prismlock.wallpaper.WallpaperCarousel
 import java.time.LocalDateTime
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
@@ -185,6 +188,7 @@ class LiquidGlassRenderer {
     private val maskCutPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
     }
+    private val layerPaint = Paint(Paint.ANTI_ALIAS_FLAG)
 
     private val bgLock = Any()
     private val blurLock = Any()
@@ -205,8 +209,8 @@ class LiquidGlassRenderer {
     private var sceneReaderW = 0
     private var sceneReaderH = 0
 
-    private val frostedShaderCache = LruCache<String, BitmapShader>(4)
-    private val lensHeightCache = LruCache<String, Bitmap>(8)
+    private val frostedShaderCache = LruCache<String, BitmapShader>(2)
+    private val lensHeightCache = LruCache<String, Bitmap>(3)
     private val lastLensByNode = ConcurrentHashMap<String, Bitmap>()
     private val lastLensInvMatrixByNode = ConcurrentHashMap<String, Matrix>()
     private val lensShaderCache = ConcurrentHashMap<String, Pair<Bitmap, BitmapShader>>()
@@ -236,20 +240,49 @@ class LiquidGlassRenderer {
     @Volatile private var prebakedFrostedBlurPx = -1f
     @Volatile private var liveVideoMode = false
     @Volatile private var liveVideoAdaptiveColor = 0xFF9AC5FF.toInt()
+    @Volatile private var currentContext: Context? = null
+    @Volatile private var activeCustomAssets: Map<String, String> = emptyMap()
+
+    fun attachContext(ctx: Context) {
+        currentContext = ctx.applicationContext
+    }
 
     data class BakedMinuteScene(
         val clockLayerBitmap: Bitmap,
-        val completeLockscreenBitmap: Bitmap,
+        val completeLockscreenBitmap: Bitmap? = null,
         val showDepth: Boolean,
         val clockCenterX: Float,
         val clockCenterY: Float
-    )
+    ) {
+        fun isSingleCompleteFrame(): Boolean =
+            completeLockscreenBitmap != null && clockLayerBitmap === completeLockscreenBitmap
+
+        fun trimToCompleteRgb565(): BakedMinuteScene {
+            val complete = completeLockscreenBitmap ?: return this
+            if (clockLayerBitmap !== complete && !clockLayerBitmap.isRecycled) {
+                runCatching { clockLayerBitmap.recycle() }
+            }
+            return copy(clockLayerBitmap = complete, completeLockscreenBitmap = complete)
+        }
+
+        fun recycle() {
+            runCatching { if (!clockLayerBitmap.isRecycled) clockLayerBitmap.recycle() }
+            runCatching {
+                if (completeLockscreenBitmap != null &&
+                    completeLockscreenBitmap !== clockLayerBitmap &&
+                    !completeLockscreenBitmap.isRecycled
+                ) {
+                    completeLockscreenBitmap.recycle()
+                }
+            }
+        }
+    }
 
     fun setAllowStaleLensOnMiss(enabled: Boolean) {
         allowStaleLensOnMiss = enabled
     }
 
-    fun release() {
+    fun releaseOffscreenResources() {
         synchronized(blurLock) {
             runCatching { blurHwRenderer?.destroy() }
             runCatching { blurImageReader?.close() }
@@ -267,16 +300,25 @@ class LiquidGlassRenderer {
             blurThread = null
             blurHandler = null
         }
-        prebakedFrostedBmp = null
-        prebakedFrostedShader = null
-        prebakedFrostedBlurPx = -1f
-        lastScaledSceneKey = ""
-        lastCachedHits.clear()
+        runCatching { blurGenNode.discardDisplayList() }
         frostedShaderCache.evictAll()
         lensHeightCache.evictAll()
         lastLensByNode.clear()
         lastLensInvMatrixByNode.clear()
         lensShaderCache.clear()
+    }
+
+    fun release() {
+        releaseOffscreenResources()
+        sharpBgBmp = null
+        sharpBgShader = null
+        prebakedFrostedBmp = null
+        prebakedFrostedShader = null
+        prebakedFrostedBlurPx = -1f
+        lastScaledSceneKey = ""
+        lastCachedHits.clear()
+        runCatching { bgNode.discardDisplayList() }
+        runCatching { scaledBaseNode.discardDisplayList() }
     }
 
     fun clearShaderCachesForHome() {
@@ -465,6 +507,7 @@ class LiquidGlassRenderer {
         val u = screenW / 1080f
         val adaptive = extractAdaptiveColor(bg)
         val globals = project.globalsMap()
+        activeCustomAssets = project.customAssets
         val nestedChildIds = project.layers.collectNestedChildIds()
         val drawnIds = HashSet<String>(project.layers.size * 2)
         var mainBounds: RectF? = null
@@ -648,10 +691,11 @@ class LiquidGlassRenderer {
             frostedBg = null,
             depthMask = depthMask,
             env = env.copy(locked = true),
-            now = now
+            now = now,
+            includeCompleteBitmap = true
         )
         scene.clockLayerBitmap.recycle()
-        return scene.completeLockscreenBitmap
+        return scene.completeLockscreenBitmap!!
     }
 
     fun prepareFrameAssets(
@@ -669,6 +713,7 @@ class LiquidGlassRenderer {
             val screenH = h.coerceAtLeast(1)
             val u = screenW / 1080f
             val globals = project.globalsMap()
+            activeCustomAssets = project.customAssets
             if (bg != null) ensureSharpBg(bg, screenW, screenH)
 
             val workPaint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -719,7 +764,8 @@ class LiquidGlassRenderer {
                     getFrostedShader(blurPx, screenW, screenH)
                     val bevelPx = (g.bevelWidth * u).coerceIn(1f, 48f * u)
                     val restScreenPath = Path(path).apply { transform(localMat) }
-                    getLensHeightMap(node.id, restScreenPath, screenW, screenH, bevelPx, m.baseStrokePx, "${m.geomKey}|$restPoseKey", localMat, m.evalText, m.baselineShiftY, u)
+                    val imgMask = if (node.type == LayerType.IMAGE) resolveLayerImageBitmap(node, m.w, m.h) else null
+                    getLensHeightMap(node.id, restScreenPath, screenW, screenH, bevelPx, m.baseStrokePx, "${m.geomKey}|$restPoseKey", localMat, m.evalText, m.baselineShiftY, u, imgMask, path, m.w, m.h)
                 }
             }
 
@@ -742,7 +788,8 @@ class LiquidGlassRenderer {
 
     fun setPrebakedBackground(sharp: Bitmap, frosted: Bitmap, w: Int, h: Int, frostedBlurPx: Float = -1f) = synchronized(bgLock) {
         liveVideoMode = false
-        val exactSharp = if (sharp.width == w && sharp.height == h && !sharp.hasAlpha()) {
+        val exactSharp = if (sharp.width == w && sharp.height == h) {
+            if (sharp.hasAlpha()) runCatching { sharp.setHasAlpha(false) }
             sharp
         } else {
             Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { dst ->
@@ -752,7 +799,8 @@ class LiquidGlassRenderer {
                 dst.setHasAlpha(false)
             }
         }
-        val exactFrosted = if (frosted.width == w && frosted.height == h && !frosted.hasAlpha()) {
+        val exactFrosted = if (frosted.width == w && frosted.height == h) {
+            if (frosted.hasAlpha()) runCatching { frosted.setHasAlpha(false) }
             frosted
         } else {
             Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { dst ->
@@ -792,12 +840,16 @@ class LiquidGlassRenderer {
         env: Env,
         now: LocalDateTime,
         prebakedBlurPx: Float = -1f,
-        hits: MutableList<HitBox>? = null
+        hits: MutableList<HitBox>? = null,
+        includeCompleteBitmap: Boolean = false,
+        useRgb565ForComplete: Boolean = false,
+        retainOnlyComplete: Boolean = false
     ): BakedMinuteScene {
         val screenW = w.coerceAtLeast(1)
         val screenH = h.coerceAtLeast(1)
         val u = screenW / 1080f
         val globals = project.globalsMap()
+        activeCustomAssets = project.customAssets
         hits?.clear()
 
         if (sharpBg != null && frostedBg != null) {
@@ -814,74 +866,108 @@ class LiquidGlassRenderer {
         var clockCx = screenW * 0.5f
         var clockCy = screenH * 0.25f
 
-        val layerNode = RenderNode("prism_minute_layers").apply {
-            setPosition(0, 0, screenW, screenH)
+        val needsHardwareShader = project.layers.flatten().any { (n, _) ->
+            !n.hidden && (n.fill == Fill.CRYSTAL || n.fill == Fill.GLASS)
         }
-        val rec = layerNode.beginRecording(screenW, screenH)
-        rec.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-        rootMatrix.reset()
-        invRootMatrix.reset()
-        wakeDeltaMatrix.reset()
 
-        val nestedChildIds = project.layers.collectNestedChildIds()
-        val drawnIds = HashSet<String>(project.layers.size * 2)
-        for (node in project.layers) {
-            if (node.parentId != null || node.id in nestedChildIds) continue
-            if (!drawnIds.add(node.id)) continue
-            if (!isVisible(node, env, now, globals) || node.type == LayerType.DEPTH) continue
-            val box = renderLayer(
-                canvas = rec,
-                screenW = screenW,
-                screenH = screenH,
-                u = u,
-                node = node,
-                bg = sharpBgBmp ?: sharpBg,
-                env = env,
-                now = now,
-                adaptive = adaptive,
-                condAlpha = 1f,
-                wakeProgress = 1f,
-                hits = hits,
-                globals = globals
-            )
-            if (mainBounds == null && (node.type == LayerType.TEXT || node.type == LayerType.STACK)) {
-                val (ox, oy) = anchorOffset(node.anchor, node.align, box.w, box.h)
-                val px = node.x * screenW + ox
-                val py = node.y * screenH + oy
-                mainBounds = RectF(px, py, px + box.w, py + box.h)
-                clockCx = mainBounds.centerX()
-                clockCy = mainBounds.centerY()
+        fun drawVisibleLayersOnto(rec: Canvas) {
+            rec.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+            rootMatrix.reset()
+            invRootMatrix.reset()
+            wakeDeltaMatrix.reset()
+
+            val nestedChildIds = project.layers.collectNestedChildIds()
+            val drawnIds = HashSet<String>(project.layers.size * 2)
+            for (node in project.layers) {
+                if (node.parentId != null || node.id in nestedChildIds) continue
+                if (!drawnIds.add(node.id)) continue
+                if (!isVisible(node, env, now, globals) || node.type == LayerType.DEPTH) continue
+                val box = renderLayer(
+                    canvas = rec,
+                    screenW = screenW,
+                    screenH = screenH,
+                    u = u,
+                    node = node,
+                    bg = sharpBgBmp ?: sharpBg,
+                    env = env,
+                    now = now,
+                    adaptive = adaptive,
+                    condAlpha = 1f,
+                    wakeProgress = 1f,
+                    hits = hits,
+                    globals = globals
+                )
+                if (mainBounds == null && (node.type == LayerType.TEXT || node.type == LayerType.STACK)) {
+                    val (ox, oy) = anchorOffset(node.anchor, node.align, box.w, box.h)
+                    val px = node.x * screenW + ox
+                    val py = node.y * screenH + oy
+                    mainBounds = RectF(px, py, px + box.w, py + box.h)
+                    clockCx = mainBounds!!.centerX()
+                    clockCy = mainBounds!!.centerY()
+                }
             }
         }
-        layerNode.endRecording()
 
-        val clockLayerBmp = renderNodeToBitmap(layerNode, screenW, screenH)
+        val clockLayerBmp = if (needsHardwareShader) {
+            val layerNode = RenderNode("prism_minute_layers").apply {
+                setPosition(0, 0, screenW, screenH)
+            }
+            val rec = layerNode.beginRecording(screenW, screenH)
+            drawVisibleLayersOnto(rec)
+            layerNode.endRecording()
+            val out = renderNodeToBitmap(layerNode, screenW, screenH)
+            layerNode.discardDisplayList()
+            releaseOffscreenResources()
+            out
+        } else {
+            Bitmap.createBitmap(screenW, screenH, Bitmap.Config.ARGB_8888).also { bmp ->
+                drawVisibleLayersOnto(Canvas(bmp))
+            }
+        }
+
         val hasDepthLayer = project.layers.any { it.type == LayerType.DEPTH && !it.hidden }
         val showDepth = hasDepthLayer && project.depth && depthMask != null &&
-            (!project.depthGuard || mainBounds == null || checkCoverage(depthMask, mainBounds, screenW, screenH))
+            (!project.depthGuard || mainBounds == null || checkCoverage(depthMask, mainBounds!!, screenW, screenH))
 
-        val completeBmp = Bitmap.createBitmap(screenW, screenH, Bitmap.Config.ARGB_8888)
-        val cc = Canvas(completeBmp)
-        cc.drawColor(Color.BLACK, PorterDuff.Mode.SRC)
-        val baseSharp = sharpBgBmp ?: sharpBg
-        if (baseSharp != null) {
-            drawBitmapCenterCrop(cc, baseSharp, screenW, screenH, Paint(Paint.FILTER_BITMAP_FLAG))
-        } else {
-            cc.drawColor(0xFF0A0D14.toInt(), PorterDuff.Mode.SRC)
+        val completeBmp = if (includeCompleteBitmap) {
+            val cfg = if (useRgb565ForComplete) Bitmap.Config.RGB_565 else Bitmap.Config.ARGB_8888
+            Bitmap.createBitmap(screenW, screenH, cfg).also { bmp ->
+                val cc = Canvas(bmp)
+                cc.drawColor(Color.BLACK, PorterDuff.Mode.SRC)
+                val baseSharp = sharpBgBmp ?: sharpBg
+                if (baseSharp != null) {
+                    drawBitmapCenterCrop(cc, baseSharp, screenW, screenH, Paint(Paint.FILTER_BITMAP_FLAG))
+                } else {
+                    cc.drawColor(0xFF0A0D14.toInt(), PorterDuff.Mode.SRC)
+                }
+                if (project.dim > 0.005f) {
+                    dimPaint.color = Color.argb((project.dim.coerceIn(0f, 0.8f) * 255).roundToInt(), 0, 0, 0)
+                    cc.drawRect(0f, 0f, screenW.toFloat(), screenH.toFloat(), dimPaint)
+                }
+                cc.drawBitmap(clockLayerBmp, 0f, 0f, null)
+                if (showDepth) {
+                    val depthNode = project.layers.firstOrNull { it.type == LayerType.DEPTH }
+                    paint.reset()
+                    paint.isAntiAlias = true
+                    paint.alpha = ((depthNode?.opacity ?: 1f) * 255).roundToInt().coerceIn(0, 255)
+                    drawBitmapCenterCrop(cc, depthMask!!, screenW, screenH, paint)
+                }
+                if (bmp.config != Bitmap.Config.RGB_565) {
+                    bmp.setHasAlpha(false)
+                }
+            }
+        } else null
+
+        if (retainOnlyComplete && completeBmp != null) {
+            runCatching { if (!clockLayerBmp.isRecycled) clockLayerBmp.recycle() }
+            return BakedMinuteScene(
+                clockLayerBitmap = completeBmp,
+                completeLockscreenBitmap = completeBmp,
+                showDepth = showDepth,
+                clockCenterX = clockCx,
+                clockCenterY = clockCy
+            )
         }
-        if (project.dim > 0.005f) {
-            dimPaint.color = Color.argb((project.dim.coerceIn(0f, 0.8f) * 255).roundToInt(), 0, 0, 0)
-            cc.drawRect(0f, 0f, screenW.toFloat(), screenH.toFloat(), dimPaint)
-        }
-        cc.drawBitmap(clockLayerBmp, 0f, 0f, null)
-        if (showDepth) {
-            val depthNode = project.layers.firstOrNull { it.type == LayerType.DEPTH }
-            paint.reset()
-            paint.isAntiAlias = true
-            paint.alpha = ((depthNode?.opacity ?: 1f) * 255).roundToInt().coerceIn(0, 255)
-            drawBitmapCenterCrop(cc, depthMask!!, screenW, screenH, paint)
-        }
-        completeBmp.setHasAlpha(false)
 
         return BakedMinuteScene(
             clockLayerBitmap = clockLayerBmp,
@@ -890,6 +976,28 @@ class LiquidGlassRenderer {
             clockCenterX = clockCx,
             clockCenterY = clockCy
         )
+    }
+
+    fun renderWidgetBitmap(
+        w: Int,
+        h: Int,
+        project: Project,
+        refBg: Bitmap?,
+        env: Env,
+        now: LocalDateTime
+    ): Bitmap {
+        val scene = bakeMinuteScene(
+            w = w,
+            h = h,
+            project = project,
+            sharpBg = refBg,
+            frostedBg = null,
+            depthMask = null,
+            env = env.copy(locked = false),
+            now = now,
+            includeCompleteBitmap = false
+        )
+        return scene.clockLayerBitmap
     }
 
     fun drawWakeAnimationFrame(
@@ -910,16 +1018,17 @@ class LiquidGlassRenderer {
         dstRectF.set(0f, 0f, targetW.toFloat(), targetH.toFloat())
         canvas.drawColor(Color.BLACK, PorterDuff.Mode.SRC)
 
-        if (p >= 0.998f && la >= 0.998f && !scene.completeLockscreenBitmap.isRecycled) {
+        val completeBmp = scene.completeLockscreenBitmap
+        if (p >= 0.998f && la >= 0.998f && completeBmp != null && !completeBmp.isRecycled) {
             filterPaint.reset()
             filterPaint.isAntiAlias = true
             filterPaint.isFilterBitmap = true
-            canvas.drawBitmap(scene.completeLockscreenBitmap, null, dstRectF, filterPaint)
+            canvas.drawBitmap(completeBmp, null, dstRectF, filterPaint)
             return
         }
 
         val baseSharp = sharpBgBmp ?: sharpBg
-        if (baseSharp != null) {
+        if (baseSharp != null && !baseSharp.isRecycled) {
             filterPaint.reset()
             filterPaint.isAntiAlias = true
             filterPaint.isFilterBitmap = true
@@ -930,6 +1039,18 @@ class LiquidGlassRenderer {
         if (project.dim > 0.005f) {
             dimPaint.color = Color.argb((project.dim.coerceIn(0f, 0.8f) * 255).roundToInt(), 0, 0, 0)
             canvas.drawRect(dstRectF, dimPaint)
+        }
+
+        if (scene.isSingleCompleteFrame() && completeBmp != null && !completeBmp.isRecycled) {
+            val combinedAlpha = (la * 255f).roundToInt().coerceIn(0, 255)
+            if (combinedAlpha > 0) {
+                filterPaint.reset()
+                filterPaint.isAntiAlias = true
+                filterPaint.isFilterBitmap = true
+                filterPaint.alpha = combinedAlpha
+                canvas.drawBitmap(completeBmp, null, dstRectF, filterPaint)
+            }
+            return
         }
 
         val combinedAlpha = (p * la * 255f).roundToInt().coerceIn(0, 255)
@@ -1257,8 +1378,29 @@ class LiquidGlassRenderer {
         now: LocalDateTime,
         globals: Map<String, String>
     ): LayerNode {
-        if (!node.hasFx()) return node
         var out = node
+        if (node.type == LayerType.IMAGE && node.fxAsset.isBlank() && node.imageUri.isNotBlank()) {
+            val mapped = activeCustomAssets[node.imageUri] ?: activeCustomAssets[node.imageUri.lowercase()]
+            if (mapped != null) {
+                val svg = Icons.decodeSvgAsset(mapped)
+                out = if (svg != null) {
+                    out.copy(type = LayerType.SVG, svgData = svg.data, svgW = svg.w, svgH = svg.h)
+                } else {
+                    out.copy(imageUri = mapped)
+                }
+            }
+        }
+        if (node.type == LayerType.ICON && node.fxAsset.isBlank() && node.icon.isNotBlank()) {
+            val evalIcon = if ('$' in node.icon || '{' in node.icon) Dynamic.eval(node.icon, env, now, globals).trim() else node.icon.trim()
+            val mapped = activeCustomAssets[evalIcon] ?: activeCustomAssets[evalIcon.lowercase()]
+            val svg = Icons.decodeSvgAsset(mapped)
+            if (svg != null) {
+                out = out.copy(type = LayerType.SVG, svgData = svg.data, svgW = svg.w, svgH = svg.h)
+            } else if (mapped != null) {
+                out = out.copy(type = LayerType.IMAGE, imageUri = mapped)
+            }
+        }
+        if (!node.hasFx()) return out
         if (node.fxColor.isNotBlank()) {
             KustomFormulaEngine.evalColor(node.fxColor, env, now, globals)?.let { c ->
                 val cAlpha = (c ushr 24) and 0xFF
@@ -1289,7 +1431,56 @@ class LiquidGlassRenderer {
                 out = out.copy(scale = (node.scale * sc.toFloat()).coerceIn(0.05f, 8f))
             }
         }
+        if (node.fxSize.isNotBlank()) {
+            KustomFormulaEngine.evalNumeric(node.fxSize, env, now, globals)?.toFloat()?.let { sz ->
+                if (sz > 1f) {
+                    out = when (out.type) {
+                        LayerType.TEXT -> out.copy(size = sz.coerceIn(8f, 600f))
+                        LayerType.SHAPE, LayerType.ICON, LayerType.SVG, LayerType.IMAGE -> {
+                            val ratio = if (out.w > 1f) out.h / out.w else 1f
+                            val nw = sz.coerceIn(8f, 2000f)
+                            out.copy(w = nw, h = (nw * ratio).coerceIn(4f, 2000f))
+                        }
+                        else -> out
+                    }
+                }
+            }
+        }
+        if (node.fxAsset.isNotBlank()) {
+            val rawKey = Dynamic.eval(node.fxAsset, env, now, globals).trim()
+            if (rawKey.isNotEmpty()) {
+                val mapped = activeCustomAssets[rawKey] ?: activeCustomAssets[rawKey.lowercase()]
+                val decodedSvg = Icons.decodeSvgAsset(mapped)
+                out = when {
+                    decodedSvg != null -> out.copy(type = LayerType.SVG, svgData = decodedSvg.data, svgW = decodedSvg.w, svgH = decodedSvg.h)
+                    out.type == LayerType.SVG && (rawKey.lowercase() in Icons.builtIn || rawKey.equals("weather", ignoreCase = true)) ->
+                        out.copy(type = LayerType.ICON, icon = rawKey.lowercase())
+                    out.type == LayerType.ICON && mapped != null ->
+                        out.copy(type = LayerType.IMAGE, imageUri = mapped)
+                    out.type == LayerType.ICON ->
+                        out.copy(icon = rawKey.lowercase())
+                    out.type == LayerType.SVG && mapped != null ->
+                        out.copy(type = LayerType.IMAGE, imageUri = mapped)
+                    out.type == LayerType.IMAGE ->
+                        out.copy(imageUri = mapped ?: rawKey)
+                    else -> out
+                }
+            }
+        }
         return out
+    }
+
+    private fun resolveLayerImageBitmap(node: LayerNode, boxW: Float, boxH: Float): Bitmap? {
+        if (node.type != LayerType.IMAGE || node.imageUri.isBlank()) return null
+        val resolvedUri = activeCustomAssets[node.imageUri] ?: activeCustomAssets[node.imageUri.lowercase()] ?: node.imageUri
+        return currentContext?.let {
+            WallpaperCarousel.loadCustomAssetBitmap(
+                it,
+                resolvedUri,
+                boxW.roundToInt().coerceAtLeast(16),
+                boxH.roundToInt().coerceAtLeast(16)
+            )
+        }
     }
 
     private data class Measured(
@@ -1355,6 +1546,17 @@ class LiquidGlassRenderer {
                 val strokePx = (minOf(w, h) * 0.25f).coerceAtLeast(6f * u)
                 val gKey = if (node.type == LayerType.ICON) "I|$iconName|$w|$h" else "V|${node.svgData.hashCode()}|$w|$h"
                 Measured(w, h, out, gKey, node, dxPx, dyPx, baseStrokePx = strokePx)
+            }
+            LayerType.IMAGE -> {
+                val w = node.w * u
+                val h = node.h * u
+                val p = Path().apply {
+                    val c = node.corner * u
+                    addRoundRect(0f, 0f, w, h, c, c, Path.Direction.CW)
+                }
+                val strokePx = (minOf(w, h) * 0.25f).coerceAtLeast(6f * u)
+                val gKey = "IMG|${node.imageUri}|$w|$h|${node.corner}"
+                Measured(w, h, p, gKey, node, dxPx, dyPx, baseStrokePx = strokePx)
             }
             LayerType.STACK -> {
                 val visibleKids = node.children
@@ -1530,6 +1732,7 @@ class LiquidGlassRenderer {
                 canvas.drawPath(path, shadowPaint)
                 canvas.restore()
             }
+            val imgBmp = if (node.type == LayerType.IMAGE) resolveLayerImageBitmap(node, m.w, m.h) else null
             if ((node.fill == Fill.GLASS || node.fill == Fill.CRYSTAL) && bg != null && canvas.isHardwareAccelerated) {
                 val animScreenPath = Path(path).apply { transform(localToScreen) }
                 val hasScreenInv = localToScreen.invert(screenToLocal)
@@ -1550,6 +1753,7 @@ class LiquidGlassRenderer {
                             screenW = screenW,
                             screenH = screenH,
                             u = u,
+                            localPath = path,
                             animScreenPath = animScreenPath,
                             restScreenPath = restPath,
                             restLocalToScreen = restMat,
@@ -1559,8 +1763,11 @@ class LiquidGlassRenderer {
                             geomKey = "${m.geomKey}|$restPoseKey",
                             g = node.glass,
                             screenRect = screenRect,
+                            boxW = m.w,
+                            boxH = m.h,
                             alpha = alpha,
-                            blend = blend
+                            blend = blend,
+                            imageMaskBmp = imgBmp
                         )
                     } else {
                         drawClassicBlur(
@@ -1574,21 +1781,34 @@ class LiquidGlassRenderer {
                             boxW = m.w,
                             boxH = m.h,
                             alpha = alpha,
-                            blend = blend
+                            blend = blend,
+                            imageMaskBmp = imgBmp
                         )
                     }
                 }
             } else if (node.fill != Fill.HOLLOW) {
-                paint.reset()
-                paint.isAntiAlias = true
-                paint.isSubpixelText = true
-                paint.blendMode = blend
-                when (node.fill) {
-                    Fill.SOLID, Fill.GLASS, Fill.CRYSTAL, Fill.HOLLOW -> paint.color = applyAlpha(node.color, alpha)
-                    Fill.ADAPTIVE -> paint.color = applyAlpha(adaptive, alpha)
-                    Fill.GRADIENT -> paint.shader = makeGradientShader(node, m.w, m.h, alpha)
+                if (imgBmp != null && !imgBmp.isRecycled) {
+                    filterPaint.reset()
+                    filterPaint.isAntiAlias = true
+                    filterPaint.isFilterBitmap = true
+                    filterPaint.alpha = (alpha * 255).roundToInt().coerceIn(0, 255)
+                    filterPaint.blendMode = blend
+                    canvas.save()
+                    canvas.clipPath(path)
+                    drawBitmapCenterCrop(canvas, imgBmp, m.w.roundToInt().coerceAtLeast(1), m.h.roundToInt().coerceAtLeast(1), filterPaint)
+                    canvas.restore()
+                } else {
+                    paint.reset()
+                    paint.isAntiAlias = true
+                    paint.isSubpixelText = true
+                    paint.blendMode = blend
+                    when (node.fill) {
+                        Fill.SOLID, Fill.GLASS, Fill.CRYSTAL, Fill.HOLLOW -> paint.color = applyAlpha(node.color, alpha)
+                        Fill.ADAPTIVE -> paint.color = applyAlpha(adaptive, alpha)
+                        Fill.GRADIENT -> paint.shader = makeGradientShader(node, m.w, m.h, alpha)
+                    }
+                    canvas.drawPath(path, paint)
                 }
-                canvas.drawPath(path, paint)
             }
 
             val effStroke = if (node.fill == Fill.HOLLOW && node.strokeWidth <= 0f) 4f else node.strokeWidth
@@ -1642,15 +1862,69 @@ class LiquidGlassRenderer {
         restLocalToScreen: Matrix? = null,
         evalText: String = "",
         baselineShiftY: Float = 0f,
-        u: Float = screenW / 1080f
+        u: Float = screenW / 1080f,
+        imageMaskBmp: Bitmap? = null,
+        localPath: Path? = null,
+        boxW: Float = 0f,
+        boxH: Float = 0f
     ): Bitmap = synchronized(maskLock) {
-        val key = "$nodeId|${screenW}x$screenH|${bevelPx.roundToInt()}|${baseStrokePx.roundToInt()}|$geomKey"
+        val imgTag = if (imageMaskBmp != null && !imageMaskBmp.isRecycled) "|img${System.identityHashCode(imageMaskBmp)}" else ""
+        val key = "$nodeId|${screenW}x$screenH|${bevelPx.roundToInt()}|${baseStrokePx.roundToInt()}|$geomKey$imgTag"
         lensHeightCache.get(key)?.let { return it }
 
         if (allowStaleLensOnMiss) {
             lastLensByNode[nodeId]?.takeIf { !it.isRecycled && it.width == screenW && it.height == screenH }?.let {
                 return it
             }
+        }
+
+        if (imageMaskBmp != null && !imageMaskBmp.isRecycled && restLocalToScreen != null && localPath != null && boxW > 0f && boxH > 0f) {
+            val sharp = Bitmap.createBitmap(screenW, screenH, Bitmap.Config.ALPHA_8)
+            val sc = Canvas(sharp)
+            maskPaint.maskFilter = null
+            maskPaint.alpha = 255
+            val alphaBmp = imageMaskBmp.extractAlpha()
+            sc.save()
+            sc.concat(restLocalToScreen)
+            sc.clipPath(localPath)
+            drawBitmapCenterCrop(sc, alphaBmp, boxW.roundToInt().coerceAtLeast(1), boxH.roundToInt().coerceAtLeast(1), maskPaint)
+            sc.restore()
+            alphaBmp.recycle()
+
+            val out = Bitmap.createBitmap(screenW, screenH, Bitmap.Config.ALPHA_8)
+            val oc = Canvas(out)
+            val rInterior = (baseStrokePx * 0.65f).coerceAtLeast(4f * u)
+            val rBevel = bevelPx.coerceAtLeast(1f)
+            val blurPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+            val offset = IntArray(2)
+
+            blurPaint.maskFilter = BlurMaskFilter(rInterior, BlurMaskFilter.Blur.NORMAL)
+            val interiorBlur = sharp.extractAlpha(blurPaint, offset)
+            maskPaint.maskFilter = null
+            maskPaint.alpha = 145
+            oc.drawBitmap(interiorBlur, offset[0].toFloat(), offset[1].toFloat(), maskPaint)
+            interiorBlur.recycle()
+
+            blurPaint.maskFilter = BlurMaskFilter(rBevel, BlurMaskFilter.Blur.NORMAL)
+            val bevelBlur = sharp.extractAlpha(blurPaint, offset)
+            maskPaint.alpha = 125
+            oc.drawBitmap(bevelBlur, offset[0].toFloat(), offset[1].toFloat(), maskPaint)
+            bevelBlur.recycle()
+
+            maskPaint.maskFilter = null
+            maskPaint.alpha = 255
+            oc.drawBitmap(sharp, 0f, 0f, maskCutPaint)
+            sharp.recycle()
+
+            lensHeightCache.put(key, out)
+            lastLensByNode[nodeId] = out
+            val inv = Matrix()
+            if (restLocalToScreen.invert(inv)) {
+                lastLensInvMatrixByNode[nodeId] = inv
+            } else {
+                lastLensInvMatrixByNode.remove(nodeId)
+            }
+            return out
         }
 
         if (restLocalToScreen != null && evalText.isNotEmpty()) {
@@ -1740,7 +2014,8 @@ class LiquidGlassRenderer {
         boxW: Float,
         boxH: Float,
         alpha: Float,
-        blend: BlendMode
+        blend: BlendMode,
+        imageMaskBmp: Bitmap? = null
     ) {
         val blurPx = (g.blur * u).coerceIn(0f, 80f * u)
         val frostedShader = getFrostedShader(blurPx, screenW, screenH)
@@ -1755,11 +2030,20 @@ class LiquidGlassRenderer {
         blurShader.setFloatUniform("uTint", r, gr, b, a)
         blurShader.setFloatUniform("uGrain", g.grain)
 
+        val useImgMask = imageMaskBmp != null && !imageMaskBmp.isRecycled
+        val saveCount = if (useImgMask) {
+            layerPaint.reset()
+            layerPaint.isAntiAlias = true
+            layerPaint.alpha = (alpha * 255).roundToInt().coerceIn(0, 255)
+            layerPaint.blendMode = blend
+            canvas.saveLayer(-2f, -2f, boxW + 2f, boxH + 2f, layerPaint)
+        } else -1
+
         glassPaint.reset()
         glassPaint.isAntiAlias = true
         glassPaint.shader = blurShader
-        glassPaint.alpha = (alpha * 255).roundToInt().coerceIn(0, 255)
-        glassPaint.blendMode = blend
+        glassPaint.alpha = if (useImgMask) 255 else (alpha * 255).roundToInt().coerceIn(0, 255)
+        glassPaint.blendMode = if (useImgMask) BlendMode.SRC_OVER else blend
 
         canvas.save()
         canvas.concat(screenToLocal)
@@ -1770,7 +2054,7 @@ class LiquidGlassRenderer {
             val rad = Math.toRadians(g.lightAngle.toDouble())
             val rx = cos(rad).toFloat() * boxW * 0.6f
             val ry = sin(rad).toFloat() * boxH * 0.6f
-            val rimAlpha = (g.rim * alpha * 190).roundToInt().coerceIn(0, 255)
+            val rimAlpha = (g.rim * (if (useImgMask) 1f else alpha) * 190).roundToInt().coerceIn(0, 255)
             rimPaint.strokeWidth = (2.6f * u).coerceAtLeast(1.8f)
             rimPaint.shader = LinearGradient(
                 boxW * 0.5f + rx, boxH * 0.5f + ry, boxW * 0.5f - rx, boxH * 0.5f - ry,
@@ -1781,6 +2065,14 @@ class LiquidGlassRenderer {
             canvas.clipPath(localPath)
             canvas.drawPath(localPath, rimPaint)
             canvas.restore()
+        }
+
+        if (useImgMask && saveCount >= 0) {
+            canvas.save()
+            canvas.clipPath(localPath)
+            drawBitmapCenterCrop(canvas, imageMaskBmp!!, boxW.roundToInt().coerceAtLeast(1), boxH.roundToInt().coerceAtLeast(1), maskCutPaint)
+            canvas.restore()
+            canvas.restoreToCount(saveCount)
         }
     }
 
@@ -1800,13 +2092,34 @@ class LiquidGlassRenderer {
         g: Glass,
         screenRect: RectF,
         alpha: Float,
-        blend: BlendMode
+        blend: BlendMode,
+        localPath: Path = Path(),
+        boxW: Float = 0f,
+        boxH: Float = 0f,
+        imageMaskBmp: Bitmap? = null
     ) {
         val blurPx = if (g.frostAmount > 0.01f) (g.blur.coerceAtLeast(18f * g.frostAmount) * u).coerceIn(0f, 80f * u) else 0f
         val bevelRadiusPx = (g.bevelWidth * u).coerceIn(1f, 48f * u)
         val sharpShader = sharpBgShader ?: return
         val frostedShader = getFrostedShader(blurPx, screenW, screenH)
-        val lensBmp = getLensHeightMap(nodeId, restScreenPath, screenW, screenH, bevelRadiusPx, baseStrokePx, geomKey, restLocalToScreen, evalText, baselineShiftY, u)
+        val useImgMask = imageMaskBmp != null && !imageMaskBmp.isRecycled && boxW > 0f && boxH > 0f
+        val lensBmp = getLensHeightMap(
+            nodeId = nodeId,
+            restScreenPath = restScreenPath,
+            screenW = screenW,
+            screenH = screenH,
+            bevelPx = bevelRadiusPx,
+            baseStrokePx = baseStrokePx,
+            geomKey = geomKey,
+            restLocalToScreen = restLocalToScreen,
+            evalText = evalText,
+            baselineShiftY = baselineShiftY,
+            u = u,
+            imageMaskBmp = if (useImgMask) imageMaskBmp else null,
+            localPath = if (useImgMask) localPath else null,
+            boxW = boxW,
+            boxH = boxH
+        )
         val lensShader = getLensShader(nodeId, lensBmp, restLocalToScreen)
 
         val sliderValue = (g.refraction / 100f).coerceIn(0f, 1f)
@@ -1832,16 +2145,32 @@ class LiquidGlassRenderer {
         crystalShader.setFloatUniform("uSaturation", g.saturation)
         crystalShader.setFloatUniform("uTint", r, gr, b, a)
 
+        val saveCount = if (useImgMask) {
+            layerPaint.reset()
+            layerPaint.isAntiAlias = true
+            layerPaint.alpha = (alpha * 255).roundToInt().coerceIn(0, 255)
+            layerPaint.blendMode = blend
+            canvas.saveLayer(-2f, -2f, boxW + 2f, boxH + 2f, layerPaint)
+        } else -1
+
         glassPaint.reset()
         glassPaint.isAntiAlias = true
         glassPaint.shader = crystalShader
-        glassPaint.alpha = (alpha * 255).roundToInt().coerceIn(0, 255)
-        glassPaint.blendMode = blend
+        glassPaint.alpha = if (useImgMask) 255 else (alpha * 255).roundToInt().coerceIn(0, 255)
+        glassPaint.blendMode = if (useImgMask) BlendMode.SRC_OVER else blend
 
         canvas.save()
         canvas.concat(screenToLocal)
         canvas.drawPath(animScreenPath, glassPaint)
         canvas.restore()
+
+        if (useImgMask && saveCount >= 0) {
+            canvas.save()
+            canvas.clipPath(localPath)
+            drawBitmapCenterCrop(canvas, imageMaskBmp!!, boxW.roundToInt().coerceAtLeast(1), boxH.roundToInt().coerceAtLeast(1), maskCutPaint)
+            canvas.restore()
+            canvas.restoreToCount(saveCount)
+        }
     }
 
     private fun applyAlpha(color: Int, factor: Float): Int {
