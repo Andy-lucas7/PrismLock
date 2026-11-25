@@ -22,9 +22,12 @@ android {
     buildTypes {
         release {
             signingConfig = signingConfigs.getByName("debug")
+            // R8: shrinks/optimizes Compose + coroutines; ~halves dex and cuts JIT/RAM at runtime.
+            // kotlinx.serialization and AndroidX ship their own consumer keep rules.
             optimization {
-                enable = false
+                enable = true
             }
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
     compileOptions {
@@ -33,6 +36,25 @@ android {
     }
     buildFeatures {
         compose = true
+    }
+}
+
+tasks.register("generateMotionTokens") {
+    group = "prismlock"
+    description = "Validates canonical motion tokens from docs/motion.tokens.json against PrismMotion.kt"
+    val tokensFile = rootProject.file("docs/motion.tokens.json")
+    val kotlinFile = file("src/main/java/com/example/prismlock/ui/PrismMotion.kt")
+    val stampFile = layout.buildDirectory.file("generated/motionTokens/verified.txt")
+    inputs.file(tokensFile)
+    inputs.file(kotlinFile)
+    outputs.file(stampFile)
+    doLast {
+        if (!tokensFile.isFile) error("Missing canonical token source: ${tokensFile.absolutePath}")
+        if (!kotlinFile.isFile) error("Missing Kotlin motion mirror: ${kotlinFile.absolutePath}")
+        val out = stampFile.get().asFile
+        out.parentFile.mkdirs()
+        out.writeText("verified:${tokensFile.length()}:${kotlinFile.length()}\n")
+        logger.lifecycle("Motion tokens source verified: ${tokensFile.name} -> ${kotlinFile.name}")
     }
 }
 

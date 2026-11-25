@@ -1,6 +1,5 @@
 package com.example.prismlock.ui
 
-import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -15,7 +14,6 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 
 object PrismColors {
@@ -31,11 +29,6 @@ object PrismColors {
     val MutedZinc = Color(0xFFA1A1AA)
     val TrackZinc = Color(0xFF27272A)
     val DangerRed = Color(0xFFFF6B6B)
-}
-
-object PrismMotion {
-    val FloatSpring = spring<Float>(dampingRatio = 0.8f, stiffness = 400f)
-    val IntOffsetSpring = spring<IntOffset>(dampingRatio = 0.8f, stiffness = 400f)
 }
 
 val PrismMonochromeColorScheme = darkColorScheme(

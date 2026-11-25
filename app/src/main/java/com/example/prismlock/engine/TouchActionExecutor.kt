@@ -98,6 +98,13 @@ object TouchActionExecutor {
         return null
     }
 
+    private val ALLOWED_URL_SCHEMES = setOf("http", "https", "mailto", "tel")
+
+    fun isAllowedUrlScheme(normalizedUrl: String): Boolean {
+        val scheme = normalizedUrl.substringBefore(':', "").lowercase()
+        return scheme in ALLOWED_URL_SCHEMES
+    }
+
     fun execute(
         ctx: Context,
         node: LayerNode,
@@ -157,6 +164,10 @@ object TouchActionExecutor {
                     return false
                 }
                 val normalized = if ("://" !in raw && ':' !in raw.substringBefore('/')) "https://$raw" else raw
+                if (!isAllowedUrlScheme(normalized)) {
+                    onFeedback("Esquema de link não permitido")
+                    return false
+                }
                 val intent = Intent(Intent.ACTION_VIEW, Uri.parse(normalized))
                 launchActivitySafely(ctx, intent, requestCode = node.id.hashCode() xor 0x1337, onFeedback = onFeedback)
             }

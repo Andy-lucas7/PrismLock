@@ -36,7 +36,9 @@ import kotlin.coroutines.resume
 object SubjectDepthEngine {
     private val segLock = Any()
     private var segmenter: com.google.mlkit.vision.segmentation.subject.SubjectSegmenter? = null
-    private val memCache = LruCache<String, Bitmap>(1)
+    private val memCache = object : LruCache<String, Bitmap>(6 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int = (value.allocationByteCount / 1024).coerceAtLeast(1)
+    }
 
     private fun obtainSegmenter(): com.google.mlkit.vision.segmentation.subject.SubjectSegmenter = synchronized(segLock) {
         segmenter ?: SubjectSegmentation.getClient(
@@ -58,7 +60,46 @@ object SubjectDepthEngine {
         MessageDigest.getInstance("SHA-256").digest(uri.toByteArray()).joinToString("") { "%02x".format(it) }.take(20)
 
     private fun maskFile(ctx: Context, uri: String): File =
-        File(File(ctx.cacheDir, "depth_masks").apply { mkdirs() }, "${key(uri)}.png")
+        File(File(ctx.applicationContext.filesDir, "depth_masks").apply { mkdirs() }, "${key(uri)}_hd.png")
+
+    private fun legacyCacheMaskFile(ctx: Context, uri: String): File =
+        File(File(ctx.applicationContext.cacheDir, "depth_masks"), "${key(uri)}.png")
+
+    fun getCachedMaskIfEnabled(
+        ctx: Context,
+        uri: String?,
+        project: Project,
+        maxEdge: Int = 0,
+        cacheInMemory: Boolean = true
+    ): Bitmap? {
+        if (!project.depth || uri == null) return null
+        if (WallpaperCarousel.isVideoUri(ctx, uri)) return null
+        val imageKey = WallpaperCarousel.imageKey(ctx, uri)
+        if (!project.isDepthEnabledFor(imageKey)) return null
+        if (cacheInMemory) {
+            memCache.get(uri)?.let { hit ->
+                if (!hit.isRecycled) return hit
+                memCache.remove(uri)
+            }
+        }
+        val file = maskFile(ctx, uri).takeIf { it.exists() }
+            ?: legacyCacheMaskFile(ctx, uri).takeIf { it.exists() }
+            ?: return null
+        val decoded = runCatching {
+            if (maxEdge > 0) {
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(file.absolutePath, bounds)
+                var sample = 1
+                val largest = maxOf(bounds.outWidth, bounds.outHeight)
+                while (largest / (sample * 2) >= maxEdge) sample *= 2
+                BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample })
+            } else {
+                BitmapFactory.decodeFile(file.absolutePath)
+            }
+        }.getOrNull() ?: return null
+        if (cacheInMemory) memCache.put(uri, decoded)
+        return decoded
+    }
 
     suspend fun getOrCreateMaskIfEnabled(ctx: Context, uri: String?, source: Bitmap?, project: Project): Bitmap? {
         if (!project.depth || uri == null || source == null) return null
@@ -68,15 +109,33 @@ object SubjectDepthEngine {
         return getOrCreateMask(ctx, uri, source)
     }
 
-    suspend fun getOrCreateMask(ctx: Context, uri: String, source: Bitmap): Bitmap? = withContext(Dispatchers.IO) {
-        memCache.get(uri)?.let { return@withContext it }
+    suspend fun getOrCreateMask(
+        ctx: Context,
+        uri: String,
+        source: Bitmap,
+        closeAfter: Boolean = true
+    ): Bitmap? = withContext(Dispatchers.IO) {
+        val minRes = source.width >= 720
+        memCache.get(uri)?.let { hit ->
+            if (!hit.isRecycled && (!minRes || hit.width >= 720)) return@withContext hit
+            if (hit.isRecycled) memCache.remove(uri)
+        }
         val file = maskFile(ctx, uri)
-        if (file.exists()) {
-            val cached = BitmapFactory.decodeFile(file.absolutePath)
-            if (cached != null) {
+        val existingFile = when {
+            file.exists() -> file
+            legacyCacheMaskFile(ctx, uri).exists() -> legacyCacheMaskFile(ctx, uri)
+            else -> null
+        }
+        if (existingFile != null) {
+            val cached = BitmapFactory.decodeFile(existingFile.absolutePath)
+            if (cached != null && (!minRes || cached.width >= 720)) {
+                if (existingFile != file && minRes) {
+                    runCatching { existingFile.copyTo(file, overwrite = true) }
+                }
                 memCache.put(uri, cached)
                 return@withContext cached
             }
+            cached?.recycle()
         }
         if (runCatching { Application.getProcessName().endsWith(":wallpaper") }.getOrDefault(false)) {
             return@withContext null
@@ -84,22 +143,32 @@ object SubjectDepthEngine {
         val fg = try {
             runSegment(source)
         } finally {
-            synchronized(segLock) {
-                runCatching { segmenter?.close() }
-                segmenter = null
+            if (closeAfter) {
+                synchronized(segLock) {
+                    runCatching { segmenter?.close() }
+                    segmenter = null
+                }
             }
         }
         if (fg == null) return@withContext null
-        runCatching {
-            file.outputStream().use { fg.compress(Bitmap.CompressFormat.PNG, 92, it) }
+        if (fg.width >= 720) {
+            runCatching {
+                file.outputStream().use { fg.compress(Bitmap.CompressFormat.PNG, 92, it) }
+            }
+            memCache.put(uri, fg)
         }
-        memCache.put(uri, fg)
         fg
     }
 
     private suspend fun runSegment(bmp: Bitmap): Bitmap? = suspendCancellableCoroutine { cont ->
-        val input = InputImage.fromBitmap(bmp, 0)
-        obtainSegmenter().process(input)
+        // Segmentation is an enhancement: an ML Kit failure (missing module, bad input) must degrade to "no mask".
+        val task = try {
+            obtainSegmenter().process(InputImage.fromBitmap(bmp, 0))
+        } catch (e: Exception) {
+            if (cont.isActive) cont.resume(null)
+            return@suspendCancellableCoroutine
+        }
+        task
             .addOnSuccessListener { res ->
                 if (cont.isActive) cont.resume(res.foregroundBitmap)
             }
@@ -166,7 +235,7 @@ object SubjectDepthEngine {
             val sat = (1f - project.depthBgDesaturate.coerceIn(0f, 1f)).coerceIn(0f, 1f)
             bgPaint.colorFilter = ColorMatrixColorFilter(ColorMatrix().apply { setSaturation(sat) })
         }
-        canvas.drawBitmap(blurredBg, 0f, 0f, bgPaint)
+        canvas.drawBitmap(blurredBg, null, android.graphics.Rect(0, 0, w, h), bgPaint)
         if (blurredBg !== baseSharp && !blurredBg.isRecycled) {
             blurredBg.recycle()
         }
@@ -216,9 +285,15 @@ object SubjectDepthEngine {
 }
 
 object WallpaperCarousel {
-    private val bmpCache = LruCache<String, Bitmap>(1)
-    private val thumbCache = LruCache<String, Bitmap>(12)
-    private val customAssetCache = LruCache<String, Bitmap>(6)
+    private val bmpCache = object : LruCache<String, Bitmap>(6 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int = (value.allocationByteCount / 1024).coerceAtLeast(1)
+    }
+    private val thumbCache = object : LruCache<String, Bitmap>(2 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int = (value.allocationByteCount / 1024).coerceAtLeast(1)
+    }
+    private val customAssetCache = object : LruCache<String, Bitmap>(2 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int = (value.allocationByteCount / 1024).coerceAtLeast(1)
+    }
     private val keyCache = ConcurrentHashMap<String, String>()
     private val videoCache = ConcurrentHashMap<String, Boolean>()
 
@@ -228,16 +303,25 @@ object WallpaperCarousel {
         customAssetCache.evictAll()
     }
 
+    private fun createImageDecoderSource(ctx: Context, uri: Uri): ImageDecoder.Source {
+        if (uri.scheme == "file") {
+            val path = uri.path
+            if (!path.isNullOrBlank()) return ImageDecoder.createSource(File(path))
+        }
+        return ImageDecoder.createSource(ctx.contentResolver, uri)
+    }
+
     fun isVideoUri(ctx: Context, uriStr: String?): Boolean {
         if (uriStr.isNullOrBlank()) return false
         videoCache[uriStr]?.let { return it }
         val uri = Uri.parse(uriStr)
-        val mime = runCatching { ctx.contentResolver.getType(uri) }.getOrNull()
+        val mime = if (uri.scheme == "file") null else runCatching { ctx.contentResolver.getType(uri) }.getOrNull()
         val isVid = when {
             mime != null -> mime.startsWith("video/")
             else -> {
                 val lower = (uri.lastPathSegment ?: uriStr).lowercase()
-                lower.endsWith(".mp4") || lower.endsWith(".webm") || lower.endsWith(".mkv") || lower.endsWith(".mov") || lower.endsWith(".m4v")
+                lower.endsWith(".mp4") || lower.endsWith(".webm") || lower.endsWith(".mkv") ||
+                    lower.endsWith(".mov") || lower.endsWith(".m4v") || lower.endsWith(".3gp")
             }
         }
         videoCache[uriStr] = isVid
@@ -247,7 +331,7 @@ object WallpaperCarousel {
     fun imageKey(ctx: Context, uriStr: String): String {
         keyCache[uriStr]?.let { return it }
         val uri = Uri.parse(uriStr)
-        val displayName = runCatching {
+        val displayName = if (uri.scheme == "file") null else runCatching {
             ctx.contentResolver.query(
                 uri,
                 arrayOf(OpenableColumns.DISPLAY_NAME),
@@ -271,7 +355,7 @@ object WallpaperCarousel {
         }
         runCatching {
             val uri = Uri.parse(uriStr)
-            val src = ImageDecoder.createSource(ctx.contentResolver, uri)
+            val src = createImageDecoderSource(ctx, uri)
             val bmp = ImageDecoder.decodeBitmap(src) { decoder, info, _ ->
                 decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
                 val w = info.size.width.coerceAtLeast(1)
@@ -289,7 +373,11 @@ object WallpaperCarousel {
             val uri = Uri.parse(uriStr)
             val mmr = MediaMetadataRetriever()
             try {
-                mmr.setDataSource(ctx, uri)
+                if (uri.scheme == "file" && !uri.path.isNullOrBlank()) {
+                    mmr.setDataSource(uri.path)
+                } else {
+                    mmr.setDataSource(ctx, uri)
+                }
                 mmr.getScaledFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, reqW.coerceAtLeast(1), reqH.coerceAtLeast(1))
                     ?: mmr.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
             } finally {
@@ -346,13 +434,14 @@ object WallpaperCarousel {
         ctx: Context,
         project: Project,
         advance: Boolean = false,
-        checkInterval: Boolean = false
+        checkInterval: Boolean = false,
+        persist: Boolean = true
     ): String? = withContext(Dispatchers.IO) {
         if (project.folderUri.isNullOrBlank() && project.imageUri.isNullOrBlank()) {
             return@withContext null
         }
         if (project.folderUri.isNullOrBlank() && !project.imageUri.isNullOrBlank()) {
-            ProjectStore.setCurrentWallpaperUri(ctx, project.imageUri)
+            if (persist) ProjectStore.setCurrentWallpaperUri(ctx, project.imageUri)
             return@withContext project.imageUri
         }
         val manifest = WallpaperBaker.readManifest(ctx)
@@ -370,7 +459,7 @@ object WallpaperCarousel {
         if (advance) {
             val nextIdx = (ProjectStore.index(ctx) + 1) % uriStrings.size
             val uri = uriStrings[nextIdx]
-            ProjectStore.setIndex(ctx, nextIdx, uri)
+            if (persist) ProjectStore.setIndex(ctx, nextIdx, uri)
             return@withContext uri
         }
         if (checkInterval && project.intervalMin > 0) {
@@ -378,7 +467,7 @@ object WallpaperCarousel {
             if (System.currentTimeMillis() - last >= project.intervalMin * 60_000L) {
                 val nextIdx = (ProjectStore.index(ctx) + 1) % uriStrings.size
                 val uri = uriStrings[nextIdx]
-                ProjectStore.setIndex(ctx, nextIdx, uri)
+                if (persist) ProjectStore.setIndex(ctx, nextIdx, uri)
                 return@withContext uri
             }
         }
@@ -388,7 +477,7 @@ object WallpaperCarousel {
         }
         val idx = ProjectStore.index(ctx).coerceIn(0, uriStrings.lastIndex)
         val uri = uriStrings[idx]
-        ProjectStore.setCurrentWallpaperUri(ctx, uri)
+        if (persist) ProjectStore.setCurrentWallpaperUri(ctx, uri)
         uri
     }
 
@@ -397,19 +486,22 @@ object WallpaperCarousel {
         uriStr: String?,
         reqW: Int,
         reqH: Int,
-        preferRgb565: Boolean = true
+        preferRgb565: Boolean = true,
+        cacheInMemory: Boolean = true
     ): Bitmap? = withContext(Dispatchers.IO) {
         if (uriStr.isNullOrBlank()) return@withContext null
         val key = "$uriStr@${reqW}x${reqH}|$preferRgb565"
-        bmpCache.get(key)?.takeIf { !it.isRecycled }?.let { return@withContext it }
+        if (cacheInMemory) {
+            bmpCache.get(key)?.takeIf { !it.isRecycled }?.let { return@withContext it }
+        }
         if (isVideoUri(ctx, uriStr)) {
             val frame = loadVideoFrame(ctx, uriStr, reqW, reqH) ?: return@withContext null
-            bmpCache.put(key, frame)
+            if (cacheInMemory) bmpCache.put(key, frame)
             return@withContext frame
         }
         runCatching {
             val uri = Uri.parse(uriStr)
-            val src = ImageDecoder.createSource(ctx.contentResolver, uri)
+            val src = createImageDecoderSource(ctx, uri)
             val decoded = ImageDecoder.decodeBitmap(src) { decoder, info, _ ->
                 decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
                 val w = info.size.width.coerceAtLeast(1)
@@ -420,7 +512,7 @@ object WallpaperCarousel {
             val bmp = if (preferRgb565 && decoded.config != Bitmap.Config.RGB_565 && !decoded.hasAlpha()) {
                 decoded.copy(Bitmap.Config.RGB_565, false)?.also { decoded.recycle() } ?: decoded
             } else decoded
-            bmpCache.put(key, bmp)
+            if (cacheInMemory) bmpCache.put(key, bmp)
             bmp
         }.getOrNull()
     }
@@ -433,7 +525,7 @@ object WallpaperCarousel {
         customAssetCache.get(key)?.takeIf { !it.isRecycled }?.let { return it }
         return runCatching {
             val uri = if (uriStr.startsWith("/")) Uri.fromFile(File(uriStr)) else Uri.parse(uriStr)
-            val src = ImageDecoder.createSource(ctx.contentResolver, uri)
+            val src = createImageDecoderSource(ctx, uri)
             val bmp = ImageDecoder.decodeBitmap(src) { decoder, info, _ ->
                 decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
                 val w = info.size.width.coerceAtLeast(1)

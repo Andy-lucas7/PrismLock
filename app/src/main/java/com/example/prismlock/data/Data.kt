@@ -11,7 +11,6 @@ import android.media.AudioManager
 import android.os.BatteryManager
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
-import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
@@ -19,6 +18,7 @@ import androidx.datastore.preferences.preferencesDataStore
 import com.example.prismlock.model.Presets
 import com.example.prismlock.model.Project
 import com.example.prismlock.model.copyDeep
+import com.example.prismlock.model.migrated
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -32,6 +32,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.MapSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.double
 import kotlinx.serialization.json.int
@@ -57,6 +59,16 @@ private data class CarouselIpcState(
     val bakeVersion: Long = 0L
 )
 
+@Serializable
+data class WeatherIpcState(
+    val key: String = "",
+    val time: Long = 0L,
+    val temp: Float? = null,
+    val code: Int = 0,
+    val day: Int = 1,
+    val city: String = ""
+)
+
 object ProjectStore {
     val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     const val ACTION_RELOAD_PROJECT = "com.example.prismlock.ACTION_RELOAD_PROJECT"
@@ -67,27 +79,103 @@ object ProjectStore {
     private val ACTIVE_WIDGET_KEY = stringPreferencesKey("active_widget_project")
     private val HERO_SEEN_KEY = booleanPreferencesKey("hero_seen_v1")
     private val BATTERY_PROMPT_DISMISSED_KEY = booleanPreferencesKey("battery_prompt_dismissed_v1")
+    private val HUB_GRID_MODE_KEY = booleanPreferencesKey("hub_grid_mode_v1")
     private val IDX = intPreferencesKey("carousel_index")
     private val LAST_SWITCH = longPreferencesKey("carousel_switch")
     private val CURRENT_URI = stringPreferencesKey("carousel_current_uri")
     private val ACTIVE_BAKE_VERSION = longPreferencesKey("active_bake_version")
     private val FONT_FOLDER_URI = stringPreferencesKey("font_folder_uri")
     private val listSerializer = ListSerializer(Project.serializer())
+    private val globalsMapSerializer = MapSerializer(String.serializer(), String.serializer())
+
+    private fun backupCorruptedJson(ctx: Context, prefix: String, raw: String) {
+        android.util.Log.e("ProjectStore", "Corrupted JSON detected for $prefix; backing up and preserving store")
+        runCatching {
+            val f = File(ctx.applicationContext.filesDir, "${prefix}_backup_${System.currentTimeMillis()}.json")
+            f.writeText(raw, Charsets.UTF_8)
+        }
+    }
+
+    private fun runtimeGlobalsFile(ctx: Context, projectId: String): File {
+        val safe = projectId.replace(Regex("[^A-Za-z0-9._-]"), "_")
+        return File(ipcDir(ctx), "runtime_globals_$safe.json")
+    }
+
+    private fun writeRuntimeGlobals(ctx: Context, p: Project) {
+        val map = p.globals.associate { it.name.lowercase() to it.value }
+        writeAtomicText(runtimeGlobalsFile(ctx, p.id), json.encodeToString(globalsMapSerializer, map))
+    }
+
+    private fun applyRuntimeGlobals(ctx: Context, p: Project): Project {
+        if (p.globals.isEmpty()) return p
+        val f = runtimeGlobalsFile(ctx, p.id)
+        if (!f.exists()) return p
+        val map = synchronized(ipcLock) {
+            runCatching { json.decodeFromString(globalsMapSerializer, f.readText()) }.getOrNull()
+        } ?: return p
+        if (map.isEmpty()) return p
+        var changed = false
+        val updated = p.globals.map { g ->
+            val v = map[g.name.lowercase()]
+            if (v != null && v != g.value) {
+                changed = true
+                g.copy(value = v)
+            } else g
+        }
+        return if (changed) p.copy(globals = updated) else p
+    }
+
+    private fun decodeProject(raw: String): Project? =
+        runCatching { json.decodeFromString(Project.serializer(), raw).migrated().refreshedStarter() }.getOrNull()
+
+    private fun decodeProjectList(raw: String): List<Project>? =
+        runCatching { json.decodeFromString(listSerializer, raw).map { it.migrated().refreshedStarter() } }.getOrNull()
+
+    /**
+     * Starters bundled by older versions (legacy id → original title, replacement starter id). A saved copy
+     * that still carries its original title is treated as untouched and gets the new design; its id, photos,
+     * folder and settings are kept so the active theme/widget references stay valid. Renamed copies are left as-is.
+     */
+    private val legacyStarters: Map<Pair<String, String>, String> = mapOf(
+        ("theme_ios_crystal" to "Cristal Óptico") to "style_glass_aurora",
+        ("theme_samsung_stretch" to "Samsung Esticado") to "style_modern_depth",
+        ("widget_crystal_clock" to "Relógio Cristal Elástico") to "style_w_elastic",
+        ("widget_weather_battery" to "Clima & Bateria Vidro") to "style_w_clean",
+        ("widget_music_smart" to "Capsula Mídia Cristal") to "style_w_music",
+        // Interim starters from the previous redesign.
+        ("starter_liquid_aurora" to "Aurora Líquida") to "style_glass_aurora",
+        ("starter_elastic_monolith" to "Monolito Elástico") to "style_modern_depth",
+        ("starter_neon_prism" to "Prisma Neon") to "style_bold_acid",
+        ("starter_editorial_noir" to "Editorial Noir") to "style_elegant_editorial",
+        ("starter_w_crystal" to "Cristal Elástico") to "style_w_elastic",
+        ("starter_w_energy" to "Clima & Energia") to "style_w_clean",
+        ("starter_w_sonic" to "Cápsula Sonora") to "style_w_music",
+        ("starter_w_calendar" to "Calendário Prisma") to "style_w_calendar"
+    )
+
+    private fun Project.refreshedStarter(): Project {
+        val replacementId = legacyStarters[id to title] ?: return this
+        val fresh = (starterThemes + starterWidgets).firstOrNull { it.id == replacementId } ?: return this
+        return copy(title = fresh.title, layers = fresh.layers, widgetAspect = if (isWidget) fresh.widgetAspect else widgetAspect)
+    }
+
+    /** Single shared default: `Project()` mints random layer ids, so fresh instances never compare equal. */
+    val emptyProject: Project by lazy { Project() }
 
     fun flow(ctx: Context): Flow<Project> = ctx.applicationContext.prismStore.data
         .map { it[KEY] }.distinctUntilChanged()
-        .map { s -> s?.let { runCatching { json.decodeFromString(Project.serializer(), it) }.getOrNull() } ?: Project() }
+        .map { s -> s?.let { decodeProject(it)?.let { p -> applyRuntimeGlobals(ctx, p) } } ?: emptyProject }
         .flowOn(Dispatchers.Default)
 
     fun themesFlow(ctx: Context): Flow<List<Project>> = ctx.applicationContext.prismStore.data
         .map { it[THEMES_KEY] to it[KEY] }
         .distinctUntilChanged()
         .map { (themesRaw, activeRaw) ->
-            val decoded = themesRaw?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
+            val decoded = themesRaw?.let { decodeProjectList(it) }
             if (!decoded.isNullOrEmpty()) {
-                decoded
+                decoded.map { applyRuntimeGlobals(ctx, it) }
             } else {
-                val active = activeRaw?.let { runCatching { json.decodeFromString(Project.serializer(), it) }.getOrNull() }
+                val active = activeRaw?.let { decodeProject(it)?.let { p -> applyRuntimeGlobals(ctx, p) } }
                 if (active != null) {
                     listOf(active)
                 } else {
@@ -97,23 +185,24 @@ object ProjectStore {
         }
         .flowOn(Dispatchers.Default)
 
-    fun defaultStarterThemes(): List<Project> = listOf(
-        Project(
-            id = "theme_ios_crystal",
-            title = "Cristal Óptico",
-            layers = Presets.iosGlass()
-        ),
-        Project(
-            id = "theme_samsung_stretch",
-            title = "Samsung Esticado",
-            layers = Presets.samsung()
-        )
-    )
+    /** One starter per style/audience, mirroring the most-saved lock screen styles (see Presets.all). */
+    private val starterThemes: List<Project> by lazy { listOf(
+        Project(id = "style_modern_depth", title = "Moderno · Profundidade", layers = Presets.modernDepth(), dim = 0.08f),
+        Project(id = "style_clean_mist", title = "Clean · Névoa", layers = Presets.cleanMist(), dim = 0.06f),
+        Project(id = "style_cute_peach", title = "Fofo · Pêssego", layers = Presets.cutePeach(), dim = 0.04f),
+        Project(id = "style_glass_aurora", title = "Vidro · Aurora", layers = Presets.liquidAurora()),
+        Project(id = "style_elegant_editorial", title = "Elegante · Editorial", layers = Presets.elegantEditorial(), dim = 0.18f),
+        Project(id = "style_advanced_terminal", title = "Avançado · Terminal", layers = Presets.advancedTerminal(), dim = 0.2f),
+        Project(id = "style_simple_corner", title = "Simples · Canto", layers = Presets.simpleCorner(), dim = 0.1f),
+        Project(id = "style_bold_acid", title = "Ousado · Ácido", layers = Presets.boldAcid(), dim = 0.15f)
+    ) }
+
+    fun defaultStarterThemes(): List<Project> = starterThemes
 
     fun newTheme(title: String = "Novo Tema"): Project = Project(
         id = UUID.randomUUID().toString(),
         title = title,
-        layers = Presets.iosGlass().map { it.copyDeep() }
+        layers = Presets.liquidAurora().map { it.copyDeep() }
     )
 
     fun isWallpaperProcess(): Boolean = runCatching {
@@ -126,6 +215,38 @@ object ProjectStore {
     private fun activeProjectFile(ctx: Context): File = File(ipcDir(ctx), "active_project.json")
     private fun activeWidgetFile(ctx: Context): File = File(ipcDir(ctx), "active_widget.json")
     private fun carouselFile(ctx: Context): File = File(ipcDir(ctx), "carousel_state.json")
+    private fun weatherFile(ctx: Context): File = File(ipcDir(ctx), "weather.json")
+
+    fun readWeatherIpc(ctx: Context): WeatherIpcState? = synchronized(ipcLock) {
+        val f = weatherFile(ctx)
+        if (!f.exists()) return@synchronized null
+        runCatching { json.decodeFromString(WeatherIpcState.serializer(), f.readText()) }.getOrNull()
+    }
+
+    fun writeWeatherIpc(ctx: Context, state: WeatherIpcState) {
+        writeAtomicText(weatherFile(ctx), json.encodeToString(WeatherIpcState.serializer(), state))
+    }
+
+    /** Processo de UI espelha o DataStore nos arquivos IPC; o processo :wallpaper nunca abre o DataStore. */
+    suspend fun ensureIpcMirrors(ctx: Context) {
+        if (isWallpaperProcess()) return
+        val projectFile = activeProjectFile(ctx)
+        val widgetFile = activeWidgetFile(ctx)
+        val carouselFile = carouselFile(ctx)
+        if (projectFile.exists() && widgetFile.exists() && carouselFile.exists()) return
+        val prefs = ctx.applicationContext.prismStore.data.first()
+        if (!projectFile.exists()) prefs[KEY]?.let { writeAtomicText(projectFile, it) }
+        if (!widgetFile.exists()) prefs[ACTIVE_WIDGET_KEY]?.let { writeAtomicText(widgetFile, it) }
+        if (!carouselFile.exists()) {
+            val state = CarouselIpcState(
+                index = prefs[IDX] ?: 0,
+                lastSwitch = prefs[LAST_SWITCH] ?: 0L,
+                currentUri = prefs[CURRENT_URI],
+                bakeVersion = prefs[ACTIVE_BAKE_VERSION] ?: 0L
+            )
+            writeAtomicText(carouselFile, json.encodeToString(CarouselIpcState.serializer(), state))
+        }
+    }
 
     private fun writeAtomicText(file: File, text: String) {
         synchronized(ipcLock) {
@@ -161,43 +282,59 @@ object ProjectStore {
         val f = activeProjectFile(ctx)
         if (f.exists()) {
             val disk = synchronized(ipcLock) {
-                runCatching { json.decodeFromString(Project.serializer(), f.readText()) }.getOrNull()
+                runCatching { decodeProject(f.readText()) }.getOrNull()
             }
-            if (disk != null) return disk
+            if (disk != null) return applyRuntimeGlobals(ctx, disk)
         }
+        if (isWallpaperProcess()) return Project()
         val ds = ctx.applicationContext.prismStore.data.first()[KEY]
-            ?.let { runCatching { json.decodeFromString(Project.serializer(), it) }.getOrNull() }
+            ?.let { decodeProject(it) }
             ?: Project()
-        writeAtomicText(f, json.encodeToString(Project.serializer(), ds))
-        return ds
+        val merged = applyRuntimeGlobals(ctx, ds)
+        writeAtomicText(f, json.encodeToString(Project.serializer(), merged))
+        return merged
     }
 
     suspend fun save(ctx: Context, p: Project): Unit = withContext(Dispatchers.IO) {
         val s = json.encodeToString(Project.serializer(), p)
         writeAtomicText(activeProjectFile(ctx), s)
+        writeRuntimeGlobals(ctx, p)
         if (!isWallpaperProcess()) {
             ctx.applicationContext.prismStore.edit { prefs ->
                 prefs[KEY] = s
-                val curList = prefs[THEMES_KEY]
-                    ?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
-                    ?.toMutableList()
-                    ?: mutableListOf()
+                val rawList = prefs[THEMES_KEY]
+                val curList = if (rawList == null) {
+                    mutableListOf()
+                } else {
+                    val parsed = decodeProjectList(rawList)
+                    if (parsed == null) {
+                        backupCorruptedJson(ctx, "themes", rawList)
+                        return@edit
+                    }
+                    parsed.toMutableList()
+                }
                 val idx = curList.indexOfFirst { it.id == p.id }
-                if (idx >= 0) curList[idx] = p else curList.add(0, p)
+                if (idx >= 0) curList[idx] = p else curList.add(p)
                 prefs[THEMES_KEY] = json.encodeToString(listSerializer, curList)
             }
         }
     }
 
     suspend fun upsertTheme(ctx: Context, p: Project) {
+        writeRuntimeGlobals(ctx, p)
         ctx.applicationContext.prismStore.edit { prefs ->
-            val baseList = prefs[THEMES_KEY]
-                ?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
-                ?.toMutableList()
-                ?: run {
-                    val active = prefs[KEY]?.let { runCatching { json.decodeFromString(Project.serializer(), it) }.getOrNull() }
-                    if (active != null) mutableListOf(active) else defaultStarterThemes().toMutableList()
+            val rawList = prefs[THEMES_KEY]
+            val baseList = if (rawList == null) {
+                val active = prefs[KEY]?.let { decodeProject(it) }
+                if (active != null) mutableListOf(active) else defaultStarterThemes().toMutableList()
+            } else {
+                val parsed = decodeProjectList(rawList)
+                if (parsed == null) {
+                    backupCorruptedJson(ctx, "themes", rawList)
+                    return@edit
                 }
+                parsed.toMutableList()
+            }
             val idx = baseList.indexOfFirst { it.id == p.id }
             if (idx >= 0) baseList[idx] = p else baseList.add(p)
             prefs[THEMES_KEY] = json.encodeToString(listSerializer, baseList)
@@ -207,36 +344,55 @@ object ProjectStore {
     suspend fun deleteTheme(ctx: Context, themeId: String) {
         var activeProject: Project? = null
         var remainingList: List<Project> = emptyList()
+        var deletedProject: Project? = null
+        var corrupted = false
         ctx.applicationContext.prismStore.edit { prefs ->
-            val curList = prefs[THEMES_KEY]
-                ?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
-                ?: defaultStarterThemes()
+            val rawList = prefs[THEMES_KEY]
+            val curList = if (rawList == null) {
+                defaultStarterThemes()
+            } else {
+                val parsed = decodeProjectList(rawList)
+                if (parsed == null) {
+                    backupCorruptedJson(ctx, "themes", rawList)
+                    corrupted = true
+                    return@edit
+                }
+                parsed
+            }
+            deletedProject = curList.firstOrNull { it.id == themeId }
             val remaining = curList.filterNot { it.id == themeId }.ifEmpty { defaultStarterThemes().take(1) }
             remainingList = remaining
-            activeProject = prefs[KEY]?.let { runCatching { json.decodeFromString(Project.serializer(), it) }.getOrNull() }
+            activeProject = prefs[KEY]?.let { decodeProject(it) }
             prefs[THEMES_KEY] = json.encodeToString(listSerializer, remaining)
         }
+        if (corrupted) return
         val active = activeProject
         val stillInUse = (active?.folderUri?.contains(themeId) == true || active?.imageUri?.contains(themeId) == true) ||
             remainingList.any { it.folderUri?.contains(themeId) == true || it.imageUri?.contains(themeId) == true }
         if (!stillInUse) {
             runCatching { java.io.File(ctx.applicationContext.filesDir, "imported_themes/$themeId").deleteRecursively() }
         }
+        MediaImporter.collectProjectUris(deletedProject).forEach { uri ->
+            MediaImporter.deleteIfUnused(ctx, uri)
+        }
     }
 
     suspend fun index(ctx: Context): Int {
         readCarouselIpc(ctx)?.let { return it.index }
+        if (isWallpaperProcess()) return 0
         return ctx.applicationContext.prismStore.data.first()[IDX] ?: 0
     }
 
     suspend fun lastSwitch(ctx: Context): Long {
         readCarouselIpc(ctx)?.let { return it.lastSwitch }
+        if (isWallpaperProcess()) return 0L
         return ctx.applicationContext.prismStore.data.first()[LAST_SWITCH] ?: 0L
     }
 
     suspend fun currentWallpaperUri(ctx: Context): String? {
         val ipc = readCarouselIpc(ctx)
         if (ipc != null) return ipc.currentUri
+        if (isWallpaperProcess()) return null
         return ctx.applicationContext.prismStore.data.first()[CURRENT_URI]
     }
 
@@ -267,6 +423,7 @@ object ProjectStore {
 
     suspend fun bakeVersion(ctx: Context): Long {
         readCarouselIpc(ctx)?.let { if (it.bakeVersion > 0L) return it.bakeVersion }
+        if (isWallpaperProcess()) return 0L
         return ctx.applicationContext.prismStore.data.first()[ACTIVE_BAKE_VERSION] ?: 0L
     }
 
@@ -285,29 +442,16 @@ object ProjectStore {
         }
     }
 
-    fun defaultStarterWidgets(): List<Project> = listOf(
-        Project(
-            id = "widget_crystal_clock",
-            title = "Relógio Cristal Elástico",
-            layers = Presets.widgetElasticClock(),
-            isWidget = true,
-            widgetAspect = 2.0f
-        ),
-        Project(
-            id = "widget_weather_battery",
-            title = "Clima & Bateria Vidro",
-            layers = Presets.widgetWeatherBatteryCard(),
-            isWidget = true,
-            widgetAspect = 2.0f
-        ),
-        Project(
-            id = "widget_music_smart",
-            title = "Capsula Mídia Cristal",
-            layers = Presets.widgetMusicSmartCard(),
-            isWidget = true,
-            widgetAspect = 2.2f
-        )
-    )
+    private val starterWidgets: List<Project> by lazy { listOf(
+        Project(id = "style_w_clean", title = "Clean · Relógio", layers = Presets.widgetCleanClock(), isWidget = true, widgetAspect = 2.2f),
+        Project(id = "style_w_elastic", title = "Moderno · Cristal Elástico", layers = Presets.widgetElasticClock(), isWidget = true, widgetAspect = 2.0f),
+        Project(id = "style_w_cute", title = "Fofo · Energia", layers = Presets.widgetCuteBattery(), isWidget = true, widgetAspect = 2.0f),
+        Project(id = "style_w_advanced", title = "Avançado · Painel", layers = Presets.widgetAdvancedPanel(), isWidget = true, widgetAspect = 2.0f),
+        Project(id = "style_w_music", title = "Música · Cápsula", layers = Presets.widgetMusicSmartCard(), isWidget = true, widgetAspect = 2.2f),
+        Project(id = "style_w_calendar", title = "Elegante · Calendário", layers = Presets.widgetElegantCalendar(), isWidget = true, widgetAspect = 2.0f)
+    ) }
+
+    fun defaultStarterWidgets(): List<Project> = starterWidgets
 
     fun newWidget(title: String = "Prism Widget"): Project = Project(
         id = UUID.randomUUID().toString(),
@@ -321,8 +465,8 @@ object ProjectStore {
         .map { it[WIDGETS_KEY] }
         .distinctUntilChanged()
         .map { raw ->
-            val decoded = raw?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
-            if (!decoded.isNullOrEmpty()) decoded.map { it.copy(isWidget = true) } else defaultStarterWidgets()
+            val decoded = raw?.let { decodeProjectList(it) }
+            if (!decoded.isNullOrEmpty()) decoded.map { applyRuntimeGlobals(ctx, it.copy(isWidget = true)) } else defaultStarterWidgets()
         }
         .flowOn(Dispatchers.Default)
 
@@ -330,7 +474,7 @@ object ProjectStore {
         .map { it[ACTIVE_WIDGET_KEY] }
         .distinctUntilChanged()
         .map { raw ->
-            raw?.let { runCatching { json.decodeFromString(Project.serializer(), it) }.getOrNull() }?.copy(isWidget = true)
+            raw?.let { decodeProject(it) }?.copy(isWidget = true)?.let { applyRuntimeGlobals(ctx, it) }
                 ?: defaultStarterWidgets().first()
         }
         .flowOn(Dispatchers.Default)
@@ -339,30 +483,40 @@ object ProjectStore {
         val f = activeWidgetFile(ctx)
         if (f.exists()) {
             val disk = synchronized(ipcLock) {
-                runCatching { json.decodeFromString(Project.serializer(), f.readText()) }.getOrNull()?.copy(isWidget = true)
+                runCatching { decodeProject(f.readText()) }.getOrNull()?.copy(isWidget = true)
             }
-            if (disk != null) return disk
+            if (disk != null) return applyRuntimeGlobals(ctx, disk)
         }
+        if (isWallpaperProcess()) return defaultStarterWidgets().first()
         val raw = ctx.applicationContext.prismStore.data.first()[ACTIVE_WIDGET_KEY]
-        val w = raw?.let { runCatching { json.decodeFromString(Project.serializer(), it) }.getOrNull() }?.copy(isWidget = true)
+        val w = raw?.let { decodeProject(it) }?.copy(isWidget = true)
             ?: defaultStarterWidgets().first()
-        writeAtomicText(f, json.encodeToString(Project.serializer(), w))
-        return w
+        val merged = applyRuntimeGlobals(ctx, w)
+        writeAtomicText(f, json.encodeToString(Project.serializer(), merged))
+        return merged
     }
 
     suspend fun saveActiveWidget(ctx: Context, p: Project): Unit = withContext(Dispatchers.IO) {
         val clean = p.copy(isWidget = true)
         val encoded = json.encodeToString(Project.serializer(), clean)
         writeAtomicText(activeWidgetFile(ctx), encoded)
+        writeRuntimeGlobals(ctx, clean)
         if (!isWallpaperProcess()) {
             ctx.applicationContext.prismStore.edit { prefs ->
                 prefs[ACTIVE_WIDGET_KEY] = encoded
-                val curList = prefs[WIDGETS_KEY]
-                    ?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
-                    ?.toMutableList()
-                    ?: defaultStarterWidgets().toMutableList()
+                val rawList = prefs[WIDGETS_KEY]
+                val curList = if (rawList == null) {
+                    defaultStarterWidgets().toMutableList()
+                } else {
+                    val parsed = decodeProjectList(rawList)
+                    if (parsed == null) {
+                        backupCorruptedJson(ctx, "widgets", rawList)
+                        return@edit
+                    }
+                    parsed.toMutableList()
+                }
                 val idx = curList.indexOfFirst { it.id == clean.id }
-                if (idx >= 0) curList[idx] = clean else curList.add(0, clean)
+                if (idx >= 0) curList[idx] = clean else curList.add(clean)
                 prefs[WIDGETS_KEY] = json.encodeToString(listSerializer, curList)
             }
         }
@@ -370,21 +524,29 @@ object ProjectStore {
 
     suspend fun upsertWidget(ctx: Context, p: Project): Unit = withContext(Dispatchers.IO) {
         val clean = p.copy(isWidget = true)
+        writeRuntimeGlobals(ctx, clean)
         if (isWallpaperProcess()) {
             saveActiveWidget(ctx, clean)
             return@withContext
         }
         var shouldWriteActiveIpc = false
         ctx.applicationContext.prismStore.edit { prefs ->
-            val baseList = prefs[WIDGETS_KEY]
-                ?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
-                ?.toMutableList()
-                ?: defaultStarterWidgets().toMutableList()
+            val rawList = prefs[WIDGETS_KEY]
+            val baseList = if (rawList == null) {
+                defaultStarterWidgets().toMutableList()
+            } else {
+                val parsed = decodeProjectList(rawList)
+                if (parsed == null) {
+                    backupCorruptedJson(ctx, "widgets", rawList)
+                    return@edit
+                }
+                parsed.toMutableList()
+            }
             val idx = baseList.indexOfFirst { it.id == clean.id }
             if (idx >= 0) baseList[idx] = clean else baseList.add(clean)
             prefs[WIDGETS_KEY] = json.encodeToString(listSerializer, baseList)
             val activeRaw = prefs[ACTIVE_WIDGET_KEY]
-            val active = activeRaw?.let { runCatching { json.decodeFromString(Project.serializer(), it) }.getOrNull() }
+            val active = activeRaw?.let { decodeProject(it) }
             if (active?.id == clean.id) {
                 prefs[ACTIVE_WIDGET_KEY] = json.encodeToString(Project.serializer(), clean)
                 shouldWriteActiveIpc = true
@@ -396,12 +558,37 @@ object ProjectStore {
     }
 
     suspend fun deleteWidget(ctx: Context, widgetId: String) {
+        var deletedProject: Project? = null
+        var replacementActive: Project? = null
+        var corrupted = false
         ctx.applicationContext.prismStore.edit { prefs ->
-            val curList = prefs[WIDGETS_KEY]
-                ?.let { runCatching { json.decodeFromString(listSerializer, it) }.getOrNull() }
-                ?: defaultStarterWidgets()
+            val rawList = prefs[WIDGETS_KEY]
+            val curList = if (rawList == null) {
+                defaultStarterWidgets()
+            } else {
+                val parsed = decodeProjectList(rawList)
+                if (parsed == null) {
+                    backupCorruptedJson(ctx, "widgets", rawList)
+                    corrupted = true
+                    return@edit
+                }
+                parsed
+            }
+            deletedProject = curList.firstOrNull { it.id == widgetId }
             val remaining = curList.filterNot { it.id == widgetId }.ifEmpty { defaultStarterWidgets().take(1) }
             prefs[WIDGETS_KEY] = json.encodeToString(listSerializer, remaining)
+            val activeId = prefs[ACTIVE_WIDGET_KEY]?.let { decodeProject(it) }?.id
+            if (activeId == widgetId) {
+                replacementActive = remaining.first()
+            }
+        }
+        if (corrupted) return
+        replacementActive?.let { nextActive ->
+            saveActiveWidget(ctx, nextActive)
+            com.example.prismlock.widget.PrismWidgetProvider.updateAll(ctx)
+        }
+        MediaImporter.collectProjectUris(deletedProject).forEach { uri ->
+            MediaImporter.deleteIfUnused(ctx, uri)
         }
     }
 
@@ -419,6 +606,14 @@ object ProjectStore {
 
     suspend fun setBatteryPromptDismissed(ctx: Context, dismissed: Boolean) {
         ctx.applicationContext.prismStore.edit { it[BATTERY_PROMPT_DISMISSED_KEY] = dismissed }
+    }
+
+    fun hubGridModeFlow(ctx: Context): Flow<Boolean> = ctx.applicationContext.prismStore.data
+        .map { it[HUB_GRID_MODE_KEY] ?: false }
+        .distinctUntilChanged()
+
+    suspend fun setHubGridMode(ctx: Context, grid: Boolean) {
+        ctx.applicationContext.prismStore.edit { it[HUB_GRID_MODE_KEY] = grid }
     }
 }
 
@@ -441,13 +636,6 @@ data class Env(
 object EnvProvider {
     private val _env = MutableStateFlow(Env())
     val env: StateFlow<Env> = _env
-    private val W_TEMP = floatPreferencesKey("w_temp")
-    private val W_CODE = intPreferencesKey("w_code")
-    private val W_DAY = intPreferencesKey("w_day")
-    private val W_TIME = longPreferencesKey("w_time")
-    private val W_KEY = stringPreferencesKey("w_key")
-    private val W_CITY = stringPreferencesKey("w_city")
-
     fun update(f: (Env) -> Env) { _env.value = f(_env.value) }
 
     fun refreshBattery(ctx: Context): Boolean {
@@ -511,13 +699,16 @@ object EnvProvider {
         }.getOrNull()
     }
 
-    suspend fun refreshWeather(ctx: Context, lat: Double, lon: Double, city: String, force: Boolean = false): Boolean = withContext(Dispatchers.IO) {
-        val store = ctx.applicationContext.prismStore
-        val prefs = store.data.first()
+    suspend fun refreshWeather(ctx: Context, lat: Double?, lon: Double?, city: String, force: Boolean = false): Boolean = withContext(Dispatchers.IO) {
+        if (lat == null || lon == null) {
+            update { it.copy(temp = null, city = city) }
+            return@withContext false
+        }
+        val cached = ProjectStore.readWeatherIpc(ctx.applicationContext)
         val key = "%.2f,%.2f".format(lat, lon)
-        val fresh = prefs[W_KEY] == key && System.currentTimeMillis() - (prefs[W_TIME] ?: 0L) < 3_600_000L
+        val fresh = cached != null && cached.key == key && System.currentTimeMillis() - cached.time < 3_600_000L
         if (fresh && !force) {
-            update { it.copy(temp = prefs[W_TEMP]?.toInt(), weatherCode = prefs[W_CODE] ?: 0, isDay = (prefs[W_DAY] ?: 1) == 1, city = city.ifBlank { prefs[W_CITY] ?: "" }) }
+            update { it.copy(temp = cached?.temp?.toInt(), weatherCode = cached?.code ?: 0, isDay = (cached?.day ?: 1) == 1, city = city.ifBlank { cached?.city ?: "" }) }
             return@withContext false
         }
         runCatching {
@@ -526,11 +717,22 @@ object EnvProvider {
             val t = cur["temperature_2m"]!!.jsonPrimitive.double.toFloat()
             val code = cur["weather_code"]!!.jsonPrimitive.int
             val day = cur["is_day"]?.jsonPrimitive?.int ?: 1
-            store.edit { it[W_TEMP] = t; it[W_CODE] = code; it[W_DAY] = day; it[W_TIME] = System.currentTimeMillis(); it[W_KEY] = key; it[W_CITY] = city }
+            ProjectStore.writeWeatherIpc(
+                ctx.applicationContext,
+                WeatherIpcState(key = key, time = System.currentTimeMillis(), temp = t, code = code, day = day, city = city)
+            )
             update { it.copy(temp = Math.round(t), weatherCode = code, isDay = day == 1, city = city) }
             true
         }.getOrDefault(false)
     }
 }
 
-fun CoroutineScope.launchSafe(block: suspend CoroutineScope.() -> Unit) = launch { runCatching { block() } }
+fun CoroutineScope.launchSafe(block: suspend CoroutineScope.() -> Unit) = launch {
+    try {
+        block()
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e
+    } catch (e: Throwable) {
+        android.util.Log.w("PrismLaunchSafe", "coroutine failed", e)
+    }
+}

@@ -39,8 +39,6 @@ data class FormulaSnippet(
  * e retrocompatibilidade total com Dynamic ({HH}, {mm}, {=expr}).
  */
 object KustomFormulaEngine {
-    private val fmtCache = HashMap<String, DateTimeFormatter?>()
-
     val categories: List<FormulaCategory> = listOf(
         FormulaCategory(
             id = "datetime",
@@ -121,6 +119,8 @@ object KustomFormulaEngine {
 
     fun hasSecondsToken(text: String): Boolean =
         "{ss}" in text || ("\$df(" in text && "ss" in text) || ("\$tf(" in text && "\"S\"" in text)
+
+    private val gvRecursionDepth = ThreadLocal.withInitial { 0 }
 
     fun evalDollarBlocks(
         text: String,
@@ -561,9 +561,7 @@ object KustomFormulaEngine {
             if (pattern == "f" || pattern == "S") {
                 return KVal.ofNum(now.atZone(java.time.ZoneId.systemDefault()).toEpochSecond().toDouble())
             }
-            val fmt = fmtCache.getOrPut(pattern) {
-                runCatching { DateTimeFormatter.ofPattern(pattern, Locale.getDefault()) }.getOrNull()
-            }
+            val fmt = Dynamic.cachedFormatter(pattern)
             val formatted = fmt?.let { runCatching { it.format(now) }.getOrNull() } ?: pattern
             return KVal.ofText(formatted)
         }
@@ -671,8 +669,15 @@ object KustomFormulaEngine {
         private fun evalGv(args: List<KVal>): KVal {
             val key = args.getOrNull(0)?.text?.trim()?.lowercase().orEmpty()
             val fallback = args.getOrNull(1)?.text ?: ""
-            val value = if (key.isEmpty()) fallback else (globals[key] ?: fallback)
-            return KVal.ofText(value)
+            val raw = if (key.isEmpty()) fallback else (globals[key] ?: fallback)
+            val depth = gvRecursionDepth.get() ?: 0
+            if (depth >= 4 || '$' !in raw) return KVal.ofText(raw)
+            gvRecursionDepth.set(depth + 1)
+            return try {
+                KVal.ofText(evalDollarBlocks(raw, env, now, globals))
+            } finally {
+                gvRecursionDepth.set(depth)
+            }
         }
 
         private fun evalCe(args: List<KVal>): KVal {

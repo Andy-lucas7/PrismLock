@@ -44,6 +44,8 @@ Guia prático e referência completa de interface, ferramentas, motor gráfico, 
    - [7.17 Lista Completa dos 58 Ícones Vetoriais Nativos](#717-lista-completa-dos-58-ícones-vetoriais-nativos)
 8. [Exportação e Importação Portátil (`.prism` e `.widget.prism`)](#8-exportação-e-importação-portátil-prism-e-widgetprism)
 9. [Tutoriais Passo a Passo (Receitas Práticas)](#9-tutoriais-passo-a-passo-receitas-práticas)
+10. [Modelos Prontos por Estilo](#10-modelos-prontos-por-estilo)
+11. [Desempenho, Memória e Bateria](#11-desempenho-memória-e-bateria)
 
 ---
 
@@ -52,9 +54,9 @@ Guia prático e referência completa de interface, ferramentas, motor gráfico, 
 O **PrismLock** reúne em um único aplicativo dois modos de personalização gráfica em **120Hz**:
 
 - **Telas de Bloqueio & Live Wallpaper (estilo KLWP):** cria telas animadas em tela cheia com recorte 3D automático de sujeito, vídeos em segundo plano, ações de toque na Tela Inicial e cristal líquido refratando em tempo real.
-- **Widgets Independentes (estilo KWGT):** cria widgets em proporções dedicadas (`2×2`, `4×2`, `4×1.8`, `4×1`) que podem ser fixados diretamente na Tela Inicial ou no LockStar, utilizando o papel de parede ativo ou uma foto de referência para calcular refração e desfoque reais sem consumo em repouso.
+- **Widgets Independentes (estilo KWGT):** cria widgets em proporções dedicadas (`2×2`, `4×2`, `4×1.8`, `4×1`) que podem ser fixados diretamente na Tela Inicial ou no LockStar, utilizando uma foto de referência própria do widget para calcular refração e desfoque reais sem consumo em repouso. Sem foto própria, o vidro refrata um fundo neutro grafite (o wallpaper do launcher não pode ser lido, e a foto da tela de bloqueio não é o que fica atrás do widget).
 
-O serviço de papel de parede e o provedor de widgets rodam isolados no processo `:wallpaper`, mantendo o frame ativo pronto em memória (`RGB_565`) para despertar instantâneo e 0% de uso em repouso.
+O serviço de papel de parede e o provedor de widgets rodam isolados no processo `:wallpaper`. Com o aparelho bloqueado, só o quadro final pronto (`RGB_565`, ~5 MB) fica em memória para despertar instantâneo; todo o resto é liberado (ver [Seção 11](#11-desempenho-memória-e-bateria)).
 
 ---
 
@@ -66,6 +68,7 @@ Exibida na primeira abertura do aplicativo (ou sempre que tocar no botão `✦` 
 
 - Apresenta a coreografia prismática e os destaques do motor (*Liquid Crystal · Elastic Engine · Optical 3D Depth*).
 - Toque no botão branco central para abrir o portal radial de entrada rumo ao Carrossel Principal.
+- Durante a apresentação, toques e arrastos fora do botão são absorvidos pela própria Hero Page — não chegam ao card do Carrossel por baixo (que abriria o Estúdio).
 
 ### 2.2 Carrossel Principal (Theme Hub)
 
@@ -548,3 +551,57 @@ Chaves utilizáveis no campo `icon` ou retornadas por fórmulas `$if(...)$` em `
 4. Personalize suas camadas de texto elástico, barras de bateria ou cristal óptico (dica: experimente `Modelos Prontos` em **Camadas**).
 5. Para fixar na Tela Inicial: abra **`⋮`** no topo direito e toque em **`Aplicar & Fixar Widget`** (ou toque no ícone de pino `📌` no Carrossel).
 6. Para compartilhar ou fazer backup: abra **`⋮`** → **`Exportar Pacote (.prism)`**; o arquivo será salvo como `<nome>.widget.prism` com todas as fontes, proporção, ativos e configurações preservados.
+
+---
+
+## 10. Modelos Prontos por Estilo
+
+Os modelos embarcados (Carrossel na primeira abertura e botão **`Modelos Prontos`** na aba **Camadas**) são organizados por estilo, cada um com foco e público próprios. Nenhum usa nome de marca.
+
+### Telas de Bloqueio
+
+| Modelo | Visual | Para quem |
+| :--- | :--- | :--- |
+| **Moderno · Profundidade** | Bebas Neue gigante em tom areia, sujeito 3D da foto à frente do relógio | Fotos de pessoas, pets e objetos |
+| **Clean · Névoa** | Inter fina centralizada, muito respiro, sem efeitos | Minimalistas; a foto em destaque |
+| **Fofo · Pêssego** | Plus Jakarta arredondada em degradê pêssego→rosa, chip com coração e brilho, pílula pastel de bateria | Estética soft / cute |
+| **Vidro · Aurora** | Relógio alto em Cristal Óptico elástico + recorte 3D | Quem quer o efeito de refração |
+| **Elegante · Editorial** | Playfair Display em creme, regra fina, caixa-alta espaçada | Estética editorial, paisagens e moda |
+| **Avançado · Terminal** | JetBrains Mono sobre vidro escuro com barras de bateria e progresso do dia, clima e alarme | Power users / dados |
+| **Simples · Canto** | Relógio discreto no canto inferior | Quem quer a foto inteira visível |
+| **Ousado · Ácido** | Syne pesada em degradê lima↔violeta | Estética Y2K / streetwear |
+
+### Widgets
+
+| Modelo | Visual |
+| :--- | :--- |
+| **Clean · Relógio** | Pílula de vidro fosco claro com hora fina e data |
+| **Moderno · Cristal Elástico** | Relógio esticado em cristal óptico sobre placa de vidro |
+| **Fofo · Energia** | Cartão pastel com anel de bateria rosa (verde ao carregar) |
+| **Avançado · Painel** | Monoespaçada com bateria, dia, clima e alarme em barras |
+| **Música · Cápsula** | Toque para tocar/pausar; ícone acompanha o estado da mídia |
+| **Elegante · Calendário** | Dia em serifada grande, semana e mês; toque abre o Alarme |
+
+> Cópias salvas de modelos de versões anteriores que ainda têm o título original recebem o novo visual automaticamente (id, fotos, pasta e ajustes preservados). Temas criados ou renomeados pelo usuário nunca são alterados.
+
+---
+
+## 11. Desempenho, Memória e Bateria
+
+Medições em um Galaxy QHD+ (Android 16 / One UI), app release:
+
+| Cenário | Antes | Agora |
+| :--- | :--- | :--- |
+| Processo `:wallpaper` com tela apagada ou desbloqueado em outro app | 373 MB PSS | ~56 MB PSS (≈20 MB sem cena carregada) |
+| App aberto no Hub | 353 MB PSS | 97 MB PSS |
+| CPU no Hub / em segundo plano | ~185% contínuo | 0% em repouso (0 quadros desenhados parado) |
+
+**Como isso é feito**
+
+- **Apresentação própria (`HardwareRenderer`)**: o wallpaper desenha num `RenderNode` próprio em vez de `lockHardwareCanvas`. O renderizador é parado 1,5 s após o último quadro e destruído quando o wallpaper não está visível; o HWUI então libera contexto de GPU, cache Skia e render targets. O último quadro continua na tela (o SurfaceFlinger mantém o buffer).
+- **Hibernação**: 3 s depois de ficar invisível ou de apagar a tela, o processo `:wallpaper` libera foto, fundo fosco, máscara 3D, caches de forma/fonte e renderizadores. Com o aparelho bloqueado mantém apenas o quadro final (`RGB_565`, ~5 MB) para acender sem atraso; desbloqueado em outro app não mantém nada. Qualquer remontagem (acender, virada de minuto) recarrega a foto a partir do bake em disco.
+- **Zero trabalho com tela apagada**: ticks de minuto, sensores, vídeo e animações só rodam com o wallpaper visível.
+- **Hub sem loop de recomposição**: os `Flow` do DataStore são criados uma vez (`remember`) e coletados com `collectAsStateWithLifecycle` (nada é coletado com o app parado); os modelos padrão são memoizados. As prévias dos cards são guardadas em disco (WebP) com chave = projeto + imagem exibida (uri, data e tamanho do arquivo) + dia, e invalidadas quando o carrossel avança.
+- **Widgets**: cada atualização carrega a imagem de referência sem cache, recicla após o render e libera o renderizador; sem imagem própria usa fundo neutro.
+- **Release com R8**: `optimization { enable = true }` + `app/proguard-rules.pro` com keep rules do ML Kit (sem elas o primeiro `InputImage.fromBitmap()` falhava). Falhas de segmentação 3D degradam para "sem máscara" em vez de fechar o app.
+- **Sem telemetria em segundo plano**: o `TransportBackendDiscovery` (datatransport do ML Kit) é removido no manifest; o `DefaultScheduler` descarta os eventos sem persistir nem agendar job, então o app nunca é acordado para enviar logs.

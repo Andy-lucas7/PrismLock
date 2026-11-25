@@ -23,6 +23,7 @@ import com.example.prismlock.model.flatten
 import com.example.prismlock.wallpaper.SubjectDepthEngine
 import com.example.prismlock.wallpaper.WallpaperCarousel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
@@ -84,7 +85,13 @@ class BakedNodeLensAtlas(
 
 object GlyphAtlasBaker {
     private const val ATLAS_CHARS = "0123456789:"
-    private val lensAtlasCache = ConcurrentHashMap<String, BakedNodeLensAtlas>()
+    private const val MAX_LENS_ATLASES = 6
+    private val lensAtlasCache: MutableMap<String, BakedNodeLensAtlas> = java.util.Collections.synchronizedMap(
+        object : LinkedHashMap<String, BakedNodeLensAtlas>(8, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, BakedNodeLensAtlas>?): Boolean =
+                size > MAX_LENS_ATLASES
+        }
+    )
     private val nodeLookup = ConcurrentHashMap<String, LayerNode>()
 
     fun registerNode(node: LayerNode) {
@@ -94,11 +101,7 @@ object GlyphAtlasBaker {
     fun getRegisteredNode(nodeId: String): LayerNode? = nodeLookup[nodeId]
 
     fun clearCache() {
-        lensAtlasCache.values.forEach { atlas ->
-            atlas.glyphs.values.forEach { runCatching { it.bitmap.recycle() } }
-        }
         lensAtlasCache.clear()
-        nodeLookup.clear()
     }
 
     fun lensAtlasKey(node: LayerNode, u: Float, bevelPx: Float, strokePx: Float): String =
@@ -168,9 +171,6 @@ object GlyphAtlasBaker {
             )
         }
 
-        if (lensAtlasCache.size >= 2) {
-            clearCache()
-        }
         lensAtlasCache[lKey] = BakedNodeLensAtlas(
             key = lKey,
             glyphs = glyphLensMap,
@@ -249,7 +249,6 @@ object GlyphAtlasBaker {
 object WallpaperBaker {
     const val ACTION_BAKED_READY = "com.example.prismlock.ACTION_BAKED_READY"
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
-    private val memAssetsCache = ConcurrentHashMap<String, BakedWallAssets>()
 
     fun bakedDir(ctx: Context): File =
         File(ctx.applicationContext.filesDir, "baked_cache").apply { mkdirs() }
@@ -315,7 +314,6 @@ object WallpaperBaker {
     }
 
     fun clearMemoryCache() {
-        memAssetsCache.clear()
         GlyphAtlasBaker.clearCache()
         SubjectDepthEngine.releaseMemory()
         WallpaperCarousel.clearMemoryCache()
@@ -401,10 +399,12 @@ object WallpaperBaker {
         val u = baseW / 1080f
         val blurPx = resolvePrimaryBlurPx(project, u)
         val bakeVersion = System.currentTimeMillis()
+        isBakeRunning = true
+        var published = false
+        try {
 
-        onProgress(0.05f, "Limpando cache anterior...")
+        onProgress(0.05f, "Limpando cache em memória...")
         clearMemoryCache()
-        bakedDir(ctx).listFiles()?.forEach { old -> runCatching { old.deleteRecursively() } }
 
         onProgress(0.10f, "Compilando Atlas de Glifos e Lentes...")
         val allNodes = project.layers.flatten().map { it.first }
@@ -418,8 +418,9 @@ object WallpaperBaker {
             }
         }
 
+        val bakeRenderer = LiquidGlassRenderer().apply { attachContext(ctx) }
         val uris = if (project.folderUri != null) {
-            WallpaperCarousel.listImages(ctx, project.folderUri).map { it.toString() }
+            WallpaperCarousel.listImages(ctx, project.folderUri).take(50).map { it.toString() }
         } else {
             listOfNotNull(project.imageUri)
         }
@@ -444,7 +445,7 @@ object WallpaperBaker {
 
                     if (wantDepth) {
                         onProgress(baseRatio + (0.18f / total), "Recortando sujeito 3D ${index + 1}/$total...")
-                        val rawMask = SubjectDepthEngine.getOrCreateMask(ctx, uriStr, exactSharp)
+                        val rawMask = SubjectDepthEngine.getOrCreateMask(ctx, uriStr, exactSharp, closeAfter = false)
                         if (rawMask != null) {
                             val croppedMask = centerCropAlpha(rawMask, baseW, baseH)
                             val processedMask = if (project.hasDepthPostProcessing()) {
@@ -453,7 +454,7 @@ object WallpaperBaker {
                                     baseSharp = exactSharp,
                                     depthMask = croppedMask,
                                     project = project,
-                                    blurFn = { src, r -> renderer.bakeBlurredBitmap(src, baseW, baseH, r) }
+                                    blurFn = { src, r -> bakeRenderer.bakeBlurredBitmap(src, baseW, baseH, r) }
                                 )
                                 SubjectDepthEngine.applySubjectColorPopMask(croppedMask, project)
                             } else {
@@ -473,7 +474,7 @@ object WallpaperBaker {
                     }
 
                     onProgress(baseRatio + (0.55f / total), "Pré-renderizando vidro jateado ${index + 1}/$total...")
-                    val frostedBmp = renderer.bakeBlurredBitmap(finalSharp, baseW, baseH, blurPx)
+                    val frostedBmp = bakeRenderer.bakeBlurredBitmap(finalSharp, baseW, baseH, blurPx)
                     FileOutputStream(frostedFile(ctx, bakeVersion, id)).use { out ->
                         frostedBmp.compress(Bitmap.CompressFormat.WEBP_LOSSY, 94, out)
                         out.flush()
@@ -486,7 +487,7 @@ object WallpaperBaker {
                 }
             }
         } finally {
-            renderer.releaseOffscreenResources()
+            bakeRenderer.release()
             SubjectDepthEngine.releaseMemory()
             WallpaperCarousel.clearMemoryCache()
         }
@@ -499,9 +500,15 @@ object WallpaperBaker {
             blurPx = blurPx,
             entries = entries
         )
-        FileOutputStream(manifestFile(ctx)).use { out ->
+        val manifestTmp = File(bakedDir(ctx), "manifest.json.tmp")
+        FileOutputStream(manifestTmp).use { out ->
             out.write(json.encodeToString(BakedManifest.serializer(), manifest).toByteArray(Charsets.UTF_8))
             out.flush()
+            runCatching { out.fd.sync() }
+        }
+        if (!manifestTmp.renameTo(manifestFile(ctx))) {
+            manifestFile(ctx).writeBytes(manifestTmp.readBytes())
+            manifestTmp.delete()
         }
 
         if (entries.isNotEmpty()) {
@@ -514,6 +521,8 @@ object WallpaperBaker {
 
         // Atomic version publish ONLY after all baked files are flushed & closed
         ProjectStore.setBakeVersion(ctx, bakeVersion)
+        published = true
+        purgeOtherVersions(ctx, bakeVersion)
 
         val elapsed = System.currentTimeMillis() - startMs
         if (elapsed < 900L) {
@@ -522,6 +531,30 @@ object WallpaperBaker {
         }
         onProgress(1.0f, "Pacote nativo pronto!")
         manifest
+        } finally {
+            if (!published) {
+                withContext(NonCancellable) { deleteVersionFiles(ctx, bakeVersion) }
+            }
+            isBakeRunning = false
+        }
+    }
+
+    @Volatile
+    var isBakeRunning = false
+        private set
+
+    private fun deleteVersionFiles(ctx: Context, version: Long) {
+        val prefix = "bake_v${version}_"
+        bakedDir(ctx).listFiles()?.forEach { f ->
+            if (f.name.startsWith(prefix) || f.name == "manifest.json.tmp") runCatching { f.deleteRecursively() }
+        }
+    }
+
+    private fun purgeOtherVersions(ctx: Context, keepVersion: Long) {
+        val keepPrefix = "bake_v${keepVersion}_"
+        bakedDir(ctx).listFiles()?.forEach { f ->
+            if (f.name != "manifest.json" && !f.name.startsWith(keepPrefix)) runCatching { f.deleteRecursively() }
+        }
     }
 
     fun centerCropOpaque(src: Bitmap, w: Int, h: Int): Bitmap {

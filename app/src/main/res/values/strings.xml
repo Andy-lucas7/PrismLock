@@ -1,4 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">PrismLock</string>
     <string name="wallpaper_desc">Motor de tela de bloqueio em camadas com vidro líquido e profundidade 3D</string>
+    <string name="widget_desc">Widget modular em vidro óptico com fórmulas dinâmicas e atalhos</string>
 </resources>

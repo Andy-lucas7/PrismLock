@@ -1,6 +1,7 @@
 package com.example.prismlock.ui
 
 import android.graphics.RuntimeShader
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -33,6 +34,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -190,37 +192,67 @@ private fun smoothPhase(t: Float, start: Float, end: Float): Float {
 }
 
 @Composable
+private fun HeroBeamBackground(
+    beamShader: RuntimeShader,
+    t: () -> Float,
+    sweepProg: () -> Float,
+    reducedMotion: Boolean
+) {
+    // State objects only: values are read in the draw phase, so the spin redraws without recomposing.
+    val ambientAngle: State<Float>? = if (reducedMotion) {
+        null
+    } else {
+        val ambientTransition = rememberInfiniteTransition(label = "HeroAmbientSpotlights")
+        ambientTransition.animateFloat(
+            initialValue = 0f,
+            targetValue = 6.2831855f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 9000, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "AmbientSpotlightAngle"
+        )
+    }
+    Canvas(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+    ) {
+        val w = size.width.coerceAtLeast(1f)
+        val h = size.height.coerceAtLeast(1f)
+        beamShader.setFloatUniform("uResolution", w, h)
+        beamShader.setFloatUniform("uConvergeTarget", w * 0.5f, h * 0.42f)
+        beamShader.setFloatUniform("uTitleCenter", w * 0.5f, lerp(h * 0.42f, h * 0.28f, sweepProg()))
+        beamShader.setFloatUniform("uTime", t())
+        beamShader.setFloatUniform("uAmbientAngle", ambientAngle?.value ?: 0f)
+        drawRect(brush = ShaderBrush(beamShader))
+    }
+}
+
+@Composable
 fun PrismHeroScreen(
+    allowReducedMotionSkip: Boolean = true,
+    onIntroSettled: () -> Unit = {},
     onEnterComplete: () -> Unit
 ) {
     val ctx = LocalContext.current
     val density = LocalDensity.current
     val scope = rememberCoroutineScope()
     val textMeasurer = rememberTextMeasurer()
+    val reducedMotion = remember(ctx) { PrismMotion.isReducedMotionEnabled(ctx) }
 
     val timeline = remember { Animatable(0f) }
     val revealProgress = remember { Animatable(0f) }
     var isEntering by remember { mutableStateOf(false) }
+    var introSettledNotified by remember { mutableStateOf(false) }
     var heroOriginInRoot by remember { mutableStateOf(Offset.Zero) }
     var buttonCenterInRoot by remember { mutableStateOf(Offset.Unspecified) }
-
-    val ambientTransition = rememberInfiniteTransition(label = "HeroAmbientSpotlights")
-    val ambientAngle by ambientTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 6.2831855f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 9000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "AmbientSpotlightAngle"
-    )
 
     val phrases = remember { listOf("LIQUID CRYSTAL", "ELASTIC ENGINE", "WIDGET STUDIO") }
     var phraseIndex by remember { mutableIntStateOf(0) }
 
     val beamShader = remember { RuntimeShader(HERO_BEAM_AGSL) }
     val portalShader = remember { RuntimeShader(PORTAL_MASK_AGSL) }
-    val portalBrush = remember(portalShader) { ShaderBrush(portalShader) }
 
     val brandFamily = remember {
         FontManager.init(ctx)
@@ -252,12 +284,26 @@ fun PrismHeroScreen(
         } else pW
     }
 
-    // Linha do tempo linear de 5.2s para transições lentas e sem apressar o fade das letras
+    // Linha do tempo linear de 5.2s (PrismMotion.Duration.INTRO); pula sob reduzir movimento
     LaunchedEffect(Unit) {
+        if (allowReducedMotionSkip && reducedMotion) {
+            onIntroSettled()
+            onEnterComplete()
+            return@LaunchedEffect
+        }
         timeline.animateTo(
             targetValue = 1f,
-            animationSpec = tween(durationMillis = 5200, easing = LinearEasing)
-        )
+            animationSpec = tween(durationMillis = PrismMotion.Duration.INTRO, easing = LinearEasing)
+        ) {
+            if (!introSettledNotified && value >= 0.82f) {
+                introSettledNotified = true
+                onIntroSettled()
+            }
+        }
+        if (!introSettledNotified) {
+            introSettledNotified = true
+            onIntroSettled()
+        }
     }
 
     val t = timeline.value
@@ -278,6 +324,14 @@ fun PrismHeroScreen(
     fun launchPortal() {
         if (isEntering) return
         isEntering = true
+        if (!introSettledNotified) {
+            introSettledNotified = true
+            onIntroSettled()
+        }
+        if (reducedMotion) {
+            onEnterComplete()
+            return
+        }
         var completed = false
         scope.launch {
             revealProgress.animateTo(
@@ -296,11 +350,27 @@ fun PrismHeroScreen(
         }
     }
 
+    val needsPortalOffscreen = isEntering || revealProgress.value > 0.001f
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
             .onGloballyPositioned { coords -> heroOriginInRoot = coords.positionInRoot() }
-            .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+            // The intro overlays the Hub. Without a full-screen pointer target, taps/swipes during the
+            // intro (or on the CTA before it is enabled) fell through to the centered carousel card,
+            // whose tap / swipe-up opens the Studio. Being the hit target blocks the Hub; the CTA child
+            // still receives its own events.
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) awaitPointerEvent()
+                }
+            }
+            .graphicsLayer {
+                compositingStrategy = if (needsPortalOffscreen) {
+                    CompositingStrategy.Offscreen
+                } else {
+                    CompositingStrategy.Auto
+                }
+            }
             .drawWithContent {
                 drawContent()
                 val rp = revealProgress.value
@@ -316,7 +386,7 @@ fun PrismHeroScreen(
                     portalShader.setFloatUniform("uCenter", center.x, center.y)
                     portalShader.setFloatUniform("uRadius", currentRadius)
                     portalShader.setFloatUniform("uFeather", featherWidth)
-                    drawRect(brush = portalBrush, blendMode = BlendMode.DstIn)
+                    drawRect(brush = ShaderBrush(portalShader), blendMode = BlendMode.DstIn)
                 }
             }
     ) {
@@ -327,21 +397,13 @@ fun PrismHeroScreen(
         val titleCenterY = lerp(screenH * 0.42f, screenH * 0.28f, sweepProg)
         val brandTopY = titleCenterY - fullH * 0.5f
 
-        // Pure #000000 backdrop + holofotes desfocados convergindo e girando atrás do título
-        Canvas(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Color.Black)
-        ) {
-            val w = size.width.coerceAtLeast(1f)
-            val h = size.height.coerceAtLeast(1f)
-            beamShader.setFloatUniform("uResolution", w, h)
-            beamShader.setFloatUniform("uConvergeTarget", w * 0.5f, h * 0.42f)
-            beamShader.setFloatUniform("uTitleCenter", w * 0.5f, lerp(h * 0.42f, h * 0.28f, sweepProg))
-            beamShader.setFloatUniform("uTime", t)
-            beamShader.setFloatUniform("uAmbientAngle", ambientAngle)
-            drawRect(brush = ShaderBrush(beamShader))
-        }
+        // Pure #000000 backdrop + holofotes desfocados em composable isolado (ambientAngle não recompõe textos)
+        HeroBeamBackground(
+            beamShader = beamShader,
+            t = { timeline.value },
+            sweepProg = { smoothPhase(timeline.value, 0.38f, 0.80f) },
+            reducedMotion = reducedMotion
+        )
 
         // Exact centered coordinates calculated from TextMeasurer width
         val finalWordLeft = (screenW - fullW) * 0.5f
@@ -474,6 +536,7 @@ fun PrismHeroScreen(
         }
 
         // Modern pure white CTA button appearing below (0.75f .. 1.00f)
+        val ctaInteraction = remember { MutableInteractionSource() }
         Box(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -495,7 +558,7 @@ fun PrismHeroScreen(
                 .background(Color.White)
                 .clickable(
                     enabled = btnProg > 0.35f && !isEntering,
-                    interactionSource = remember { MutableInteractionSource() },
+                    interactionSource = ctaInteraction,
                     indication = null,
                     onClick = ::launchPortal
                 )

@@ -352,7 +352,12 @@ class VideoWallpaperRenderer(
         val mp = MediaPlayer()
         mediaPlayer = mp
         runCatching {
-            mp.setDataSource(context, Uri.parse(uriStr))
+            val parsedUri = Uri.parse(uriStr)
+            if (parsedUri.scheme == "file" && !parsedUri.path.isNullOrBlank()) {
+                mp.setDataSource(parsedUri.path)
+            } else {
+                mp.setDataSource(context, parsedUri)
+            }
             mp.setSurface(surf)
             mp.isLooping = true
             mp.setVolume(0f, 0f)

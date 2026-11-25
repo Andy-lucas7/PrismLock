@@ -18,6 +18,7 @@ import android.graphics.PixelFormat
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 import android.graphics.RadialGradient
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.RenderEffect
 import android.graphics.RenderNode
@@ -49,6 +50,8 @@ import java.time.LocalDateTime
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.roundToInt
@@ -158,76 +161,209 @@ class LiquidGlassRenderer {
         """
     }
 
-    private val blurShader = RuntimeShader(BLUR_AGSL)
-    private val crystalShader = RuntimeShader(CRYSTAL_AGSL)
+    private class Workspace {
+        // Compilação AGSL só quando um preenchimento Blur/Cristal for realmente desenhado nesta thread.
+        val blurShader by lazy(LazyThreadSafetyMode.NONE) { RuntimeShader(BLUR_AGSL) }
+        val crystalShader by lazy(LazyThreadSafetyMode.NONE) { RuntimeShader(CRYSTAL_AGSL) }
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        val filterPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
+            isFilterBitmap = true
+        }
+        val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+        }
+        val glassPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeJoin = Paint.Join.ROUND
+            strokeCap = Paint.Cap.ROUND
+        }
+        val rimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeJoin = Paint.Join.ROUND
+            strokeCap = Paint.Cap.ROUND
+            pathEffect = CornerPathEffect(4f)
+        }
+        val dimPaint = Paint()
+        val maskPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.FILL
+        }
+        val maskCutPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
+        }
+        val layerPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        val dstRectF = RectF()
+        val rootMatrix = Matrix()
+        val invRootMatrix = Matrix()
+        val tmpMatrix = Matrix()
+        val localToScreen = Matrix()
+        val screenToLocal = Matrix()
+        val restingMatrix = Matrix()
+        val wakeDeltaMatrix = Matrix()
+        val lensDeltaMatrix = Matrix()
+        val tmpBounds = RectF()
+    }
 
-    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val filterPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
-        isFilterBitmap = true
+    private val workspaces = ThreadLocal.withInitial { Workspace() }
+    private val ws: Workspace get() = workspaces.get()!!
+    private val generatingAssets = ThreadLocal<Boolean>()
+
+    private val blurShader: RuntimeShader get() = ws.blurShader
+    private val crystalShader: RuntimeShader get() = ws.crystalShader
+    private val paint: Paint get() = ws.paint
+    private val filterPaint: Paint get() = ws.filterPaint
+    private val shadowPaint: Paint get() = ws.shadowPaint
+    private val glassPaint: Paint get() = ws.glassPaint
+    private val strokePaint: Paint get() = ws.strokePaint
+    private val rimPaint: Paint get() = ws.rimPaint
+    private val dimPaint: Paint get() = ws.dimPaint
+    private val maskPaint: Paint get() = ws.maskPaint
+    private val maskCutPaint: Paint get() = ws.maskCutPaint
+    private val layerPaint: Paint get() = ws.layerPaint
+    private val dstRectF: RectF get() = ws.dstRectF
+    private val rootMatrix: Matrix get() = ws.rootMatrix
+    private val invRootMatrix: Matrix get() = ws.invRootMatrix
+    private val tmpMatrix: Matrix get() = ws.tmpMatrix
+    private val localToScreen: Matrix get() = ws.localToScreen
+    private val screenToLocal: Matrix get() = ws.screenToLocal
+    private val restingMatrix: Matrix get() = ws.restingMatrix
+    private val wakeDeltaMatrix: Matrix get() = ws.wakeDeltaMatrix
+    private val lensDeltaMatrix: Matrix get() = ws.lensDeltaMatrix
+    private val tmpBounds: RectF get() = ws.tmpBounds
+
+    private class OffscreenRenderer(private val callbackHandler: () -> Handler) {
+        private var hwRenderer: HardwareRenderer? = null
+        private var imageReader: ImageReader? = null
+        private var curW = 0
+        private var curH = 0
+        private var curOpaque = false
+
+        fun render(node: RenderNode, w: Int, h: Int, isOpaque: Boolean, timeoutMs: Long = 240L): Bitmap? {
+            val safeW = w.coerceAtLeast(1)
+            val safeH = h.coerceAtLeast(1)
+            return runCatching {
+                if (imageReader == null || hwRenderer == null || curW != safeW || curH != safeH || curOpaque != isOpaque) {
+                    release()
+                    val reader = ImageReader.newInstance(
+                        safeW, safeH, PixelFormat.RGBA_8888, 2,
+                        HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_GPU_COLOR_OUTPUT
+                    )
+                    val hr = HardwareRenderer().apply {
+                        setSurface(reader.surface)
+                        this.isOpaque = isOpaque
+                    }
+                    imageReader = reader
+                    hwRenderer = hr
+                    curW = safeW
+                    curH = safeH
+                    curOpaque = isOpaque
+                }
+                val reader = imageReader!!
+                val hr = hwRenderer!!
+                hr.setContentRoot(node)
+                val latch = CountDownLatch(1)
+                reader.setOnImageAvailableListener({ latch.countDown() }, callbackHandler())
+                while (true) {
+                    val stale = reader.acquireNextImage() ?: break
+                    stale.close()
+                }
+                hr.createRenderRequest().setWaitForPresent(true).syncAndDraw()
+                var img = reader.acquireLatestImage()
+                if (img == null && timeoutMs > 0L) {
+                    latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+                    img = reader.acquireLatestImage()
+                }
+                reader.setOnImageAvailableListener(null, null)
+                img?.use { image ->
+                    val hwBuf = image.hardwareBuffer ?: return@use null
+                    hwBuf.use { buf ->
+                        val hwBmp = Bitmap.wrapHardwareBuffer(buf, ColorSpace.get(ColorSpace.Named.SRGB)) ?: return@use null
+                        val copy = hwBmp.copy(Bitmap.Config.ARGB_8888, true)
+                        hwBmp.recycle()
+                        copy
+                    }
+                }
+            }.onFailure {
+                release()
+            }.getOrNull()
+        }
+
+        fun release() {
+            runCatching { hwRenderer?.destroy() }
+            runCatching { imageReader?.close() }
+            hwRenderer = null
+            imageReader = null
+            curW = 0
+            curH = 0
+        }
     }
-    private val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-    }
-    private val glassPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeJoin = Paint.Join.ROUND
-        strokeCap = Paint.Cap.ROUND
-    }
-    private val rimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeJoin = Paint.Join.ROUND
-        strokeCap = Paint.Cap.ROUND
-        pathEffect = CornerPathEffect(4f)
-    }
-    private val dimPaint = Paint()
-    private val maskPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
-        style = Paint.Style.FILL
-    }
-    private val maskCutPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
-    }
-    private val layerPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    private data class PendingBlurReq(
+        val bgId: Int,
+        val src: Bitmap,
+        val w: Int,
+        val h: Int,
+        val radius: Float
+    )
 
     private val bgLock = Any()
     private val blurLock = Any()
+    private val threadLock = Any()
     private val maskLock = Any()
 
     private val bgNode = RenderNode("prism_bg")
     private val blurGenNode = RenderNode("prism_frosted_gen")
+    private val interactiveBlurNode = RenderNode("prism_frosted_lowres")
     private val scaledBaseNode = RenderNode("prism_scaled_base")
-    private val dstRectF = RectF()
     private var blurThread: HandlerThread? = null
     private var blurHandler: Handler? = null
-    private var blurHwRenderer: HardwareRenderer? = null
-    private var blurImageReader: ImageReader? = null
-    private var blurReaderW = 0
-    private var blurReaderH = 0
-    private var sceneHwRenderer: HardwareRenderer? = null
-    private var sceneImageReader: ImageReader? = null
-    private var sceneReaderW = 0
-    private var sceneReaderH = 0
+    private var readerCbThread: HandlerThread? = null
+    private var readerCbHandler: Handler? = null
+    private val offscreenBlur = OffscreenRenderer(::ensureReaderCbHandler)
+    private val offscreenScene = OffscreenRenderer(::ensureReaderCbHandler)
+    private val offscreenInteractive = OffscreenRenderer(::ensureReaderCbHandler)
 
-    private val frostedShaderCache = LruCache<String, BitmapShader>(2)
-    private val lensHeightCache = LruCache<String, Bitmap>(3)
+    @Volatile var interactiveBlur = false
+    @Volatile var onInteractiveBlurReady: (() -> Unit)? = null
+    private val pendingBlurRequest = AtomicReference<PendingBlurReq?>(null)
+    private val blurWorkerRunning = AtomicBoolean(false)
+    @Volatile private var interactiveFrostedShader: BitmapShader? = null
+    @Volatile private var interactiveFrostedRadius = -1f
+    @Volatile private var interactiveFrostedBgId = 0
+
+    private fun ensureBlurHandler(): Handler = synchronized(threadLock) {
+        val existing = blurHandler
+        if (existing != null && blurThread?.isAlive == true) return@synchronized existing
+        HandlerThread("PrismBlurGen").let { t ->
+            t.start()
+            blurThread = t
+            Handler(t.looper).also { blurHandler = it }
+        }
+    }
+
+    private fun ensureReaderCbHandler(): Handler = synchronized(threadLock) {
+        val existing = readerCbHandler
+        if (existing != null && readerCbThread?.isAlive == true) return@synchronized existing
+        HandlerThread("PrismReaderCb").let { t ->
+            t.start()
+            readerCbThread = t
+            Handler(t.looper).also { readerCbHandler = it }
+        }
+    }
+
+    private val frostedShaderCache = LruCache<String, BitmapShader>(1)
+    private val lensHeightCache = object : LruCache<String, Bitmap>(4 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int = (value.allocationByteCount / 1024).coerceAtLeast(1)
+    }
     private val lastLensByNode = ConcurrentHashMap<String, Bitmap>()
     private val lastLensInvMatrixByNode = ConcurrentHashMap<String, Matrix>()
     private val lensShaderCache = ConcurrentHashMap<String, Pair<Bitmap, BitmapShader>>()
     @Volatile private var allowStaleLensOnMiss = false
-    private val forceFreshLensOnThread = ThreadLocal<Boolean>()
+    @Volatile private var lastFrostedShader: BitmapShader? = null
     @Volatile private var lastScaledSceneKey = ""
     private val lastCachedHits = ArrayList<HitBox>()
 
-    private val rootMatrix = Matrix()
-    private val invRootMatrix = Matrix()
-    private val tmpMatrix = Matrix()
-    private val localToScreen = Matrix()
-    private val screenToLocal = Matrix()
-    private val restingMatrix = Matrix()
-    private val wakeDeltaMatrix = Matrix()
-    private val lensDeltaMatrix = Matrix()
-    private val tmpBounds = RectF()
     private val adaptiveCache = ConcurrentHashMap<Int, Int>()
     private val paletteCache = ConcurrentHashMap<Int, List<Int>>()
 
@@ -253,7 +389,8 @@ class LiquidGlassRenderer {
         val completeLockscreenBitmap: Bitmap? = null,
         val showDepth: Boolean,
         val clockCenterX: Float,
-        val clockCenterY: Float
+        val clockCenterY: Float,
+        val overlayLayerBitmap: Bitmap? = null
     ) {
         fun isSingleCompleteFrame(): Boolean =
             completeLockscreenBitmap != null && clockLayerBitmap === completeLockscreenBitmap
@@ -263,11 +400,38 @@ class LiquidGlassRenderer {
             if (clockLayerBitmap !== complete && !clockLayerBitmap.isRecycled) {
                 runCatching { clockLayerBitmap.recycle() }
             }
-            return copy(clockLayerBitmap = complete, completeLockscreenBitmap = complete)
+            val overlay = overlayLayerBitmap
+            if (overlay != null && overlay !== complete && !overlay.isRecycled) {
+                runCatching { overlay.recycle() }
+            }
+            return copy(
+                clockLayerBitmap = complete,
+                completeLockscreenBitmap = complete,
+                overlayLayerBitmap = null
+            )
+        }
+
+        /** Frame único em repouso: move para memória de GPU (zero cópia no canvas de hardware, sem textura duplicada). */
+        fun toHardware(): BakedMinuteScene {
+            if (!isSingleCompleteFrame()) return this
+            val complete = completeLockscreenBitmap ?: return this
+            if (complete.isRecycled || complete.config == Bitmap.Config.HARDWARE) return this
+            val hw = complete.copy(Bitmap.Config.HARDWARE, false) ?: return this
+            complete.recycle()
+            return copy(clockLayerBitmap = hw, completeLockscreenBitmap = hw, overlayLayerBitmap = null)
         }
 
         fun recycle() {
             runCatching { if (!clockLayerBitmap.isRecycled) clockLayerBitmap.recycle() }
+            runCatching {
+                if (overlayLayerBitmap != null &&
+                    overlayLayerBitmap !== clockLayerBitmap &&
+                    overlayLayerBitmap !== completeLockscreenBitmap &&
+                    !overlayLayerBitmap.isRecycled
+                ) {
+                    overlayLayerBitmap.recycle()
+                }
+            }
             runCatching {
                 if (completeLockscreenBitmap != null &&
                     completeLockscreenBitmap !== clockLayerBitmap &&
@@ -284,25 +448,31 @@ class LiquidGlassRenderer {
     }
 
     fun releaseOffscreenResources() {
+        pendingBlurRequest.set(null)
+        interactiveFrostedShader = null
+        interactiveFrostedRadius = -1f
+        interactiveFrostedBgId = 0
         synchronized(blurLock) {
-            runCatching { blurHwRenderer?.destroy() }
-            runCatching { blurImageReader?.close() }
-            runCatching { sceneHwRenderer?.destroy() }
-            runCatching { sceneImageReader?.close() }
+            offscreenBlur.release()
+            offscreenScene.release()
+            offscreenInteractive.release()
+        }
+        synchronized(threadLock) {
             runCatching { blurThread?.quitSafely() }
-            blurHwRenderer = null
-            blurImageReader = null
-            blurReaderW = 0
-            blurReaderH = 0
-            sceneHwRenderer = null
-            sceneImageReader = null
-            sceneReaderW = 0
-            sceneReaderH = 0
+            runCatching { readerCbThread?.quitSafely() }
             blurThread = null
             blurHandler = null
+            readerCbThread = null
+            readerCbHandler = null
         }
         runCatching { blurGenNode.discardDisplayList() }
+        runCatching { interactiveBlurNode.discardDisplayList() }
         frostedShaderCache.evictAll()
+        lastFrostedShader = null
+        pendingBlurRequest.set(null)
+        interactiveFrostedShader = null
+        interactiveFrostedRadius = -1f
+        interactiveFrostedBgId = 0
         lensHeightCache.evictAll()
         lastLensByNode.clear()
         lastLensInvMatrixByNode.clear()
@@ -323,17 +493,27 @@ class LiquidGlassRenderer {
     }
 
     fun clearShaderCachesForHome() {
-        liveVideoMode = false
-        lastBgId = 0
-        sharpBgBmp = null
-        sharpBgShader = null
+        synchronized(bgLock) {
+            liveVideoMode = false
+            lastBgId = 0
+            sharpBgBmp = null
+            sharpBgShader = null
+            prebakedFrostedBmp = null
+            prebakedFrostedShader = null
+            prebakedFrostedBlurPx = -1f
+        }
         lastScaledSceneKey = ""
         lastCachedHits.clear()
+        adaptiveCache.clear()
+        paletteCache.clear()
         runCatching { bgNode.discardDisplayList() }
-        prebakedFrostedBmp = null
-        prebakedFrostedShader = null
-        prebakedFrostedBlurPx = -1f
+        runCatching { scaledBaseNode.discardDisplayList() }
         frostedShaderCache.evictAll()
+        lastFrostedShader = null
+        pendingBlurRequest.set(null)
+        interactiveFrostedShader = null
+        interactiveFrostedRadius = -1f
+        interactiveFrostedBgId = 0
         lensHeightCache.evictAll()
         lastLensByNode.clear()
         lastLensInvMatrixByNode.clear()
@@ -477,11 +657,30 @@ class LiquidGlassRenderer {
         now: LocalDateTime,
         wakeProgress: Float = 1f,
         lockAlpha: Float = 1f,
-        hits: MutableList<HitBox>? = null
+        hits: MutableList<HitBox>? = null,
+        motionNormX: Float = 0f,
+        motionNormY: Float = 0f
     ) {
         val screenW = w.coerceAtLeast(1)
         val screenH = h.coerceAtLeast(1)
         hits?.clear()
+
+        val motion = project.motion
+        val hasMotion = motion.enabled && !project.isWidget &&
+            (abs(motionNormX) > 0.0005f || abs(motionNormY) > 0.0005f)
+        val maxShift = if (motion.enabled && !project.isWidget) motion.maxShiftPx(screenW) else 0f
+        val bgShiftX = motionNormX * maxShift * motion.backgroundDepth
+        val bgShiftY = motionNormY * maxShift * motion.backgroundDepth
+        val bgOverscan = if (hasMotion) {
+            val pad = abs(maxShift * motion.backgroundDepth)
+            1f + (2.15f * pad) / minOf(screenW, screenH).coerceAtLeast(1).toFloat()
+        } else 1f
+        val subjShiftX = motionNormX * maxShift * motion.subjectDepth
+        val subjShiftY = motionNormY * maxShift * motion.subjectDepth
+        val subjOverscan = if (hasMotion) {
+            val pad = abs(maxShift * motion.subjectDepth)
+            1f + (2.05f * pad) / minOf(screenW, screenH).coerceAtLeast(1).toFloat()
+        } else 1f
 
         @Suppress("DEPRECATION")
         canvas.getMatrix(rootMatrix)
@@ -489,6 +688,12 @@ class LiquidGlassRenderer {
 
         canvas.drawColor(Color.BLACK, PorterDuff.Mode.SRC)
         if (bg != null) {
+            if (hasMotion) {
+                canvas.save()
+                canvas.translate(screenW * 0.5f + bgShiftX, screenH * 0.5f + bgShiftY)
+                canvas.scale(bgOverscan, bgOverscan)
+                canvas.translate(-screenW * 0.5f, -screenH * 0.5f)
+            }
             if (liveVideoMode && bg === sharpBgBmp) {
                 canvas.drawBitmap(bg, 0f, 0f, null)
             } else {
@@ -496,6 +701,7 @@ class LiquidGlassRenderer {
                 ensureSharpBg(bg, screenW, screenH)
                 canvas.drawRenderNode(bgNode)
             }
+            if (hasMotion) canvas.restore()
         } else {
             liveVideoMode = false
             canvas.drawColor(0xFF0A0D14.toInt(), PorterDuff.Mode.SRC)
@@ -528,12 +734,31 @@ class LiquidGlassRenderer {
                         paint.reset()
                         paint.isAntiAlias = true
                         paint.alpha = (node.opacity * condAlpha * 255).roundToInt().coerceIn(0, 255)
-                        drawBitmapCenterCrop(canvas, depthMask, screenW, screenH, paint)
+                        if (hasMotion) {
+                            canvas.save()
+                            canvas.translate(screenW * 0.5f + subjShiftX, screenH * 0.5f + subjShiftY)
+                            canvas.scale(subjOverscan, subjOverscan)
+                            canvas.translate(-screenW * 0.5f, -screenH * 0.5f)
+                            drawBitmapCenterCrop(canvas, depthMask, screenW, screenH, paint)
+                            canvas.restore()
+                        } else {
+                            drawBitmapCenterCrop(canvas, depthMask, screenW, screenH, paint)
+                        }
                     }
                 }
                 continue
             }
 
+            val layerDepth = when (node.motion) {
+                com.example.prismlock.model.LayerMotion.STILL -> 0f
+                com.example.prismlock.model.LayerMotion.CUSTOM -> node.motionDepth
+                com.example.prismlock.model.LayerMotion.FOLLOW_PLANE -> motion.itemsDepth
+            }
+            val shiftLayer = hasMotion && abs(layerDepth) > 0.001f
+            if (shiftLayer) {
+                canvas.save()
+                canvas.translate(motionNormX * maxShift * layerDepth, motionNormY * maxShift * layerDepth)
+            }
             val box = renderLayer(
                 canvas = canvas,
                 screenW = screenW,
@@ -549,6 +774,7 @@ class LiquidGlassRenderer {
                 wakeProgress = wakeProgress,
                 hits = hits
             )
+            if (shiftLayer) canvas.restore()
             if (mainBounds == null && (node.type == LayerType.TEXT || node.type == LayerType.STACK)) {
                 val (ox, oy) = anchorOffset(node.anchor, node.align, box.w, box.h)
                 val px = node.x * screenW + ox
@@ -624,11 +850,16 @@ class LiquidGlassRenderer {
         env: Env,
         now: LocalDateTime,
         hits: MutableList<HitBox>? = null,
-        cacheKey: String? = null
+        cacheKey: String? = null,
+        motionNormX: Float = 0f,
+        motionNormY: Float = 0f
     ) {
         val bw = baseW.coerceAtLeast(1)
         val bh = baseH.coerceAtLeast(1)
-        if (cacheKey != null && cacheKey == lastScaledSceneKey && scaledBaseNode.hasDisplayList()) {
+        val effectiveCacheKey = if (cacheKey != null && (abs(motionNormX) > 0.0005f || abs(motionNormY) > 0.0005f)) {
+            "$cacheKey|m:${(motionNormX * 200).roundToInt()},${(motionNormY * 200).roundToInt()}"
+        } else cacheKey
+        if (effectiveCacheKey != null && effectiveCacheKey == lastScaledSceneKey && scaledBaseNode.hasDisplayList()) {
             if (hits != null) {
                 hits.clear()
                 hits.addAll(lastCachedHits)
@@ -655,11 +886,13 @@ class LiquidGlassRenderer {
             now = now,
             wakeProgress = 1f,
             lockAlpha = 1f,
-            hits = hits
+            hits = hits,
+            motionNormX = motionNormX,
+            motionNormY = motionNormY
         )
         scaledBaseNode.endRecording()
-        if (cacheKey != null) {
-            lastScaledSceneKey = cacheKey
+        if (effectiveCacheKey != null) {
+            lastScaledSceneKey = effectiveCacheKey
             lastCachedHits.clear()
             if (hits != null) lastCachedHits.addAll(hits)
         } else {
@@ -680,7 +913,8 @@ class LiquidGlassRenderer {
         bg: Bitmap?,
         depthMask: Bitmap?,
         env: Env,
-        now: LocalDateTime
+        now: LocalDateTime,
+        useRgb565: Boolean = !project.isWidget
     ): Bitmap {
         val screenW = w.coerceAtLeast(1)
         val screenH = h.coerceAtLeast(1)
@@ -693,10 +927,16 @@ class LiquidGlassRenderer {
             depthMask = depthMask,
             env = env.copy(locked = true),
             now = now,
-            includeCompleteBitmap = true
+            includeCompleteBitmap = true,
+            useRgb565ForComplete = useRgb565,
+            retainOnlyComplete = true,
+            releaseOffscreenAfter = false
         )
-        scene.clockLayerBitmap.recycle()
-        return scene.completeLockscreenBitmap!!
+        val complete = scene.completeLockscreenBitmap
+        return complete?.takeIf { !it.isRecycled }
+            ?: Bitmap.createBitmap(screenW, screenH, if (useRgb565) Bitmap.Config.RGB_565 else Bitmap.Config.ARGB_8888).also { fallback ->
+                Canvas(fallback).drawColor(Color.BLACK)
+            }
     }
 
     fun prepareFrameAssets(
@@ -707,13 +947,27 @@ class LiquidGlassRenderer {
         env: Env,
         now: LocalDateTime
     ) {
-        forceFreshLensOnThread.set(true)
+        generatingAssets.set(true)
         try {
             val screenW = w.coerceAtLeast(1)
             val screenH = h.coerceAtLeast(1)
             val u = screenW / 1080f
             val globals = project.globalsMap()
             activeCustomAssets = project.customAssets
+            val hasGlassOrCrystal = project.layers.flatten().any { (n, _) ->
+                !n.hidden && (n.fill == Fill.GLASS || n.fill == Fill.CRYSTAL)
+            }
+            if (!hasGlassOrCrystal) {
+                frostedShaderCache.evictAll()
+                lastFrostedShader = null
+                interactiveFrostedShader = null
+                interactiveFrostedRadius = -1f
+                lensHeightCache.evictAll()
+                lastLensByNode.clear()
+                lastLensInvMatrixByNode.clear()
+                lensShaderCache.clear()
+                return
+            }
             if (bg != null) ensureSharpBg(bg, screenW, screenH)
 
             val workPaint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -782,7 +1036,7 @@ class LiquidGlassRenderer {
                 )
             }
         } finally {
-            forceFreshLensOnThread.remove()
+            generatingAssets.remove()
         }
     }
 
@@ -825,8 +1079,14 @@ class LiquidGlassRenderer {
         bgNode.endRecording()
     }
 
-    fun bakeBlurredBitmap(sharp: Bitmap, w: Int, h: Int, blurPx: Float): Bitmap {
-        val r = blurPx.coerceIn(1f, 80f * (w / 1080f))
+    fun bakeBlurredBitmap(sharp: Bitmap, w: Int, h: Int, blurPx: Float, lowRes: Boolean = false): Bitmap {
+        val r = blurPx.coerceIn(0.5f, 80f * (w / 1080f).coerceAtLeast(0.25f))
+        if (lowRes) {
+            val lowW = (w / 4).coerceAtLeast(16)
+            val lowH = (h / 4).coerceAtLeast(16)
+            val lowR = (r / 4f).coerceAtLeast(0.5f)
+            return renderLowResBlurredBitmap(sharp, lowW, lowH, lowR).apply { setHasAlpha(false) }
+        }
         return renderBlurredBitmap(sharp, w, h, r).apply { setHasAlpha(false) }
     }
 
@@ -843,7 +1103,8 @@ class LiquidGlassRenderer {
         hits: MutableList<HitBox>? = null,
         includeCompleteBitmap: Boolean = false,
         useRgb565ForComplete: Boolean = false,
-        retainOnlyComplete: Boolean = false
+        retainOnlyComplete: Boolean = false,
+        releaseOffscreenAfter: Boolean = true
     ): BakedMinuteScene {
         val screenW = w.coerceAtLeast(1)
         val screenH = h.coerceAtLeast(1)
@@ -859,6 +1120,17 @@ class LiquidGlassRenderer {
             prebakedFrostedShader = null
             prebakedFrostedBlurPx = -1f
             ensureSharpBg(sharpBg, screenW, screenH)
+        } else if (!liveVideoMode) {
+            // No background for this bake: drop the previous one, or a shared renderer would refract/draw
+            // the last project's photo (e.g. a theme photo leaking into the next widget preview).
+            synchronized(bgLock) {
+                lastBgId = 0
+                sharpBgBmp = null
+                sharpBgShader = null
+                prebakedFrostedBmp = null
+                prebakedFrostedShader = null
+                prebakedFrostedBlurPx = -1f
+            }
         }
 
         val adaptive = extractAdaptiveColor(sharpBgBmp ?: sharpBg)
@@ -866,22 +1138,32 @@ class LiquidGlassRenderer {
         var clockCx = screenW * 0.5f
         var clockCy = screenH * 0.25f
 
-        val needsHardwareShader = project.layers.flatten().any { (n, _) ->
-            !n.hidden && (n.fill == Fill.CRYSTAL || n.fill == Fill.GLASS)
+        val nestedChildIds = project.layers.collectNestedChildIds()
+        val depthIdx = project.layers.indexOfFirst { it.type == LayerType.DEPTH }
+        val depthNode = if (depthIdx >= 0) project.layers[depthIdx] else null
+        val canUseDepth = depthNode != null && !depthNode.hidden && project.depth && depthMask != null
+
+        val behindNodes = ArrayList<LayerNode>(project.layers.size)
+        val frontNodes = ArrayList<LayerNode>(4)
+        val seenIds = HashSet<String>(project.layers.size * 2)
+        project.layers.forEachIndexed { idx, node ->
+            if (node.parentId != null || node.id in nestedChildIds) return@forEachIndexed
+            if (!seenIds.add(node.id)) return@forEachIndexed
+            if (node.type == LayerType.DEPTH) return@forEachIndexed
+            if (!isVisible(node, env, now, globals)) return@forEachIndexed
+            if (canUseDepth && idx > depthIdx) frontNodes.add(node) else behindNodes.add(node)
         }
 
-        fun drawVisibleLayersOnto(rec: Canvas) {
-            rec.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+        fun nodesNeedHardwareShader(nodes: List<LayerNode>): Boolean =
+            nodes.flatten().any { (n, _) -> !n.hidden && (n.fill == Fill.CRYSTAL || n.fill == Fill.GLASS) }
+
+        fun drawNodeListOnto(rec: Canvas, nodes: List<LayerNode>, clearFirst: Boolean = true) {
+            if (clearFirst) rec.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
             rootMatrix.reset()
             invRootMatrix.reset()
             wakeDeltaMatrix.reset()
 
-            val nestedChildIds = project.layers.collectNestedChildIds()
-            val drawnIds = HashSet<String>(project.layers.size * 2)
-            for (node in project.layers) {
-                if (node.parentId != null || node.id in nestedChildIds) continue
-                if (!drawnIds.add(node.id)) continue
-                if (!isVisible(node, env, now, globals) || node.type == LayerType.DEPTH) continue
+            for (node in nodes) {
                 val box = renderLayer(
                     canvas = rec,
                     screenW = screenW,
@@ -908,26 +1190,45 @@ class LiquidGlassRenderer {
             }
         }
 
-        val clockLayerBmp = if (needsHardwareShader) {
-            val layerNode = RenderNode("prism_minute_layers").apply {
-                setPosition(0, 0, screenW, screenH)
-            }
-            val rec = layerNode.beginRecording(screenW, screenH)
-            drawVisibleLayersOnto(rec)
-            layerNode.endRecording()
-            val out = renderNodeToBitmap(layerNode, screenW, screenH)
-            layerNode.discardDisplayList()
-            releaseOffscreenResources()
-            out
-        } else {
-            Bitmap.createBitmap(screenW, screenH, Bitmap.Config.ARGB_8888).also { bmp ->
-                drawVisibleLayersOnto(Canvas(bmp))
+        var usedOffscreen = false
+        fun renderPassBitmap(name: String, nodes: List<LayerNode>): Bitmap {
+            return if (nodesNeedHardwareShader(nodes)) {
+                usedOffscreen = true
+                val layerNode = RenderNode(name).apply {
+                    setPosition(0, 0, screenW, screenH)
+                }
+                val rec = layerNode.beginRecording(screenW, screenH)
+                drawNodeListOnto(rec, nodes, clearFirst = true)
+                layerNode.endRecording()
+                val out = renderNodeToBitmap(layerNode, screenW, screenH)
+                layerNode.discardDisplayList()
+                out ?: Bitmap.createBitmap(screenW, screenH, Bitmap.Config.ARGB_8888).also { fallback ->
+                    drawNodeListOnto(Canvas(fallback), nodes, clearFirst = true)
+                }
+            } else {
+                Bitmap.createBitmap(screenW, screenH, Bitmap.Config.ARGB_8888).also { bmp ->
+                    drawNodeListOnto(Canvas(bmp), nodes, clearFirst = true)
+                }
             }
         }
 
-        val hasDepthLayer = project.layers.any { it.type == LayerType.DEPTH && !it.hidden }
-        val showDepth = hasDepthLayer && project.depth && depthMask != null &&
-            (!project.depthGuard || mainBounds == null || checkCoverage(depthMask, mainBounds!!, screenW, screenH))
+        val clockLayerBmp = renderPassBitmap("prism_minute_layers", behindNodes)
+        val showDepth = canUseDepth &&
+            (!project.depthGuard || mainBounds == null || checkCoverage(depthMask!!, mainBounds!!, screenW, screenH))
+
+        var overlayLayerBmp: Bitmap? = null
+        if (frontNodes.isNotEmpty()) {
+            val frontBmp = renderPassBitmap("prism_minute_overlay_layers", frontNodes)
+            if (showDepth) {
+                overlayLayerBmp = frontBmp
+            } else {
+                Canvas(clockLayerBmp).drawBitmap(frontBmp, 0f, 0f, null)
+                runCatching { if (!frontBmp.isRecycled) frontBmp.recycle() }
+            }
+        }
+        if (usedOffscreen && releaseOffscreenAfter) {
+            releaseOffscreenResources()
+        }
 
         val completeBmp = if (includeCompleteBitmap) {
             val cfg = if (useRgb565ForComplete) Bitmap.Config.RGB_565 else Bitmap.Config.ARGB_8888
@@ -946,11 +1247,13 @@ class LiquidGlassRenderer {
                 }
                 cc.drawBitmap(clockLayerBmp, 0f, 0f, null)
                 if (showDepth) {
-                    val depthNode = project.layers.firstOrNull { it.type == LayerType.DEPTH }
                     paint.reset()
                     paint.isAntiAlias = true
                     paint.alpha = ((depthNode?.opacity ?: 1f) * 255).roundToInt().coerceIn(0, 255)
                     drawBitmapCenterCrop(cc, depthMask!!, screenW, screenH, paint)
+                }
+                overlayLayerBmp?.let { front ->
+                    if (!front.isRecycled) cc.drawBitmap(front, 0f, 0f, null)
                 }
                 if (bmp.config != Bitmap.Config.RGB_565) {
                     bmp.setHasAlpha(false)
@@ -960,12 +1263,14 @@ class LiquidGlassRenderer {
 
         if (retainOnlyComplete && completeBmp != null) {
             runCatching { if (!clockLayerBmp.isRecycled) clockLayerBmp.recycle() }
+            runCatching { if (overlayLayerBmp != null && !overlayLayerBmp.isRecycled) overlayLayerBmp.recycle() }
             return BakedMinuteScene(
                 clockLayerBitmap = completeBmp,
                 completeLockscreenBitmap = completeBmp,
                 showDepth = showDepth,
                 clockCenterX = clockCx,
-                clockCenterY = clockCy
+                clockCenterY = clockCy,
+                overlayLayerBitmap = null
             )
         }
 
@@ -974,7 +1279,8 @@ class LiquidGlassRenderer {
             completeLockscreenBitmap = completeBmp,
             showDepth = showDepth,
             clockCenterX = clockCx,
-            clockCenterY = clockCy
+            clockCenterY = clockCy,
+            overlayLayerBitmap = overlayLayerBmp
         )
     }
 
@@ -984,7 +1290,8 @@ class LiquidGlassRenderer {
         project: Project,
         refBg: Bitmap?,
         env: Env,
-        now: LocalDateTime
+        now: LocalDateTime,
+        hits: MutableList<HitBox>? = null
     ): Bitmap {
         val scene = bakeMinuteScene(
             w = w,
@@ -995,6 +1302,7 @@ class LiquidGlassRenderer {
             depthMask = null,
             env = env.copy(locked = false),
             now = now,
+            hits = hits,
             includeCompleteBitmap = false
         )
         return scene.clockLayerBitmap
@@ -1009,17 +1317,22 @@ class LiquidGlassRenderer {
         scene: BakedMinuteScene,
         depthMask: Bitmap?,
         wakeProgress: Float,
-        lockAlpha: Float
+        lockAlpha: Float,
+        motionNormX: Float = 0f,
+        motionNormY: Float = 0f
     ) {
         val targetW = dstW.coerceAtLeast(1)
         val targetH = dstH.coerceAtLeast(1)
         val p = wakeProgress.coerceIn(0f, 1f)
         val la = lockAlpha.coerceIn(0f, 1f)
+        val motion = project.motion
+        val hasMotion = motion.enabled && !project.isWidget &&
+            (abs(motionNormX) > 0.0005f || abs(motionNormY) > 0.0005f)
         dstRectF.set(0f, 0f, targetW.toFloat(), targetH.toFloat())
         canvas.drawColor(Color.BLACK, PorterDuff.Mode.SRC)
 
         val completeBmp = scene.completeLockscreenBitmap
-        if (p >= 0.998f && la >= 0.998f && completeBmp != null && !completeBmp.isRecycled) {
+        if (!hasMotion && p >= 0.998f && la >= 0.998f && completeBmp != null && !completeBmp.isRecycled) {
             filterPaint.reset()
             filterPaint.isAntiAlias = true
             filterPaint.isFilterBitmap = true
@@ -1027,12 +1340,37 @@ class LiquidGlassRenderer {
             return
         }
 
+        val maxShift = if (motion.enabled && !project.isWidget) motion.maxShiftPx(targetW) else 0f
+        val bgShiftX = motionNormX * maxShift * motion.backgroundDepth
+        val bgShiftY = motionNormY * maxShift * motion.backgroundDepth
+        val itemShiftX = motionNormX * maxShift * motion.itemsDepth
+        val itemShiftY = motionNormY * maxShift * motion.itemsDepth
+        val subjShiftX = motionNormX * maxShift * motion.subjectDepth
+        val subjShiftY = motionNormY * maxShift * motion.subjectDepth
+        val bgOverscan = if (motion.enabled && !project.isWidget) {
+            val pad = abs(maxShift * motion.backgroundDepth).coerceAtLeast(0f)
+            1f + (2.15f * pad) / minOf(targetW, targetH).coerceAtLeast(1).toFloat()
+        } else 1f
+        val subjOverscan = if (motion.enabled && !project.isWidget) {
+            val pad = abs(maxShift * motion.subjectDepth).coerceAtLeast(0f)
+            1f + (2.05f * pad) / minOf(targetW, targetH).coerceAtLeast(1).toFloat()
+        } else 1f
+
         val baseSharp = sharpBgBmp ?: sharpBg
         if (baseSharp != null && !baseSharp.isRecycled) {
             filterPaint.reset()
             filterPaint.isAntiAlias = true
             filterPaint.isFilterBitmap = true
-            canvas.drawBitmap(baseSharp, null, dstRectF, filterPaint)
+            if (bgOverscan > 1.0005f || hasMotion) {
+                canvas.save()
+                canvas.translate(targetW * 0.5f + bgShiftX, targetH * 0.5f + bgShiftY)
+                canvas.scale(bgOverscan, bgOverscan)
+                canvas.translate(-targetW * 0.5f, -targetH * 0.5f)
+                canvas.drawBitmap(baseSharp, null, dstRectF, filterPaint)
+                canvas.restore()
+            } else {
+                canvas.drawBitmap(baseSharp, null, dstRectF, filterPaint)
+            }
         } else {
             canvas.drawColor(0xFF0A0D14.toInt(), PorterDuff.Mode.SRC)
         }
@@ -1041,7 +1379,7 @@ class LiquidGlassRenderer {
             canvas.drawRect(dstRectF, dimPaint)
         }
 
-        if (scene.isSingleCompleteFrame() && completeBmp != null && !completeBmp.isRecycled) {
+        if (!hasMotion && scene.isSingleCompleteFrame() && completeBmp != null && !completeBmp.isRecycled) {
             val combinedAlpha = (la * 255f).roundToInt().coerceIn(0, 255)
             if (combinedAlpha > 0) {
                 filterPaint.reset()
@@ -1054,23 +1392,24 @@ class LiquidGlassRenderer {
         }
 
         val combinedAlpha = (p * la * 255f).roundToInt().coerceIn(0, 255)
+        val baseW = scene.clockLayerBitmap.width.coerceAtLeast(1).toFloat()
+        val baseH = scene.clockLayerBitmap.height.coerceAtLeast(1).toFloat()
+        val sx = targetW / baseW
+        val sy = targetH / baseH
+        val cx = scene.clockCenterX * sx
+        val cy = scene.clockCenterY * sy
+        val uDst = targetW / 1080f
+        val wakeOffset = (1f - p) * 42f * uDst
+        val wakeScale = (0.96f + 0.04f * p).coerceAtLeast(0.5f)
+
         if (combinedAlpha > 0 && !scene.clockLayerBitmap.isRecycled) {
-            val baseW = scene.clockLayerBitmap.width.coerceAtLeast(1).toFloat()
-            val baseH = scene.clockLayerBitmap.height.coerceAtLeast(1).toFloat()
-            val sx = targetW / baseW
-            val sy = targetH / baseH
-            val cx = scene.clockCenterX * sx
-            val cy = scene.clockCenterY * sy
-            val uDst = targetW / 1080f
-            val wakeOffset = (1f - p) * 42f * uDst
-            val wakeScale = (0.96f + 0.04f * p).coerceAtLeast(0.5f)
             filterPaint.reset()
             filterPaint.isAntiAlias = true
             filterPaint.isFilterBitmap = true
             filterPaint.alpha = combinedAlpha
 
             canvas.save()
-            canvas.translate(cx, cy + wakeOffset)
+            canvas.translate(cx + itemShiftX, cy + wakeOffset + itemShiftY)
             canvas.scale(wakeScale, wakeScale)
             canvas.translate(-cx, -cy)
             canvas.drawBitmap(scene.clockLayerBitmap, null, dstRectF, filterPaint)
@@ -1083,7 +1422,31 @@ class LiquidGlassRenderer {
             filterPaint.isAntiAlias = true
             filterPaint.isFilterBitmap = true
             filterPaint.alpha = ((depthNode?.opacity ?: 1f) * la * 255f).roundToInt().coerceIn(0, 255)
-            canvas.drawBitmap(depthMask, null, dstRectF, filterPaint)
+            if (subjOverscan > 1.0005f || hasMotion) {
+                canvas.save()
+                canvas.translate(targetW * 0.5f + subjShiftX, targetH * 0.5f + subjShiftY)
+                canvas.scale(subjOverscan, subjOverscan)
+                canvas.translate(-targetW * 0.5f, -targetH * 0.5f)
+                canvas.drawBitmap(depthMask, null, dstRectF, filterPaint)
+                canvas.restore()
+            } else {
+                canvas.drawBitmap(depthMask, null, dstRectF, filterPaint)
+            }
+        }
+
+        val overlayBmp = scene.overlayLayerBitmap
+        if (combinedAlpha > 0 && overlayBmp != null && !overlayBmp.isRecycled) {
+            filterPaint.reset()
+            filterPaint.isAntiAlias = true
+            filterPaint.isFilterBitmap = true
+            filterPaint.alpha = combinedAlpha
+
+            canvas.save()
+            canvas.translate(cx + itemShiftX, cy + wakeOffset + itemShiftY)
+            canvas.scale(wakeScale, wakeScale)
+            canvas.translate(-cx, -cy)
+            canvas.drawBitmap(overlayBmp, null, dstRectF, filterPaint)
+            canvas.restore()
         }
     }
 
@@ -1092,7 +1455,9 @@ class LiquidGlassRenderer {
         dstW: Int,
         dstH: Int,
         project: Project,
-        sharpBg: Bitmap?
+        sharpBg: Bitmap?,
+        motionNormX: Float = 0f,
+        motionNormY: Float = 0f
     ) {
         val targetW = dstW.coerceAtLeast(1)
         val targetH = dstH.coerceAtLeast(1)
@@ -1103,7 +1468,23 @@ class LiquidGlassRenderer {
             filterPaint.reset()
             filterPaint.isAntiAlias = true
             filterPaint.isFilterBitmap = true
-            canvas.drawBitmap(baseSharp, null, dstRectF, filterPaint)
+            val motion = project.motion
+            if (motion.enabled && motion.homeScreen && !project.isWidget) {
+                val maxShift = motion.maxShiftPx(targetW)
+                val pad = abs(maxShift * motion.backgroundDepth)
+                val overscan = 1f + (2.15f * pad) / minOf(targetW, targetH).coerceAtLeast(1).toFloat()
+                canvas.save()
+                canvas.translate(
+                    targetW * 0.5f + motionNormX * maxShift * motion.backgroundDepth,
+                    targetH * 0.5f + motionNormY * maxShift * motion.backgroundDepth
+                )
+                canvas.scale(overscan, overscan)
+                canvas.translate(-targetW * 0.5f, -targetH * 0.5f)
+                canvas.drawBitmap(baseSharp, null, dstRectF, filterPaint)
+                canvas.restore()
+            } else {
+                canvas.drawBitmap(baseSharp, null, dstRectF, filterPaint)
+            }
         } else {
             canvas.drawColor(0xFF0A0D14.toInt(), PorterDuff.Mode.SRC)
         }
@@ -1113,54 +1494,8 @@ class LiquidGlassRenderer {
         }
     }
 
-    private fun renderNodeToBitmap(node: RenderNode, w: Int, h: Int): Bitmap = synchronized(blurLock) {
-        if (blurThread == null) {
-            val t = HandlerThread("PrismBlurGen").apply { start() }
-            blurThread = t
-            blurHandler = Handler(t.looper)
-        }
-        if (sceneImageReader == null || sceneHwRenderer == null || sceneReaderW != w || sceneReaderH != h) {
-            runCatching { sceneHwRenderer?.destroy() }
-            runCatching { sceneImageReader?.close() }
-            val reader = ImageReader.newInstance(
-                w, h, PixelFormat.RGBA_8888, 2,
-                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_GPU_COLOR_OUTPUT
-            )
-            val hr = HardwareRenderer().apply {
-                setSurface(reader.surface)
-                isOpaque = false
-            }
-            sceneImageReader = reader
-            sceneHwRenderer = hr
-            sceneReaderW = w
-            sceneReaderH = h
-        }
-        val reader = sceneImageReader!!
-        val hr = sceneHwRenderer!!
-        hr.setContentRoot(node)
-        val latch = CountDownLatch(1)
-        reader.setOnImageAvailableListener({ latch.countDown() }, blurHandler)
-        while (true) {
-            val stale = reader.acquireNextImage() ?: break
-            stale.close()
-        }
-        hr.createRenderRequest().setWaitForPresent(true).syncAndDraw()
-        var img = reader.acquireLatestImage()
-        if (img == null) {
-            latch.await(200, TimeUnit.MILLISECONDS)
-            img = reader.acquireLatestImage()
-        }
-        reader.setOnImageAvailableListener(null, null)
-        val bmp = img?.use { image ->
-            val hwBuf = image.hardwareBuffer ?: return@use null
-            hwBuf.use { buf ->
-                val hwBmp = Bitmap.wrapHardwareBuffer(buf, ColorSpace.get(ColorSpace.Named.SRGB)) ?: return@use null
-                val copy = hwBmp.copy(Bitmap.Config.ARGB_8888, true)
-                hwBmp.recycle()
-                copy
-            }
-        }
-        bmp ?: Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+    private fun renderNodeToBitmap(node: RenderNode, w: Int, h: Int): Bitmap? = synchronized(blurLock) {
+        offscreenScene.render(node, w, h, isOpaque = false, timeoutMs = 260L)
     }
 
     private fun ensureSharpBg(bg: Bitmap, w: Int, h: Int) = synchronized(bgLock) {
@@ -1174,12 +1509,22 @@ class LiquidGlassRenderer {
         lastBgW = w
         lastBgH = h
         frostedShaderCache.evictAll()
+        lastFrostedShader = null
+        pendingBlurRequest.set(null)
+        interactiveFrostedShader = null
+        interactiveFrostedRadius = -1f
+        interactiveFrostedBgId = 0
 
-        val exactSharp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val sc = Canvas(exactSharp)
-        sc.drawColor(Color.BLACK)
-        drawBitmapCenterCrop(sc, bg, w, h, Paint(Paint.FILTER_BITMAP_FLAG), Matrix())
-        exactSharp.setHasAlpha(false)
+        val exactSharp = if (!bg.isRecycled && bg.width == w && bg.height == h && bg.config == Bitmap.Config.ARGB_8888 && !bg.hasAlpha()) {
+            bg
+        } else {
+            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { dst ->
+                val sc = Canvas(dst)
+                sc.drawColor(Color.BLACK)
+                drawBitmapCenterCrop(sc, bg, w, h, Paint(Paint.FILTER_BITMAP_FLAG), Matrix())
+                dst.setHasAlpha(false)
+            }
+        }
 
         sharpBgBmp = exactSharp
         sharpBgShader = BitmapShader(exactSharp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
@@ -1190,83 +1535,122 @@ class LiquidGlassRenderer {
         bgNode.endRecording()
     }
 
-    private fun getFrostedShader(blurPx: Float, w: Int, h: Int): BitmapShader {
-        val sharpShader = sharpBgShader!!
+    private fun mayGenerateAssets(): Boolean = !allowStaleLensOnMiss || generatingAssets.get() == true
+
+    private fun scheduleInteractiveBlur(bgId: Int, src: Bitmap, w: Int, h: Int, radius: Float) {
+        pendingBlurRequest.set(PendingBlurReq(bgId, src, w, h, radius))
+        if (blurWorkerRunning.compareAndSet(false, true)) {
+            ensureBlurHandler().post { drainInteractiveBlurQueue() }
+        }
+    }
+
+    private fun drainInteractiveBlurQueue() {
+        try {
+            while (true) {
+                val req = pendingBlurRequest.getAndSet(null) ?: break
+                if (req.bgId != lastBgId || req.src.isRecycled) continue
+                val lowW = (req.w / 4).coerceAtLeast(16)
+                val lowH = (req.h / 4).coerceAtLeast(16)
+                val lowRadius = (req.radius / 4f).coerceAtLeast(0.5f)
+                val blurred = renderLowResBlurredBitmap(req.src, lowW, lowH, lowRadius)
+                if (req.bgId != lastBgId) {
+                    runCatching { blurred.recycle() }
+                    continue
+                }
+                blurred.setHasAlpha(false)
+                val shader = BitmapShader(blurred, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+                shader.setLocalMatrix(Matrix().apply {
+                    setScale(req.w.toFloat() / lowW.toFloat(), req.h.toFloat() / lowH.toFloat())
+                })
+                interactiveFrostedBgId = req.bgId
+                interactiveFrostedRadius = req.radius
+                interactiveFrostedShader = shader
+                lastFrostedShader = shader
+                onInteractiveBlurReady?.invoke()
+            }
+        } finally {
+            blurWorkerRunning.set(false)
+            if (pendingBlurRequest.get() != null && blurWorkerRunning.compareAndSet(false, true)) {
+                ensureBlurHandler().post { drainInteractiveBlurQueue() }
+            }
+        }
+    }
+
+    private fun getFrostedShader(blurPx: Float, w: Int, h: Int): BitmapShader? {
+        val sharpShader = sharpBgShader ?: return null
         if (blurPx <= 0.5f) return sharpShader
+        val clampedRadius = blurPx.coerceIn(0.5f, 120f)
+        if (interactiveBlur) {
+            val curInteractive = interactiveFrostedShader
+            if (curInteractive != null && interactiveFrostedBgId == lastBgId && abs(interactiveFrostedRadius - clampedRadius) < 0.25f) {
+                return curInteractive
+            }
+            val src = sharpBgBmp
+            if (src != null && !src.isRecycled) {
+                scheduleInteractiveBlur(lastBgId, src, w, h, clampedRadius)
+            }
+            return curInteractive ?: lastFrostedShader ?: sharpShader
+        }
         prebakedFrostedShader?.let { pre ->
-            if (prebakedFrostedBlurPx < 0f || abs(prebakedFrostedBlurPx - blurPx) <= 2f) {
+            if (prebakedFrostedBlurPx < 0f || abs(prebakedFrostedBlurPx - clampedRadius) < 0.5f) {
                 return pre
             }
         }
-        val radius = blurPx.roundToInt().coerceIn(1, 120)
-        val key = "$lastBgId|${w}x$h|$radius"
+        val exactRadiusKey = (clampedRadius * 10f).roundToInt()
+        val key = "$lastBgId|${w}x$h|$exactRadiusKey"
         frostedShaderCache.get(key)?.let { return it }
+        if (!mayGenerateAssets()) return lastFrostedShader ?: interactiveFrostedShader ?: sharpShader
 
-        val src = sharpBgBmp!!
-        val blurred = renderBlurredBitmap(src, w, h, radius.toFloat())
+        val src = sharpBgBmp ?: return sharpShader
+        if (src.isRecycled) return sharpShader
+        val useHalfRes = w >= 480 && h >= 480
+        val targetW = if (useHalfRes) (w / 2).coerceAtLeast(16) else w
+        val targetH = if (useHalfRes) (h / 2).coerceAtLeast(16) else h
+        val targetRadius = if (useHalfRes) (clampedRadius * 0.5f).coerceAtLeast(0.5f) else clampedRadius
+        val blurred = renderBlurredBitmap(src, targetW, targetH, targetRadius)
         blurred.setHasAlpha(false)
         val shader = BitmapShader(blurred, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+        if (useHalfRes) {
+            shader.setLocalMatrix(Matrix().apply {
+                setScale(w.toFloat() / targetW.toFloat(), h.toFloat() / targetH.toFloat())
+            })
+        }
         frostedShaderCache.put(key, shader)
+        lastFrostedShader = shader
+        interactiveFrostedShader = null
+        interactiveFrostedRadius = -1f
         return shader
     }
 
-    private fun renderBlurredBitmap(src: Bitmap, w: Int, h: Int, radius: Float): Bitmap = synchronized(blurLock) {
-        if (blurThread == null) {
-            val t = HandlerThread("PrismBlurGen").apply { start() }
-            blurThread = t
-            blurHandler = Handler(t.looper)
-        }
-        if (blurImageReader == null || blurHwRenderer == null || blurReaderW != w || blurReaderH != h) {
-            runCatching { blurHwRenderer?.destroy() }
-            runCatching { blurImageReader?.close() }
-            val reader = ImageReader.newInstance(
-                w, h, PixelFormat.RGBA_8888, 2,
-                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_GPU_COLOR_OUTPUT
-            )
-            val hr = HardwareRenderer().apply {
-                setSurface(reader.surface)
-                setContentRoot(blurGenNode)
-            }
-            blurImageReader = reader
-            blurHwRenderer = hr
-            blurReaderW = w
-            blurReaderH = h
-        }
-        val reader = blurImageReader!!
-        val hr = blurHwRenderer!!
-        val latch = CountDownLatch(1)
-        reader.setOnImageAvailableListener({ latch.countDown() }, blurHandler)
+    private fun renderLowResBlurredBitmap(src: Bitmap, lowW: Int, lowH: Int, lowRadius: Float): Bitmap = synchronized(blurLock) {
+        interactiveBlurNode.setPosition(0, 0, lowW, lowH)
+        interactiveBlurNode.setRenderEffect(RenderEffect.createBlurEffect(lowRadius, lowRadius, Shader.TileMode.CLAMP))
+        val rec = interactiveBlurNode.beginRecording(lowW, lowH)
+        rec.drawColor(Color.BLACK)
+        rec.drawBitmap(src, null, Rect(0, 0, lowW, lowH), Paint(Paint.FILTER_BITMAP_FLAG))
+        interactiveBlurNode.endRecording()
+        offscreenInteractive.render(interactiveBlurNode, lowW, lowH, isOpaque = true, timeoutMs = 45L)
+            ?: fastBoxBlur(Bitmap.createScaledBitmap(src, lowW, lowH, true), lowRadius.roundToInt().coerceIn(1, 30))
+    }
 
+    private fun renderBlurredBitmap(src: Bitmap, w: Int, h: Int, radius: Float): Bitmap = synchronized(blurLock) {
         blurGenNode.setPosition(0, 0, w, h)
         blurGenNode.setRenderEffect(RenderEffect.createBlurEffect(radius, radius, Shader.TileMode.CLAMP))
         val rec = blurGenNode.beginRecording(w, h)
         rec.drawColor(Color.BLACK)
-        rec.drawBitmap(src, 0f, 0f, null)
+        if (src.width == w && src.height == h) {
+            rec.drawBitmap(src, 0f, 0f, null)
+        } else {
+            rec.drawBitmap(src, null, Rect(0, 0, w, h), Paint(Paint.FILTER_BITMAP_FLAG))
+        }
         blurGenNode.endRecording()
 
-        while (true) {
-            val stale = reader.acquireNextImage() ?: break
-            stale.close()
-        }
-        hr.createRenderRequest().setWaitForPresent(true).syncAndDraw()
-        var img = reader.acquireLatestImage()
-        if (img == null) {
-            latch.await(200, TimeUnit.MILLISECONDS)
-            img = reader.acquireLatestImage()
-        }
-        reader.setOnImageAvailableListener(null, null)
-
-        val gpuResult = img?.use { image ->
-            val hwBuf = image.hardwareBuffer ?: return@use null
-            hwBuf.use { buf ->
-                val hwBmp = Bitmap.wrapHardwareBuffer(buf, ColorSpace.get(ColorSpace.Named.SRGB)) ?: return@use null
-                val copy = hwBmp.copy(Bitmap.Config.ARGB_8888, true)
-                hwBmp.recycle()
-                copy
-            }
-        }
+        val gpuResult = offscreenBlur.render(blurGenNode, w, h, isOpaque = true, timeoutMs = 200L)
         if (gpuResult != null) return gpuResult
-        return fastBoxBlur(src, radius.roundToInt().coerceIn(1, 80))
+        val scaledSrc = if (src.width == w && src.height == h) src else Bitmap.createScaledBitmap(src, w, h, true)
+        return fastBoxBlur(scaledSrc, radius.roundToInt().coerceIn(1, 80)).also {
+            if (scaledSrc !== src && !scaledSrc.isRecycled) scaledSrc.recycle()
+        }
     }
 
     private fun fastBoxBlur(src: Bitmap, radius: Int): Bitmap {
@@ -1867,16 +2251,18 @@ class LiquidGlassRenderer {
         localPath: Path? = null,
         boxW: Float = 0f,
         boxH: Float = 0f
-    ): Bitmap = synchronized(maskLock) {
+    ): Bitmap? {
         val imgTag = if (imageMaskBmp != null && !imageMaskBmp.isRecycled) "|img${System.identityHashCode(imageMaskBmp)}" else ""
         val key = "$nodeId|${screenW}x$screenH|${bevelPx.roundToInt()}|${baseStrokePx.roundToInt()}|$geomKey$imgTag"
         lensHeightCache.get(key)?.let { return it }
-
-        if (allowStaleLensOnMiss && forceFreshLensOnThread.get() != true) {
+        // Drag/interactive frame: reuse the previous lens if any; with none yet, generate once so the glass never vanishes.
+        if (!mayGenerateAssets()) {
             lastLensByNode[nodeId]?.takeIf { !it.isRecycled && it.width == screenW && it.height == screenH }?.let {
                 return it
             }
         }
+        return synchronized(maskLock) {
+        lensHeightCache.get(key)?.let { return it }
 
         if (imageMaskBmp != null && !imageMaskBmp.isRecycled && restLocalToScreen != null && localPath != null && boxW > 0f && boxH > 0f) {
             val sharp = Bitmap.createBitmap(screenW, screenH, Bitmap.Config.ALPHA_8)
@@ -1981,6 +2367,7 @@ class LiquidGlassRenderer {
             lastLensInvMatrixByNode.remove(nodeId)
         }
         return out
+        }
     }
 
     private fun getLensShader(nodeId: String, lensBmp: Bitmap, curRestMatrix: Matrix? = null): BitmapShader {
@@ -2018,7 +2405,7 @@ class LiquidGlassRenderer {
         imageMaskBmp: Bitmap? = null
     ) {
         val blurPx = (g.blur * u).coerceIn(0f, 80f * u)
-        val frostedShader = getFrostedShader(blurPx, screenW, screenH)
+        val frostedShader = getFrostedShader(blurPx, screenW, screenH) ?: return
         val r = Color.red(g.tint) / 255f
         val gr = Color.green(g.tint) / 255f
         val b = Color.blue(g.tint) / 255f
@@ -2101,7 +2488,7 @@ class LiquidGlassRenderer {
         val blurPx = if (g.frostAmount > 0.01f) (g.blur.coerceAtLeast(18f * g.frostAmount) * u).coerceIn(0f, 80f * u) else 0f
         val bevelRadiusPx = (g.bevelWidth * u).coerceIn(1f, 48f * u)
         val sharpShader = sharpBgShader ?: return
-        val frostedShader = getFrostedShader(blurPx, screenW, screenH)
+        val frostedShader = getFrostedShader(blurPx, screenW, screenH) ?: return
         val useImgMask = imageMaskBmp != null && !imageMaskBmp.isRecycled && boxW > 0f && boxH > 0f
         val lensBmp = getLensHeightMap(
             nodeId = nodeId,
@@ -2119,7 +2506,7 @@ class LiquidGlassRenderer {
             localPath = if (useImgMask) localPath else null,
             boxW = boxW,
             boxH = boxH
-        )
+        ) ?: return
         val lensShader = getLensShader(nodeId, lensBmp, restLocalToScreen)
 
         val sliderValue = (g.refraction / 100f).coerceIn(0f, 1f)
