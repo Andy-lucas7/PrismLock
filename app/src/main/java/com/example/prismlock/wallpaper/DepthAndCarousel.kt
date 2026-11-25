@@ -161,8 +161,14 @@ object SubjectDepthEngine {
     }
 
     private suspend fun runSegment(bmp: Bitmap): Bitmap? = suspendCancellableCoroutine { cont ->
-        val input = InputImage.fromBitmap(bmp, 0)
-        obtainSegmenter().process(input)
+        // Segmentation is an enhancement: an ML Kit failure (missing module, bad input) must degrade to "no mask".
+        val task = try {
+            obtainSegmenter().process(InputImage.fromBitmap(bmp, 0))
+        } catch (e: Exception) {
+            if (cont.isActive) cont.resume(null)
+            return@suspendCancellableCoroutine
+        }
+        task
             .addOnSuccessListener { res ->
                 if (cont.isActive) cont.resume(res.foregroundBitmap)
             }

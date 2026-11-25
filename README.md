@@ -12,7 +12,7 @@ O **PrismLock** é um estúdio completo de **Live Wallpaper (KLWP)** e **Widgets
   Simulação física de refração, dispersão cromática RGB, brilho especular de Fresnel e vidro jateado (*frost*) em textos, formas, ícones, SVGs e camadas de imagem (`LayerType.IMAGE` com canal alpha usado como mapa de lente 3D).
 
 - **Estúdio de Widgets Ópticos (KWGT) & Live Wallpaper (KLWP)**  
-  Crie e fixe widgets em múltiplas proporções (`2×2`, `4×2`, `4×1.8`, `4×1`) usando o papel de parede ativo ou uma imagem de referência para refração realista com consumo zero em repouso.
+  Crie e fixe widgets em múltiplas proporções (`2×2`, `4×2`, `4×1.8`, `4×1`) com uma imagem de referência própria do widget para refração realista (sem imagem, o vidro refrata um fundo neutro grafite — nunca a foto da tela de bloqueio, que não é o que fica atrás do widget) e consumo zero em repouso.
 
 - **Vídeos em Live Wallpaper com Refração ao Vivo**  
   Reproduza `.mp4`, `.webm`, `.mkv` e `.mov` diretamente via aceleração por hardware (`ImageReader` zero-copy) com pausa automática quando fora de exibição.
@@ -41,6 +41,30 @@ O **PrismLock** é um estúdio completo de **Live Wallpaper (KLWP)** e **Widgets
   - **Carrossel Spotlight**: alternância suave *fade + blur* entre **Telas (Lock)** e **Widgets (KWGT)** com gestos verticais (`↑ Editar · ↓ Aplicar`).
   - **Estúdio em 5 Abas + 3 Pílulas de Contexto**: pílulas globais no topo (`Fundo & 3D` / `Formato & Fundo`, `Globais ($gv)`, `Clima & Automação`) e **5 abas** dedicadas ao item selecionado (*Camadas*, *Conteúdo*, *Forma & Fonte*, *Vidro & Cor*, *Posição & Toque*).
   - **Exportação & Importação Diferenciada**: empacote temas (`.prism`) e widgets (`.widget.prism`) com `theme.json`/`widget.json`, `bundle.json`, globais, ações de toque, ativos nomeados, mídias e fontes (compatível também com `.zip` e pastas SAF).
+
+- **Modelos Prontos por Estilo (sem marcas)**  
+  Cada modelo tem um foco e um público, usando as 8 fontes embarcadas:
+  - **Telas:** `Moderno · Profundidade` (Bebas Neue gigante atrás do sujeito 3D), `Clean · Névoa` (Inter fina, muito respiro), `Fofo · Pêssego` (pastel arredondado com chips), `Vidro · Aurora` (cristal óptico elástico + 3D), `Elegante · Editorial` (Playfair em creme), `Avançado · Terminal` (painel mono com barras de bateria/dia), `Simples · Canto` (relógio discreto no canto) e `Ousado · Ácido` (Syne em degradê lima↔violeta).
+  - **Widgets:** `Clean · Relógio`, `Moderno · Cristal Elástico`, `Fofo · Energia`, `Avançado · Painel`, `Música · Cápsula` e `Elegante · Calendário`.
+  - Cópias salvas de modelos antigos que mantêm o título original recebem o novo visual automaticamente (id, fotos e ajustes preservados); temas criados ou renomeados pelo usuário nunca são alterados.
+
+---
+
+## Desempenho e Consumo
+
+| Cenário (Galaxy, QHD+) | Antes | Agora |
+| --- | --- | --- |
+| Processo `:wallpaper`, tela apagada / desbloqueado em outro app | 373 MB PSS | ~56 MB PSS (≈20 MB sem cena carregada) |
+| App aberto no Hub (memória) | 353 MB PSS | 97 MB PSS |
+| CPU do app no Hub / em segundo plano | ~185% contínuo | 0% em repouso (0 quadros desenhados parado) |
+
+- **Apresentação própria do wallpaper:** `PrismWallpaperService` desenha com um `HardwareRenderer` próprio (em vez de `lockHardwareCanvas`), parado 1,5 s após o último quadro; o HWUI pode então descartar o contexto de GPU, o cache Skia e os render targets.
+- **Hibernação:** 3 s depois de ficar invisível ou de apagar a tela, o processo libera fotos, máscara 3D, fundo fosco, caches e renderizadores. Com o aparelho bloqueado mantém **apenas o quadro final pronto** (`RGB_565`, ~5 MB) para acender sem atraso; desbloqueado em outro app não mantém nada. Qualquer remontagem recarrega a foto do bake em disco automaticamente.
+- **Zero trabalho com tela apagada:** ticks, sensores, vídeo e animações só rodam com o wallpaper visível.
+- **Hub sem loop de recomposição:** os `Flow` do DataStore são criados uma vez (`remember`) e coletados com `collectAsStateWithLifecycle`; os modelos padrão são memoizados. Prévias dos cards ficam em cache em disco (**WebP**), com chave que inclui o projeto, a imagem exibida (uri + data/tamanho) e o dia.
+- **Release com R8** (`optimization { enable = true }` + `proguard-rules.pro` com keep rules do ML Kit) — APK release ~6 MB.
+- **Sem telemetria em segundo plano:** o `TransportBackendDiscovery` do ML Kit (datatransport) é removido no manifest; os eventos são descartados no próprio processo e o app nunca é acordado para enviar logs.
+- **Widgets leves:** cada atualização carrega a imagem de referência sem cache, recicla após o render e libera o renderizador.
 
 ---
 

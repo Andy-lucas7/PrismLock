@@ -125,14 +125,45 @@ object ProjectStore {
     }
 
     private fun decodeProject(raw: String): Project? =
-        runCatching { json.decodeFromString(Project.serializer(), raw).migrated() }.getOrNull()
+        runCatching { json.decodeFromString(Project.serializer(), raw).migrated().refreshedStarter() }.getOrNull()
 
     private fun decodeProjectList(raw: String): List<Project>? =
-        runCatching { json.decodeFromString(listSerializer, raw).map { it.migrated() } }.getOrNull()
+        runCatching { json.decodeFromString(listSerializer, raw).map { it.migrated().refreshedStarter() } }.getOrNull()
+
+    /**
+     * Starters bundled by older versions (legacy id → original title, replacement starter id). A saved copy
+     * that still carries its original title is treated as untouched and gets the new design; its id, photos,
+     * folder and settings are kept so the active theme/widget references stay valid. Renamed copies are left as-is.
+     */
+    private val legacyStarters: Map<Pair<String, String>, String> = mapOf(
+        ("theme_ios_crystal" to "Cristal Óptico") to "style_glass_aurora",
+        ("theme_samsung_stretch" to "Samsung Esticado") to "style_modern_depth",
+        ("widget_crystal_clock" to "Relógio Cristal Elástico") to "style_w_elastic",
+        ("widget_weather_battery" to "Clima & Bateria Vidro") to "style_w_clean",
+        ("widget_music_smart" to "Capsula Mídia Cristal") to "style_w_music",
+        // Interim starters from the previous redesign.
+        ("starter_liquid_aurora" to "Aurora Líquida") to "style_glass_aurora",
+        ("starter_elastic_monolith" to "Monolito Elástico") to "style_modern_depth",
+        ("starter_neon_prism" to "Prisma Neon") to "style_bold_acid",
+        ("starter_editorial_noir" to "Editorial Noir") to "style_elegant_editorial",
+        ("starter_w_crystal" to "Cristal Elástico") to "style_w_elastic",
+        ("starter_w_energy" to "Clima & Energia") to "style_w_clean",
+        ("starter_w_sonic" to "Cápsula Sonora") to "style_w_music",
+        ("starter_w_calendar" to "Calendário Prisma") to "style_w_calendar"
+    )
+
+    private fun Project.refreshedStarter(): Project {
+        val replacementId = legacyStarters[id to title] ?: return this
+        val fresh = (starterThemes + starterWidgets).firstOrNull { it.id == replacementId } ?: return this
+        return copy(title = fresh.title, layers = fresh.layers, widgetAspect = if (isWidget) fresh.widgetAspect else widgetAspect)
+    }
+
+    /** Single shared default: `Project()` mints random layer ids, so fresh instances never compare equal. */
+    val emptyProject: Project by lazy { Project() }
 
     fun flow(ctx: Context): Flow<Project> = ctx.applicationContext.prismStore.data
         .map { it[KEY] }.distinctUntilChanged()
-        .map { s -> s?.let { decodeProject(it)?.let { p -> applyRuntimeGlobals(ctx, p) } } ?: Project() }
+        .map { s -> s?.let { decodeProject(it)?.let { p -> applyRuntimeGlobals(ctx, p) } } ?: emptyProject }
 
     fun themesFlow(ctx: Context): Flow<List<Project>> = ctx.applicationContext.prismStore.data
         .map { it[THEMES_KEY] to it[KEY] }
@@ -151,23 +182,24 @@ object ProjectStore {
             }
         }
 
-    fun defaultStarterThemes(): List<Project> = listOf(
-        Project(
-            id = "theme_ios_crystal",
-            title = "Cristal Óptico",
-            layers = Presets.iosGlass()
-        ),
-        Project(
-            id = "theme_samsung_stretch",
-            title = "Samsung Esticado",
-            layers = Presets.samsung()
-        )
-    )
+    /** One starter per style/audience, mirroring the most-saved lock screen styles (see Presets.all). */
+    private val starterThemes: List<Project> by lazy { listOf(
+        Project(id = "style_modern_depth", title = "Moderno · Profundidade", layers = Presets.modernDepth(), dim = 0.08f),
+        Project(id = "style_clean_mist", title = "Clean · Névoa", layers = Presets.cleanMist(), dim = 0.06f),
+        Project(id = "style_cute_peach", title = "Fofo · Pêssego", layers = Presets.cutePeach(), dim = 0.04f),
+        Project(id = "style_glass_aurora", title = "Vidro · Aurora", layers = Presets.liquidAurora()),
+        Project(id = "style_elegant_editorial", title = "Elegante · Editorial", layers = Presets.elegantEditorial(), dim = 0.18f),
+        Project(id = "style_advanced_terminal", title = "Avançado · Terminal", layers = Presets.advancedTerminal(), dim = 0.2f),
+        Project(id = "style_simple_corner", title = "Simples · Canto", layers = Presets.simpleCorner(), dim = 0.1f),
+        Project(id = "style_bold_acid", title = "Ousado · Ácido", layers = Presets.boldAcid(), dim = 0.15f)
+    ) }
+
+    fun defaultStarterThemes(): List<Project> = starterThemes
 
     fun newTheme(title: String = "Novo Tema"): Project = Project(
         id = UUID.randomUUID().toString(),
         title = title,
-        layers = Presets.iosGlass().map { it.copyDeep() }
+        layers = Presets.liquidAurora().map { it.copyDeep() }
     )
 
     fun isWallpaperProcess(): Boolean = runCatching {
@@ -407,29 +439,16 @@ object ProjectStore {
         }
     }
 
-    fun defaultStarterWidgets(): List<Project> = listOf(
-        Project(
-            id = "widget_crystal_clock",
-            title = "Relógio Cristal Elástico",
-            layers = Presets.widgetElasticClock(),
-            isWidget = true,
-            widgetAspect = 2.0f
-        ),
-        Project(
-            id = "widget_weather_battery",
-            title = "Clima & Bateria Vidro",
-            layers = Presets.widgetWeatherBatteryCard(),
-            isWidget = true,
-            widgetAspect = 2.0f
-        ),
-        Project(
-            id = "widget_music_smart",
-            title = "Capsula Mídia Cristal",
-            layers = Presets.widgetMusicSmartCard(),
-            isWidget = true,
-            widgetAspect = 2.2f
-        )
-    )
+    private val starterWidgets: List<Project> by lazy { listOf(
+        Project(id = "style_w_clean", title = "Clean · Relógio", layers = Presets.widgetCleanClock(), isWidget = true, widgetAspect = 2.2f),
+        Project(id = "style_w_elastic", title = "Moderno · Cristal Elástico", layers = Presets.widgetElasticClock(), isWidget = true, widgetAspect = 2.0f),
+        Project(id = "style_w_cute", title = "Fofo · Energia", layers = Presets.widgetCuteBattery(), isWidget = true, widgetAspect = 2.0f),
+        Project(id = "style_w_advanced", title = "Avançado · Painel", layers = Presets.widgetAdvancedPanel(), isWidget = true, widgetAspect = 2.0f),
+        Project(id = "style_w_music", title = "Música · Cápsula", layers = Presets.widgetMusicSmartCard(), isWidget = true, widgetAspect = 2.2f),
+        Project(id = "style_w_calendar", title = "Elegante · Calendário", layers = Presets.widgetElegantCalendar(), isWidget = true, widgetAspect = 2.0f)
+    ) }
+
+    fun defaultStarterWidgets(): List<Project> = starterWidgets
 
     fun newWidget(title: String = "Prism Widget"): Project = Project(
         id = UUID.randomUUID().toString(),

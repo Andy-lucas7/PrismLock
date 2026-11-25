@@ -39,7 +39,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -62,6 +61,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.prismlock.data.EnvProvider
 import com.example.prismlock.data.MediaImporter
 import com.example.prismlock.data.PrismPackageManager
@@ -238,12 +238,18 @@ private fun PrismApp() {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    val themes by ProjectStore.themesFlow(ctx).collectAsState(initial = ProjectStore.defaultStarterThemes())
-    val widgets by ProjectStore.widgetsFlow(ctx).collectAsState(initial = ProjectStore.defaultStarterWidgets())
-    val activeApplied by ProjectStore.flow(ctx).collectAsState(initial = Project())
-    val activeWidget by ProjectStore.activeWidgetFlow(ctx).collectAsState(initial = ProjectStore.defaultStarterWidgets().first())
-    val heroSeenState by ProjectStore.heroSeenFlow(ctx).map<Boolean, Boolean?> { it }.collectAsState(initial = null)
-    val batteryDismissedState by ProjectStore.batteryPromptDismissedFlow(ctx).map<Boolean, Boolean?> { it }.collectAsState(initial = null)
+    val themesFlow = remember(ctx) { ProjectStore.themesFlow(ctx) }
+    val widgetsFlow = remember(ctx) { ProjectStore.widgetsFlow(ctx) }
+    val activeFlow = remember(ctx) { ProjectStore.flow(ctx) }
+    val activeWidgetFlow = remember(ctx) { ProjectStore.activeWidgetFlow(ctx) }
+    val heroSeenFlow = remember(ctx) { ProjectStore.heroSeenFlow(ctx).map<Boolean, Boolean?> { it } }
+    val batteryDismissedFlow = remember(ctx) { ProjectStore.batteryPromptDismissedFlow(ctx).map<Boolean, Boolean?> { it } }
+    val themes by themesFlow.collectAsStateWithLifecycle(initialValue = ProjectStore.defaultStarterThemes())
+    val widgets by widgetsFlow.collectAsStateWithLifecycle(initialValue = ProjectStore.defaultStarterWidgets())
+    val activeApplied by activeFlow.collectAsStateWithLifecycle(initialValue = ProjectStore.emptyProject)
+    val activeWidget by activeWidgetFlow.collectAsStateWithLifecycle(initialValue = ProjectStore.defaultStarterWidgets().first())
+    val heroSeenState by heroSeenFlow.collectAsStateWithLifecycle(initialValue = null)
+    val batteryDismissedState by batteryDismissedFlow.collectAsStateWithLifecycle(initialValue = null)
     var replayingHero by remember { mutableStateOf(false) }
     var heroIntroSettled by remember { mutableStateOf(false) }
     val deferHubPreviews = (heroSeenState == null) || ((heroSeenState == false || replayingHero) && !heroIntroSettled)
@@ -251,7 +257,7 @@ private fun PrismApp() {
     var screenName by rememberSaveable { mutableStateOf(AppScreen.HUB.name) }
     val screen = remember(screenName) { runCatching { AppScreen.valueOf(screenName) }.getOrDefault(AppScreen.HUB) }
     var savedEditingId by rememberSaveable { mutableStateOf<String?>(null) }
-    var editingProject by remember { mutableStateOf(Project()) }
+    var editingProject by remember { mutableStateOf(ProjectStore.emptyProject) }
     var selectedLayerId by rememberSaveable { mutableStateOf<String?>(null) }
     var focusThemeId by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingAssetAlias by remember { mutableStateOf<String?>(null) }
@@ -279,7 +285,7 @@ private fun PrismApp() {
     }
 
     var previewUri by remember { mutableStateOf<String?>(null) }
-    val env by EnvProvider.env.collectAsState()
+    val env by EnvProvider.env.collectAsStateWithLifecycle()
     var fontFolderUri by remember { mutableStateOf<String?>(null) }
     var importedFonts by remember {
         FontManager.init(ctx)

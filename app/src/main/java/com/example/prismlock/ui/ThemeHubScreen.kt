@@ -77,7 +77,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
@@ -287,7 +287,8 @@ fun ThemeHubScreen(
     val reducedMotion = remember(ctx) { PrismMotion.isReducedMotionEnabled(ctx) }
 
     var mode by remember { mutableStateOf(HubMode.SCREENS) }
-    val isGridMode by ProjectStore.hubGridModeFlow(ctx).collectAsState(initial = false)
+    val gridModeFlow = remember(ctx) { ProjectStore.hubGridModeFlow(ctx) }
+    val isGridMode by gridModeFlow.collectAsStateWithLifecycle(initialValue = false)
     val gridState = rememberLazyGridState()
     val cardBounds = remember { HashMap<String, Rect>() }
     val modeTransition = remember { Animatable(0f) }
@@ -466,7 +467,17 @@ fun ThemeHubScreen(
                 val wW = if (theme.isWidget) 420 else cardRenderW
                 val wH = if (theme.isWidget) (wW / theme.widgetAspect.coerceIn(0.6f, 4.5f)).roundToInt().coerceAtLeast(120) else cardRenderH
                 val sig = "${theme.id}|${theme.hashCode()}|${wW}x${wH}"
-                val diskKey = withContext(Dispatchers.Default) { HubPreviewDiskCache.key(theme, wW, wH) }
+                // Resolve the card's image once: the disk key and the render below must use the same one,
+                // so a carousel advance or replaced file invalidates the cached card.
+                val imageUri = if (theme.isWidget) {
+                    PrismWidgetProvider.ownImageUri(ctx, theme)
+                } else {
+                    WallpaperCarousel.currentUri(ctx, theme, advance = false, persist = false)
+                }
+                val diskKey = withContext(Dispatchers.IO) {
+                    val stamp = HubPreviewDiskCache.imageStamp(appCtx, imageUri)
+                    HubPreviewDiskCache.key(theme, wW, wH, imageUri, stamp)
+                }
                 val fromDisk = withContext(Dispatchers.IO) {
                     runCatching { HubPreviewDiskCache.load(appCtx, theme.id, diskKey) }.getOrNull()
                 }
@@ -477,7 +488,7 @@ fun ThemeHubScreen(
                         runCatching {
                             cardRenderer.clearShaderCachesForHome()
                             if (theme.isWidget) {
-                                val refBg = PrismWidgetProvider.resolveReferenceBg(ctx, theme, wW, wH, cacheInMemory = false)
+                                val refBg = PrismWidgetProvider.resolveReferenceBgFor(ctx, imageUri, wW, wH, cacheInMemory = false)
                                 val bmp = cardRenderer.renderPreviewBitmap(
                                     w = wW,
                                     h = wH,
@@ -488,11 +499,11 @@ fun ThemeHubScreen(
                                     now = hubMockTime(),
                                     useRgb565 = false
                                 )
-                                val tinyAmb = bakeTinyAmbientBitmap(refBg ?: bmp)
-                                if (refBg != null && !refBg.isRecycled) runCatching { refBg.recycle() }
+                                val tinyAmb = bakeTinyAmbientBitmap(refBg)
+                                if (!refBg.isRecycled) runCatching { refBg.recycle() }
                                 bmp to tinyAmb
                             } else {
-                                val uri = WallpaperCarousel.currentUri(ctx, theme, advance = false, persist = false)
+                                val uri = imageUri
                                 val rawBg = WallpaperCarousel.loadBitmap(ctx, uri, cardRenderW, cardRenderH, preferRgb565 = true, cacheInMemory = false)
                                 val rawMask = SubjectDepthEngine.getCachedMaskIfEnabled(ctx, uri, theme, maxEdge = cardRenderH, cacheInMemory = false)
                                 val bgBmp = if (rawBg != null && rawMask != null && theme.hasDepthPostProcessing()) {

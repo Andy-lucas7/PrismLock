@@ -171,8 +171,8 @@ const val WIDGET_ASPECT_MAX = 4.5f
 @Serializable
 data class Project(
     val id: String = "default",
-    val title: String = "Cristal Óptico",
-    val layers: List<LayerNode> = Presets.iosGlass(),
+    val title: String = "Aurora Líquida",
+    val layers: List<LayerNode> = Presets.liquidAurora(),
     val folderUri: String? = null,
     val imageUri: String? = null,
     val changeOnWake: Boolean = true,
@@ -440,230 +440,277 @@ fun Project.migrated(): Project {
 }
 
 object Presets {
-    private fun t(name: String, text: String, size: Float, weight: Int = 400, align: Align = Align.START, font: String = "sans-serif", ls: Float = 0f) =
-        LayerNode(name = name, text = text, size = size, weight = weight, align = align, font = font, letterSpacing = ls)
+    private const val INTER = "res:inter"
+    private const val BEBAS = "res:bebas_neue"
+    private const val JAKARTA = "res:plus_jakarta_sans"
+    private const val PLAYFAIR = "res:playfair_display"
+    private const val MONO = "res:jetbrains_mono"
+    private const val OUTFIT = "res:outfit"
+    private const val SYNE = "res:syne"
+    private const val GROTESK = "res:space_grotesk"
 
-    fun xiaomi(): List<LayerNode> = listOf(
-        LayerNode(name = "Bloco Xiaomi", type = LayerType.STACK, x = 0.08f, y = 0.09f, align = Align.START, spacing = 6f, children = listOf(
-            t("Hora", "{HH}:{mm}", 210f, 300, font = "sans-serif-light"),
-            t("Data", "{EEEE}, {d} {MMMM}", 44f, 500),
-            LayerNode(name = "Clima", type = LayerType.STACK, dir = Dir.HORIZONTAL, align = Align.CENTER, spacing = 14f, children = listOf(
-                LayerNode(name = "Ícone clima", type = LayerType.ICON, icon = "weather", w = 54f, h = 54f),
-                t("Temperatura", "{temp}° {city}", 40f, 400)
+    private fun t(
+        name: String,
+        text: String,
+        size: Float,
+        weight: Int = 400,
+        align: Align = Align.START,
+        font: String = INTER,
+        ls: Float = 0f,
+        color: Int = 0xFFFFFFFF.toInt()
+    ) = LayerNode(name = name, text = text, size = size, weight = weight, align = align, font = font, letterSpacing = ls, color = color)
+
+    private fun softShadow(alpha: Int = 0x55) = alpha shl 24
+
+    // ───────────────────────────── Telas (tela de bloqueio) ─────────────────────────────
+
+    /**
+     * Vidro · Aurora — vitrine do motor: relógio alto em Cristal Óptico elástico refratando a foto,
+     * sujeito 3D na frente e uma linha discreta de status. Público: quem quer o efeito "uau".
+     */
+    fun liquidAurora(): List<LayerNode> = listOf(
+        LayerNode(name = "Dia", text = "{EEEE_UPPER}", size = 30f, weight = 600, font = INTER, x = 0.5f, y = 0.075f,
+            letterSpacing = 0.38f, cond = Cond.LOCK_ONLY, color = 0xE6FFFFFF.toInt()),
+        LayerNode(
+            name = "Hora cristal", text = "{H}:{mm}", size = 320f, weight = 700, font = OUTFIT, x = 0.5f, y = 0.1f,
+            fill = Fill.CRYSTAL, cond = Cond.LOCK_ONLY, stretch = 1.25f,
+            glass = Glass(blur = 20f, refraction = 50f, bevelWidth = 24f, frostAmount = 0.14f, tint = 0x2EFFFFFF, rim = 0.95f)
+        ),
+        LayerNode(name = "Sujeito 3D", type = LayerType.DEPTH),
+        LayerNode(name = "Status", type = LayerType.STACK, dir = Dir.HORIZONTAL, x = 0.5f, y = 0.335f, align = Align.CENTER,
+            spacing = 22f, cond = Cond.LOCK_ONLY, children = listOf(
+                LayerNode(name = "Clima", type = LayerType.ICON, icon = "weather", w = 54f, h = 54f),
+                t("Info", "{temp}°  ·  {d} {MMM}  ·  {bat}%", 36f, 500, font = INTER, ls = 0.04f, color = 0xE6FFFFFF.toInt())
             ))
-        )),
-        LayerNode(name = "Alarme", text = "⏰ {alarm}", size = 34f, x = 0.08f, y = 0.92f, align = Align.START, cond = Cond.LOCK_ONLY)
     )
 
-    fun iosGlass(): List<LayerNode> = listOf(
-        LayerNode(name = "Data", text = "{EEEE}, {d} de {MMMM}", size = 46f, weight = 600, x = 0.5f, y = 0.085f, cond = Cond.LOCK_ONLY),
-        LayerNode(name = "Hora vidro", text = "{H}:{mm}", size = 330f, weight = 800, x = 0.5f, y = 0.11f, fill = Fill.GLASS, cond = Cond.LOCK_ONLY,
-            stretch = 1.15f, glass = Glass(blur = 30f, refraction = 26f, tint = 0x40FFFFFF)),
-        LayerNode(name = "Sujeito 3D", type = LayerType.DEPTH),
-        LayerNode(name = "Widgets", type = LayerType.STACK, dir = Dir.HORIZONTAL, x = 0.5f, y = 0.34f, align = Align.CENTER, spacing = 36f, cond = Cond.LOCK_ONLY, children = listOf(
-            LayerNode(name = "Anel bateria", type = LayerType.SHAPE, shape = ShapeKind.RING, w = 110f, h = 110f, value = "bat", strokeWidth = 12f),
-            LayerNode(name = "Clima", type = LayerType.ICON, icon = "weather", w = 80f, h = 80f),
-            t("Temp", "{temp}°", 64f, 600)
-        ))
+    /**
+     * Moderno · Profundidade — o visual de relógio-atrás-do-sujeito que domina o Pinterest: Bebas Neue
+     * gigante em tom areia, o sujeito da foto sobreposto. Público: quem usa fotos de pessoas/pets/objetos.
+     */
+    fun modernDepth(): List<LayerNode> = listOf(
+        LayerNode(name = "Data", text = "{EEE_UPPER}  {d}  {MMM_UPPER}", size = 34f, weight = 400, font = BEBAS, x = 0.5f, y = 0.07f,
+            letterSpacing = 0.3f, cond = Cond.LOCK_ONLY, color = 0xFFF1E4D3.toInt()),
+        LayerNode(name = "Hora", text = "{HH}:{mm}", size = 380f, weight = 400, font = BEBAS, x = 0.5f, y = 0.085f,
+            stretch = 1.35f, letterSpacing = -0.01f, cond = Cond.LOCK_ONLY, color = 0xFFF1E4D3.toInt(),
+            shadowRadius = 30f, shadowColor = softShadow(0x40), shadowDy = 8f),
+        LayerNode(name = "Sujeito 3D", type = LayerType.DEPTH)
     )
 
-    fun samsung(): List<LayerNode> = listOf(
-        LayerNode(name = "Pilha Samsung", type = LayerType.STACK, x = 0.5f, y = 0.12f, align = Align.CENTER, spacing = -30f, cond = Cond.LOCK_ONLY, children = listOf(
-            LayerNode(name = "HH", text = "{HH}", size = 280f, weight = 700, font = "sans-serif-condensed", stretch = 1.9f, letterSpacing = -0.02f),
-            LayerNode(name = "mm", text = "{mm}", size = 280f, weight = 700, font = "sans-serif-condensed", stretch = 1.9f, letterSpacing = -0.02f, color = 0xFFB9D4FF.toInt())
-        )),
-        LayerNode(name = "Sujeito 3D", type = LayerType.DEPTH),
-        LayerNode(name = "Data", text = "{EEE} {d} {MMM}", size = 44f, weight = 500, x = 0.5f, y = 0.075f, cond = Cond.LOCK_ONLY)
-    )
-
-    fun huawei(): List<LayerNode> = listOf(
-        LayerNode(name = "Editorial", type = LayerType.STACK, x = 0.07f, y = 0.1f, align = Align.START, spacing = 10f, cond = Cond.LOCK_ONLY, children = listOf(
-            t("Dia", "{EEEE_UPPER}", 34f, 600, ls = 0.32f),
-            t("Hora", "{HH}:{mm}", 190f, 200, font = "serif"),
-            LayerNode(name = "Linha", type = LayerType.SHAPE, shape = ShapeKind.LINE, w = 420f, h = 3f),
-            t("Data", "{yyyy. MM. dd.}", 40f, 400, ls = 0.08f),
-            LayerNode(name = "Barra bateria", type = LayerType.SHAPE, shape = ShapeKind.BAR, w = 420f, h = 14f, corner = 7f, value = "bat"),
-            t("Info", "{bat}% · {temp}° {city}", 30f, 400)
+    /**
+     * Clean · Névoa — tipografia fina, muito respiro, nada de efeito. Público: minimalistas,
+     * quem quer a foto em destaque e um relógio elegante.
+     */
+    fun cleanMist(): List<LayerNode> = listOf(
+        LayerNode(name = "Bloco", type = LayerType.STACK, x = 0.5f, y = 0.1f, align = Align.CENTER, spacing = 4f, cond = Cond.LOCK_ONLY, children = listOf(
+            t("Data", "{EEEE}, {d} de {MMMM}", 38f, 500, align = Align.CENTER, font = INTER, ls = 0.02f, color = 0xD9FFFFFF.toInt()),
+            t("Hora", "{HH}:{mm}", 230f, 200, align = Align.CENTER, font = INTER, ls = -0.03f)
         )),
         LayerNode(name = "Sujeito 3D", type = LayerType.DEPTH)
     )
 
+    /**
+     * Fofo · Pêssego — tons pastel, cantos redondos e "adesivos": relógio arredondado em degradê
+     * pêssego→rosa, chips com coração e bateria. Público: estética soft/cute.
+     */
+    fun cutePeach(): List<LayerNode> = listOf(
+        LayerNode(name = "Hora", text = "{HH}:{mm}", size = 250f, weight = 800, font = JAKARTA, x = 0.5f, y = 0.1f, cond = Cond.LOCK_ONLY,
+            fill = Fill.GRADIENT, color = 0xFFFFD6A5.toInt(), color2 = 0xFFFFADC7.toInt(), gradientAngle = 90f,
+            shadowRadius = 26f, shadowColor = 0x66FF8FB1, shadowDy = 6f),
+        LayerNode(name = "Sujeito 3D", type = LayerType.DEPTH),
+        LayerNode(name = "Chip data", type = LayerType.STACK, dir = Dir.HORIZONTAL, x = 0.5f, y = 0.29f, align = Align.CENTER, spacing = 14f,
+            cond = Cond.LOCK_ONLY, children = listOf(
+                LayerNode(name = "Coração", type = LayerType.ICON, icon = "heart", w = 46f, h = 46f, color = 0xFFFF8FB1.toInt()),
+                t("Data", "{EEEE}, {d} de {MMMM}", 38f, 700, font = JAKARTA, color = 0xFFFFF0F5.toInt()),
+                LayerNode(name = "Brilho", type = LayerType.ICON, icon = "sparkle", w = 40f, h = 40f, color = 0xFFFFD6A5.toInt())
+            )),
+        LayerNode(name = "Pílula bateria", type = LayerType.SHAPE, shape = ShapeKind.RECT, x = 0.5f, y = 0.9f, anchor = Anchor.CENTER,
+            w = 300f, h = 96f, corner = 48f, fill = Fill.SOLID, color = 0xCCFFE4EC.toInt(), cond = Cond.LOCK_ONLY),
+        LayerNode(name = "Bateria", type = LayerType.STACK, dir = Dir.HORIZONTAL, x = 0.5f, y = 0.9f, anchor = Anchor.CENTER, align = Align.CENTER,
+            spacing = 10f, cond = Cond.LOCK_ONLY, children = listOf(
+                LayerNode(name = "Ícone", type = LayerType.ICON, icon = "battery", w = 40f, h = 40f, color = 0xFFE5708F.toInt(),
+                    fxAsset = "\$if(bi(charging), \"battery_charging\", \"battery\")\$"),
+                t("Nível", "{bat}%", 38f, 800, font = JAKARTA, color = 0xFFE5708F.toInt())
+            ))
+    )
+
+    /**
+     * Elegante · Editorial — serifada de revista em creme, regra fina e caixa-alta espaçada.
+     * Público: estética "old money"/aesthetic, fotos de paisagem e moda.
+     */
+    fun elegantEditorial(): List<LayerNode> = listOf(
+        LayerNode(name = "Editorial", type = LayerType.STACK, x = 0.5f, y = 0.09f, align = Align.CENTER, spacing = 8f, cond = Cond.LOCK_ONLY, children = listOf(
+            t("Dia", "{EEEE_UPPER}", 26f, 600, align = Align.CENTER, font = INTER, ls = 0.5f, color = 0xE6F6EFE6.toInt()),
+            t("Hora", "{HH}:{mm}", 210f, 400, align = Align.CENTER, font = PLAYFAIR, color = 0xFFF6EFE6.toInt()),
+            LayerNode(name = "Linha", type = LayerType.SHAPE, shape = ShapeKind.LINE, w = 180f, h = 2f, color = 0xB3F6EFE6.toInt()),
+            t("Data", "{d} de {MMMM}", 40f, 400, align = Align.CENTER, font = PLAYFAIR, color = 0xFFF6EFE6.toInt())
+        )),
+        LayerNode(name = "Sujeito 3D", type = LayerType.DEPTH)
+    )
+
+    /**
+     * Avançado · Terminal — painel de informações em monoespaçada sobre vidro escuro: bateria,
+     * progresso do dia, clima e alarme com barras. Público: power users, quem gosta de dados.
+     */
+    fun advancedTerminal(): List<LayerNode> = listOf(
+        LayerNode(name = "Painel", type = LayerType.SHAPE, shape = ShapeKind.RECT, x = 0.5f, y = 0.2f, anchor = Anchor.CENTER,
+            w = 940f, h = 620f, corner = 44f, fill = Fill.GLASS, cond = Cond.LOCK_ONLY,
+            glass = Glass(blur = 36f, refraction = 18f, bevelWidth = 12f, frostAmount = 0.7f, tint = 0x66080B10, rim = 0.6f)),
+        LayerNode(name = "Dados", type = LayerType.STACK, x = 0.5f, y = 0.2f, anchor = Anchor.CENTER, align = Align.START, spacing = 14f,
+            cond = Cond.LOCK_ONLY, children = listOf(
+                t("Hora", "{HH}:{mm}", 170f, 700, font = MONO, ls = -0.02f, color = 0xFF7CFFB2.toInt()),
+                t("Data", "> {EEE_LOWER} {dd}.{MM}.{yyyy}", 34f, 400, font = MONO, color = 0xCC7CFFB2.toInt()),
+                t("Bateria", "bat   {bat}% {charging}", 32f, 400, font = MONO, color = 0xE6FFFFFF.toInt()),
+                LayerNode(name = "Barra bateria", type = LayerType.SHAPE, shape = ShapeKind.BAR, w = 760f, h = 10f, corner = 5f, value = "bat",
+                    color = 0xFF7CFFB2.toInt(), trackColor = 0x33FFFFFF,
+                    fxColor = "\$if(bi(level) <= 20, \"#FFFF6B6B\", \"#FF7CFFB2\")\$"),
+                t("Dia", "dia   {dayprog}%", 32f, 400, font = MONO, color = 0xE6FFFFFF.toInt()),
+                LayerNode(name = "Barra dia", type = LayerType.SHAPE, shape = ShapeKind.BAR, w = 760f, h = 10f, corner = 5f, value = "dayprog",
+                    color = 0xFF63D2FF.toInt(), trackColor = 0x33FFFFFF),
+                t("Clima", "tmp   {temp}° {cond}", 32f, 400, font = MONO, color = 0xE6FFFFFF.toInt()),
+                t("Alarme", "alm   {alarm}", 32f, 400, font = MONO, color = 0xE6FFFFFF.toInt())
+            ))
+    )
+
+    /** Simples · Canto — relógio pequeno no canto inferior, a foto inteira em evidência. Público: quem quer só o essencial. */
+    fun simpleCorner(): List<LayerNode> = listOf(
+        LayerNode(name = "Bloco", type = LayerType.STACK, x = 0.08f, y = 0.74f, align = Align.START, spacing = 2f, cond = Cond.LOCK_ONLY, children = listOf(
+            t("Hora", "{HH}:{mm}", 150f, 300, font = OUTFIT, ls = -0.02f),
+            t("Data", "{EEEE}, {d} {MMM}  ·  {temp}°", 36f, 500, font = OUTFIT, color = 0xD9FFFFFF.toInt())
+        ))
+    )
+
+    /**
+     * Ousado · Ácido — display Syne pesado em degradê lima→violeta, estética Y2K/streetwear.
+     * Público: quem quer cor e atitude.
+     */
+    fun boldAcid(): List<LayerNode> = listOf(
+        LayerNode(name = "Horas", text = "{HH}", size = 330f, weight = 800, font = SYNE, x = 0.08f, y = 0.07f, align = Align.START,
+            letterSpacing = -0.05f, cond = Cond.LOCK_ONLY, fill = Fill.GRADIENT, color = 0xFFD4FF3F.toInt(), color2 = 0xFFA78BFA.toInt(),
+            gradientAngle = 0f),
+        LayerNode(name = "Minutos", text = "{mm}", size = 330f, weight = 800, font = SYNE, x = 0.08f, y = 0.215f, align = Align.START,
+            letterSpacing = -0.05f, cond = Cond.LOCK_ONLY, fill = Fill.GRADIENT, color = 0xFFA78BFA.toInt(), color2 = 0xFFD4FF3F.toInt(),
+            gradientAngle = 0f),
+        LayerNode(name = "Sujeito 3D", type = LayerType.DEPTH),
+        LayerNode(name = "Etiqueta", text = "{EEEE_UPPER} / {dd}.{MM}", size = 30f, weight = 500, font = GROTESK, x = 0.08f, y = 0.375f,
+            align = Align.START, letterSpacing = 0.12f, cond = Cond.LOCK_ONLY, color = 0xFFD4FF3F.toInt())
+    )
+
+    // ───────────────────────────────────── Widgets ─────────────────────────────────────
+
+    /** Moderno · Cristal Elástico — relógio esticado em cristal óptico sobre placa de vidro. */
     fun widgetElasticClock(): List<LayerNode> = listOf(
-        LayerNode(
-            name = "Base Cristal Widget",
-            type = LayerType.SHAPE,
-            shape = ShapeKind.RECT,
-            x = 0.5f,
-            y = 0.5f,
-            anchor = Anchor.CENTER,
-            w = 980f,
-            h = 460f,
-            corner = 72f,
-            fill = Fill.CRYSTAL,
-            glass = Glass(blur = 28f, refraction = 44f, bevelWidth = 24f, frostAmount = 0.24f, tint = 0x28FFFFFF, rim = 0.9f)
-        ),
-        LayerNode(
-            name = "Bloco Relógio Widget",
-            type = LayerType.STACK,
-            dir = Dir.VERTICAL,
-            x = 0.5f,
-            y = 0.5f,
-            anchor = Anchor.CENTER,
-            align = Align.CENTER,
-            spacing = 8f,
-            children = listOf(
-                LayerNode(
-                    name = "Hora Elástica",
-                    text = "\$df(HH)\$:\$df(mm)\$",
-                    size = 215f,
-                    weight = 700,
-                    font = "sans-serif-condensed",
-                    stretch = 1.65f,
+        LayerNode(name = "Base Cristal", type = LayerType.SHAPE, shape = ShapeKind.RECT, x = 0.5f, y = 0.5f, anchor = Anchor.CENTER,
+            w = 980f, h = 460f, corner = 72f, fill = Fill.CRYSTAL,
+            glass = Glass(blur = 28f, refraction = 44f, bevelWidth = 24f, frostAmount = 0.24f, tint = 0x28FFFFFF, rim = 0.9f)),
+        LayerNode(name = "Bloco Relógio", type = LayerType.STACK, dir = Dir.VERTICAL, x = 0.5f, y = 0.5f, anchor = Anchor.CENTER,
+            align = Align.CENTER, spacing = 8f, children = listOf(
+                LayerNode(name = "Hora Elástica", text = "\$df(HH)\$:\$df(mm)\$", size = 215f, weight = 700, font = OUTFIT, stretch = 1.6f,
                     fill = Fill.CRYSTAL,
-                    glass = Glass(blur = 14f, refraction = 54f, bevelWidth = 18f, frostAmount = 0.12f, tint = 0x44FFFFFF, rim = 0.95f)
-                ),
-                LayerNode(
-                    name = "Data & Clima",
-                    text = "\$tc(cap, df(EEE))\$, \$df(dd)\$ \$df(MMM)\$ · \$wi(temp)\$° · \$bi(level)\$%",
-                    size = 38f,
-                    weight = 500,
-                    fill = Fill.SOLID,
-                    color = 0xEEFFFFFF.toInt()
-                )
-            )
-        )
+                    glass = Glass(blur = 14f, refraction = 54f, bevelWidth = 18f, frostAmount = 0.12f, tint = 0x44FFFFFF, rim = 0.95f)),
+                LayerNode(name = "Data & Clima", text = "\$tc(cap, df(EEE))\$, \$df(dd)\$ \$df(MMM)\$ · \$wi(temp)\$° · \$bi(level)\$%",
+                    size = 38f, weight = 500, font = INTER, color = 0xEEFFFFFF.toInt())
+            ))
     )
 
-    fun widgetWeatherBatteryCard(): List<LayerNode> = listOf(
-        LayerNode(
-            name = "Card Vidro Fosco",
-            type = LayerType.SHAPE,
-            shape = ShapeKind.RECT,
-            x = 0.5f,
-            y = 0.5f,
-            anchor = Anchor.CENTER,
-            w = 980f,
-            h = 460f,
-            corner = 68f,
-            fill = Fill.GLASS,
-            glass = Glass(blur = 32f, refraction = 28f, bevelWidth = 18f, frostAmount = 0.55f, tint = 0x36FFFFFF, rim = 0.85f)
-        ),
-        LayerNode(
-            name = "Linha Clima & Bateria",
-            type = LayerType.STACK,
-            dir = Dir.HORIZONTAL,
-            x = 0.5f,
-            y = 0.5f,
-            anchor = Anchor.CENTER,
-            align = Align.CENTER,
-            spacing = 54f,
-            children = listOf(
-                LayerNode(
-                    name = "Ícone Dinâmico",
-                    type = LayerType.ICON,
-                    icon = "weather",
-                    fxAsset = "\$if(bi(charging), \"bolt\", \"weather\")\$",
-                    w = 132f,
-                    h = 132f,
-                    fill = Fill.SOLID,
-                    color = 0xFFFFFFFF.toInt()
-                ),
-                LayerNode(
-                    name = "Clima Agora",
-                    type = LayerType.STACK,
-                    dir = Dir.VERTICAL,
-                    align = Align.START,
-                    spacing = 8f,
-                    children = listOf(
-                        LayerNode(name = "Temp", text = "\$wi(temp)\$°", size = 128f, weight = 700, align = Align.START),
-                        LayerNode(name = "Resumo", text = "\$wi(cond)\$ · \$wi(city)\$", size = 34f, weight = 500, align = Align.START, color = 0xCCFFFFFF.toInt())
-                    )
-                ),
-                LayerNode(
-                    name = "Anel Bateria",
-                    type = LayerType.SHAPE,
-                    shape = ShapeKind.RING,
-                    w = 136f,
-                    h = 136f,
-                    strokeWidth = 14f,
-                    value = "\$bi(level)\$",
-                    fxColor = "\$if(bi(level) <= 20, \"#FFFF5252\", if(bi(charging), \"#FF80FFB5\", \"#FFFFFFFF\"))\$"
-                )
-            )
-        )
+    /** Clean · Relógio — pílula de vidro fosco claro com hora fina e data. */
+    fun widgetCleanClock(): List<LayerNode> = listOf(
+        LayerNode(name = "Pílula", type = LayerType.SHAPE, shape = ShapeKind.RECT, x = 0.5f, y = 0.5f, anchor = Anchor.CENTER,
+            w = 980f, h = 440f, corner = 220f, fill = Fill.GLASS,
+            glass = Glass(blur = 34f, refraction = 16f, bevelWidth = 10f, frostAmount = 0.75f, tint = 0x40FFFFFF, rim = 0.5f)),
+        LayerNode(name = "Linha", type = LayerType.STACK, dir = Dir.HORIZONTAL, x = 0.5f, y = 0.5f, anchor = Anchor.CENTER,
+            align = Align.CENTER, spacing = 36f, children = listOf(
+                t("Hora", "{HH}:{mm}", 190f, 200, font = INTER, ls = -0.03f),
+                LayerNode(name = "Data", type = LayerType.STACK, align = Align.START, spacing = 2f, children = listOf(
+                    t("Dia", "{EEEE}", 46f, 600, font = INTER),
+                    t("Mês", "{d} de {MMMM}", 36f, 400, font = INTER, color = 0xCCFFFFFF.toInt())
+                ))
+            ))
     )
 
+    /** Fofo · Energia — cartão pastel com coração, anel de bateria rosa e estado de carga. */
+    fun widgetCuteBattery(): List<LayerNode> = listOf(
+        LayerNode(name = "Cartão", type = LayerType.SHAPE, shape = ShapeKind.RECT, x = 0.5f, y = 0.5f, anchor = Anchor.CENTER,
+            w = 980f, h = 460f, corner = 120f, fill = Fill.GRADIENT, color = 0xFFFFE4EC.toInt(), color2 = 0xFFFFF1DC.toInt(), gradientAngle = 135f),
+        LayerNode(name = "Conteúdo", type = LayerType.STACK, dir = Dir.HORIZONTAL, x = 0.5f, y = 0.5f, anchor = Anchor.CENTER,
+            align = Align.CENTER, spacing = 48f, children = listOf(
+                LayerNode(name = "Anel", type = LayerType.SHAPE, shape = ShapeKind.RING, w = 220f, h = 220f, strokeWidth = 26f, value = "bat",
+                    color = 0xFFFF8FB1.toInt(), trackColor = 0x33E5708F,
+                    fxColor = "\$if(bi(charging), \"#FF7ED6A8\", \"#FFFF8FB1\")\$"),
+                LayerNode(name = "Texto", type = LayerType.STACK, align = Align.START, spacing = 4f, children = listOf(
+                    t("Nível", "{bat}%", 110f, 800, font = JAKARTA, color = 0xFFE5708F.toInt()),
+                    t("Estado", "\$if(bi(charging), \"carregando ♡\", \"energia do dia ♡\")\$", 38f, 700, font = JAKARTA, color = 0xFFB98AA0.toInt())
+                ))
+            ))
+    )
+
+    /** Avançado · Painel — monoespaçada com bateria, dia, clima e alarme em barras. */
+    fun widgetAdvancedPanel(): List<LayerNode> = listOf(
+        LayerNode(name = "Painel", type = LayerType.SHAPE, shape = ShapeKind.RECT, x = 0.5f, y = 0.5f, anchor = Anchor.CENTER,
+            w = 980f, h = 460f, corner = 48f, fill = Fill.SOLID, color = 0xE60B0F14.toInt()),
+        LayerNode(name = "Dados", type = LayerType.STACK, x = 0.5f, y = 0.5f, anchor = Anchor.CENTER, align = Align.START, spacing = 12f, children = listOf(
+            t("Topo", "{HH}:{mm}  {EEE_LOWER} {dd}.{MM}", 64f, 700, font = MONO, color = 0xFF7CFFB2.toInt()),
+            t("Bateria", "bat {bat}% {charging}", 32f, 400, font = MONO, color = 0xE6FFFFFF.toInt()),
+            LayerNode(name = "Barra bateria", type = LayerType.SHAPE, shape = ShapeKind.BAR, w = 820f, h = 10f, corner = 5f, value = "bat",
+                color = 0xFF7CFFB2.toInt(), trackColor = 0x33FFFFFF),
+            t("Dia", "dia {dayprog}%  ·  tmp {temp}°  ·  alm {alarm}", 32f, 400, font = MONO, color = 0xE6FFFFFF.toInt()),
+            LayerNode(name = "Barra dia", type = LayerType.SHAPE, shape = ShapeKind.BAR, w = 820f, h = 10f, corner = 5f, value = "dayprog",
+                color = 0xFF63D2FF.toInt(), trackColor = 0x33FFFFFF)
+        ))
+    )
+
+    /** Música · Cápsula — toque para tocar/pausar; ícone muda com o estado da mídia. */
     fun widgetMusicSmartCard(): List<LayerNode> = listOf(
-        LayerNode(
-            name = "Capsula Mídia Vidro",
-            type = LayerType.SHAPE,
-            shape = ShapeKind.RECT,
-            x = 0.5f,
-            y = 0.5f,
-            anchor = Anchor.CENTER,
-            w = 980f,
-            h = 420f,
-            corner = 72f,
-            fill = Fill.CRYSTAL,
+        LayerNode(name = "Cápsula", type = LayerType.SHAPE, shape = ShapeKind.RECT, x = 0.5f, y = 0.5f, anchor = Anchor.CENTER,
+            w = 980f, h = 420f, corner = 210f, fill = Fill.CRYSTAL,
             glass = Glass(blur = 28f, refraction = 38f, bevelWidth = 22f, frostAmount = 0.35f, tint = 0x30101420, rim = 0.9f),
-            touch = TouchAction(type = TouchActionType.MEDIA_PLAY_PAUSE)
-        ),
-        LayerNode(
-            name = "Conteúdo Mídia",
-            type = LayerType.STACK,
-            dir = Dir.HORIZONTAL,
-            x = 0.5f,
-            y = 0.5f,
-            anchor = Anchor.CENTER,
-            align = Align.CENTER,
-            spacing = 40f,
-            children = listOf(
-                LayerNode(
-                    name = "Ícone Mídia",
-                    type = LayerType.ICON,
-                    icon = "music",
-                    fxAsset = "\$if(si(mplaying), \"music\", \"weather\")\$",
-                    w = 120f,
-                    h = 120f
-                ),
-                LayerNode(
-                    name = "Faixa & Status",
-                    type = LayerType.STACK,
-                    dir = Dir.VERTICAL,
-                    align = Align.START,
-                    spacing = 8f,
-                    children = listOf(
-                        LayerNode(
-                            name = "Título",
-                            text = "\$if(si(mplaying), \"Tocando Agora\", df(HH) + \":\" + df(mm))\$",
-                            size = 66f,
-                            weight = 700,
-                            align = Align.START
-                        ),
-                        LayerNode(
-                            name = "Subtítulo",
-                            text = "\$if(si(mplaying), \"Toque para Pausar/Play\", tc(cap, df(EEEE)) + \" · \" + wi(temp) + \"°\")\$",
-                            size = 34f,
-                            weight = 400,
-                            align = Align.START,
-                            color = 0xCCFFFFFF.toInt()
-                        )
-                    )
-                )
-            )
-        )
+            touch = TouchAction(type = TouchActionType.MEDIA_PLAY_PAUSE)),
+        LayerNode(name = "Conteúdo", type = LayerType.STACK, dir = Dir.HORIZONTAL, x = 0.5f, y = 0.5f, anchor = Anchor.CENTER,
+            align = Align.CENTER, spacing = 40f, children = listOf(
+                LayerNode(name = "Ícone", type = LayerType.ICON, icon = "play", w = 120f, h = 120f,
+                    fxAsset = "\$if(si(mplaying), \"pause\", \"play\")\$"),
+                LayerNode(name = "Faixa", type = LayerType.STACK, align = Align.START, spacing = 8f, children = listOf(
+                    LayerNode(name = "Título", text = "\$if(si(mplaying), \"Tocando agora\", df(HH) + \":\" + df(mm))\$",
+                        size = 66f, weight = 700, font = GROTESK, align = Align.START),
+                    LayerNode(name = "Subtítulo", text = "\$if(si(mplaying), \"Toque para pausar\", \"Toque para tocar\")\$",
+                        size = 34f, weight = 400, font = GROTESK, align = Align.START, color = 0xCCFFFFFF.toInt())
+                ))
+            ))
+    )
+
+    /** Elegante · Calendário — dia em serifada grande, mês e semana em caixa-alta espaçada. */
+    fun widgetElegantCalendar(): List<LayerNode> = listOf(
+        LayerNode(name = "Placa", type = LayerType.SHAPE, shape = ShapeKind.RECT, x = 0.5f, y = 0.5f, anchor = Anchor.CENTER,
+            w = 980f, h = 460f, corner = 56f, fill = Fill.SOLID, color = 0xF2F6EFE6.toInt(),
+            touch = TouchAction(type = TouchActionType.SYSTEM_ALARM)),
+        LayerNode(name = "Linha", type = LayerType.STACK, dir = Dir.HORIZONTAL, x = 0.5f, y = 0.5f, anchor = Anchor.CENTER,
+            align = Align.CENTER, spacing = 44f, children = listOf(
+                t("Dia", "{dd}", 230f, 400, font = PLAYFAIR, color = 0xFF2B2622.toInt()),
+                LayerNode(name = "Detalhes", type = LayerType.STACK, align = Align.START, spacing = 8f, children = listOf(
+                    t("Semana", "{EEEE_UPPER}", 34f, 600, font = INTER, ls = 0.3f, color = 0xFF2B2622.toInt()),
+                    t("Mês", "{MMMM} {yyyy}", 44f, 400, font = PLAYFAIR, color = 0xFF5C5148.toInt()),
+                    t("Alarme", "alarme {alarm}", 30f, 500, font = INTER, color = 0xFF8C7E72.toInt())
+                ))
+            ))
     )
 
     val all: List<Pair<String, () -> List<LayerNode>>> = listOf(
-        "Xiaomi Canto Clássico" to ::xiaomi,
-        "iOS Vidro 3D" to ::iosGlass,
-        "Samsung Esticado" to ::samsung,
-        "Huawei Editorial" to ::huawei
+        "Vidro · Aurora" to ::liquidAurora,
+        "Moderno · Profundidade" to ::modernDepth,
+        "Clean · Névoa" to ::cleanMist,
+        "Fofo · Pêssego" to ::cutePeach,
+        "Elegante · Editorial" to ::elegantEditorial,
+        "Avançado · Terminal" to ::advancedTerminal,
+        "Simples · Canto" to ::simpleCorner,
+        "Ousado · Ácido" to ::boldAcid
     )
 
     val allWidgets: List<Pair<String, () -> List<LayerNode>>> = listOf(
-        "Relógio Cristal Elástico" to ::widgetElasticClock,
-        "Card Clima & Bateria Vidro" to ::widgetWeatherBatteryCard,
-        "Card Mídia & Status Cristal" to ::widgetMusicSmartCard
+        "Clean · Relógio" to ::widgetCleanClock,
+        "Moderno · Cristal Elástico" to ::widgetElasticClock,
+        "Fofo · Energia" to ::widgetCuteBattery,
+        "Avançado · Painel" to ::widgetAdvancedPanel,
+        "Música · Cápsula" to ::widgetMusicSmartCard,
+        "Elegante · Calendário" to ::widgetElegantCalendar
     )
 }

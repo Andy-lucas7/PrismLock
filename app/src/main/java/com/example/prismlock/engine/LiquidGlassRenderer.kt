@@ -1120,6 +1120,17 @@ class LiquidGlassRenderer {
             prebakedFrostedShader = null
             prebakedFrostedBlurPx = -1f
             ensureSharpBg(sharpBg, screenW, screenH)
+        } else if (!liveVideoMode) {
+            // No background for this bake: drop the previous one, or a shared renderer would refract/draw
+            // the last project's photo (e.g. a theme photo leaking into the next widget preview).
+            synchronized(bgLock) {
+                lastBgId = 0
+                sharpBgBmp = null
+                sharpBgShader = null
+                prebakedFrostedBmp = null
+                prebakedFrostedShader = null
+                prebakedFrostedBlurPx = -1f
+            }
         }
 
         val adaptive = extractAdaptiveColor(sharpBgBmp ?: sharpBg)

@@ -3,6 +3,9 @@ package com.example.prismlock.ui
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.net.Uri
+import android.provider.DocumentsContract
+import android.provider.OpenableColumns
 import com.example.prismlock.data.ProjectStore
 import com.example.prismlock.model.Project
 import java.io.File
@@ -15,7 +18,9 @@ import java.time.LocalDate
  * Lets the UI drop every preview from RAM on stop and come back without re-rendering.
  */
 internal object HubPreviewDiskCache {
-    private const val VERSION = 1
+    // 2: widget cards no longer borrow the lock-screen photo as backdrop; drop previews baked with it.
+    // 3: key also covers the image the card renders (carousel advance / replaced file invalidates it).
+    private const val VERSION = 3
     private const val SEP = "__"
     private const val PREVIEW_EXT = ".webp"
     private const val AMBIENT_EXT = ".amb.webp"
@@ -26,9 +31,14 @@ internal object HubPreviewDiskCache {
 
     private fun safeId(id: String): String = id.replace(Regex("[^A-Za-z0-9_-]"), "_")
 
-    fun key(project: Project, w: Int, h: Int): String {
+    /**
+     * [imageUri] is the exact image the card renders (resolved once by the caller and reused for the
+     * render), [imageStamp] its modification stamp from [imageStamp].
+     */
+    fun key(project: Project, w: Int, h: Int, imageUri: String?, imageStamp: String): String {
         val md = MessageDigest.getInstance("SHA-1")
         md.update(ProjectStore.json.encodeToString(Project.serializer(), project).toByteArray())
+        md.update("|${imageUri.orEmpty()}|$imageStamp".toByteArray())
         md.update("|$w|$h|${LocalDate.now().toEpochDay()}|$VERSION".toByteArray())
         val d = md.digest()
         val sb = StringBuilder(20)
@@ -37,6 +47,29 @@ internal object HubPreviewDiskCache {
             sb.append(Character.forDigit(b ushr 4, 16)).append(Character.forDigit(b and 0xF, 16))
         }
         return sb.toString()
+    }
+
+    /** "lastModified:size" when cheaply known (file path or a provider exposing the columns), else "". */
+    fun imageStamp(ctx: Context, uri: String?): String {
+        if (uri.isNullOrBlank()) return ""
+        return runCatching {
+            val parsed = Uri.parse(uri)
+            when (parsed.scheme) {
+                null, "", "file" -> File(parsed.path ?: uri).takeIf { it.isFile }?.let { "${it.lastModified()}:${it.length()}" }
+                "content" -> ctx.contentResolver.query(
+                    parsed,
+                    arrayOf(DocumentsContract.Document.COLUMN_LAST_MODIFIED, OpenableColumns.SIZE),
+                    null, null, null
+                )?.use { c ->
+                    if (!c.moveToFirst()) null else {
+                        val lm = c.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED).takeIf { it >= 0 }?.let { if (c.isNull(it)) null else c.getLong(it) }
+                        val sz = c.getColumnIndex(OpenableColumns.SIZE).takeIf { it >= 0 }?.let { if (c.isNull(it)) null else c.getLong(it) }
+                        "${lm ?: ""}:${sz ?: ""}"
+                    }
+                }
+                else -> null
+            }
+        }.getOrNull().orEmpty()
     }
 
     private fun base(id: String, key: String) = "${safeId(id)}$SEP$key"

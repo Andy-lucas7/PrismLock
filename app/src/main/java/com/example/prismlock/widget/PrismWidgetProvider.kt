@@ -196,14 +196,58 @@ class PrismWidgetProvider : AppWidgetProvider() {
             reqW: Int,
             reqH: Int,
             cacheInMemory: Boolean = true
-        ): Bitmap? {
-            val directUri = widgetProject.imageUri?.takeIf { it.isNotBlank() }
+        ): Bitmap? = resolveReferenceBgFor(ctx, ownImageUri(ctx, widgetProject), reqW, reqH, cacheInMemory)
+
+        /**
+         * The widget's own image only. The lock-screen theme photo is NOT what sits behind a home-screen
+         * widget (the launcher wallpaper is unreadable), so borrowing it painted the last lock photo into
+         * every widget card/preview. Without an own image, glass refracts a neutral backdrop instead.
+         */
+        suspend fun ownImageUri(ctx: Context, widgetProject: Project): String? =
+            widgetProject.imageUri?.takeIf { it.isNotBlank() }
                 ?: widgetProject.folderUri?.let { WallpaperCarousel.currentUri(ctx, widgetProject, advance = false, persist = false) }
-                ?: ProjectStore.currentWallpaperUri(ctx)
-                ?: ProjectStore.readActiveProject(ctx).let { wallProj ->
-                    WallpaperCarousel.currentUri(ctx, wallProj, advance = false, persist = false)
-                }
-            return WallpaperCarousel.loadBitmap(ctx, directUri, reqW, reqH, preferRgb565 = true, cacheInMemory = cacheInMemory)
+
+        /** Loads an already-resolved [ownImageUri] (so callers keying a cache on it render the same image). */
+        suspend fun resolveReferenceBgFor(
+            ctx: Context,
+            uri: String?,
+            reqW: Int,
+            reqH: Int,
+            cacheInMemory: Boolean = true
+        ): Bitmap {
+            val own = uri?.let {
+                WallpaperCarousel.loadBitmap(ctx, it, reqW, reqH, preferRgb565 = true, cacheInMemory = cacheInMemory)
+            }
+            return own ?: neutralBackdrop(reqW, reqH, shared = cacheInMemory)
+        }
+
+        @Volatile private var sharedBackdrop: Bitmap? = null
+
+        /** Soft graphite gradient used as the refraction source when a widget has no image of its own. */
+        fun neutralBackdrop(w: Int, h: Int, shared: Boolean = false): Bitmap {
+            val bw = w.coerceAtLeast(16)
+            val bh = h.coerceAtLeast(16)
+            if (shared) {
+                sharedBackdrop?.let { if (!it.isRecycled && it.width == bw && it.height == bh) return it }
+            }
+            val bmp = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+            val c = android.graphics.Canvas(bmp)
+            val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+            p.shader = android.graphics.LinearGradient(
+                0f, 0f, bw.toFloat(), bh.toFloat(),
+                intArrayOf(0xFF1E2433.toInt(), 0xFF121620.toInt(), 0xFF0A0D14.toInt()),
+                floatArrayOf(0f, 0.55f, 1f),
+                android.graphics.Shader.TileMode.CLAMP
+            )
+            c.drawRect(0f, 0f, bw.toFloat(), bh.toFloat(), p)
+            p.shader = android.graphics.RadialGradient(
+                bw * 0.25f, bh * 0.2f, maxOf(bw, bh) * 0.6f,
+                0x33A9B8FF, 0x00000000, android.graphics.Shader.TileMode.CLAMP
+            )
+            c.drawRect(0f, 0f, bw.toFloat(), bh.toFloat(), p)
+            bmp.setHasAlpha(false)
+            if (shared) sharedBackdrop = bmp
+            return bmp
         }
 
         private suspend fun renderAndPushWidgets(
@@ -252,10 +296,17 @@ class PrismWidgetProvider : AppWidgetProvider() {
                     }
                     if (lastWidgetRenderSig[id] == evalSig) continue
 
-                    val refBg = resolveReferenceBg(ctx, widget, targetW, targetH)
+                    // Uncached + recycled after the render: widget updates run in the :wallpaper process
+                    // and must not leave photos/backdrops behind between minutes.
+                    val refBg = resolveReferenceBg(ctx, widget, targetW, targetH, cacheInMemory = false)
                     val hits = ArrayList<HitBox>()
-                    val bmp = renderer.renderWidgetBitmap(targetW, targetH, widget, refBg, env, now, hits)
-                    renderer.releaseOffscreenResources()
+                    val bmp = try {
+                        renderer.renderWidgetBitmap(targetW, targetH, widget, refBg, env, now, hits)
+                    } finally {
+                        renderer.clearShaderCachesForHome()
+                        renderer.releaseOffscreenResources()
+                        if (refBg != null && !refBg.isRecycled) refBg.recycle()
+                    }
                     val targets = buildTargets(widget, hits, targetW, targetH, slotWDp, slotHDp)
 
                     val tapIntent = Intent(ctx, PrismWidgetActionReceiver::class.java).apply {

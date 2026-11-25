@@ -1,6 +1,7 @@
 package com.example.prismlock.ui
 
 import android.graphics.RuntimeShader
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -354,6 +355,15 @@ fun PrismHeroScreen(
         modifier = Modifier
             .fillMaxSize()
             .onGloballyPositioned { coords -> heroOriginInRoot = coords.positionInRoot() }
+            // The intro overlays the Hub. Without a full-screen pointer target, taps/swipes during the
+            // intro (or on the CTA before it is enabled) fell through to the centered carousel card,
+            // whose tap / swipe-up opens the Studio. Being the hit target blocks the Hub; the CTA child
+            // still receives its own events.
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) awaitPointerEvent()
+                }
+            }
             .graphicsLayer {
                 compositingStrategy = if (needsPortalOffscreen) {
                     CompositingStrategy.Offscreen
