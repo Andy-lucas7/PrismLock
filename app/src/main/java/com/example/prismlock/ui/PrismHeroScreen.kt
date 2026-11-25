@@ -33,6 +33,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -192,12 +193,13 @@ private fun smoothPhase(t: Float, start: Float, end: Float): Float {
 @Composable
 private fun HeroBeamBackground(
     beamShader: RuntimeShader,
-    t: Float,
-    sweepProg: Float,
+    t: () -> Float,
+    sweepProg: () -> Float,
     reducedMotion: Boolean
 ) {
-    val ambientAngle = if (reducedMotion) {
-        0f
+    // State objects only: values are read in the draw phase, so the spin redraws without recomposing.
+    val ambientAngle: State<Float>? = if (reducedMotion) {
+        null
     } else {
         val ambientTransition = rememberInfiniteTransition(label = "HeroAmbientSpotlights")
         ambientTransition.animateFloat(
@@ -208,7 +210,7 @@ private fun HeroBeamBackground(
                 repeatMode = RepeatMode.Restart
             ),
             label = "AmbientSpotlightAngle"
-        ).value
+        )
     }
     Canvas(
         modifier = Modifier
@@ -219,9 +221,9 @@ private fun HeroBeamBackground(
         val h = size.height.coerceAtLeast(1f)
         beamShader.setFloatUniform("uResolution", w, h)
         beamShader.setFloatUniform("uConvergeTarget", w * 0.5f, h * 0.42f)
-        beamShader.setFloatUniform("uTitleCenter", w * 0.5f, lerp(h * 0.42f, h * 0.28f, sweepProg))
-        beamShader.setFloatUniform("uTime", t)
-        beamShader.setFloatUniform("uAmbientAngle", ambientAngle)
+        beamShader.setFloatUniform("uTitleCenter", w * 0.5f, lerp(h * 0.42f, h * 0.28f, sweepProg()))
+        beamShader.setFloatUniform("uTime", t())
+        beamShader.setFloatUniform("uAmbientAngle", ambientAngle?.value ?: 0f)
         drawRect(brush = ShaderBrush(beamShader))
     }
 }
@@ -388,8 +390,8 @@ fun PrismHeroScreen(
         // Pure #000000 backdrop + holofotes desfocados em composable isolado (ambientAngle não recompõe textos)
         HeroBeamBackground(
             beamShader = beamShader,
-            t = t,
-            sweepProg = sweepProg,
+            t = { timeline.value },
+            sweepProg = { smoothPhase(timeline.value, 0.38f, 0.80f) },
             reducedMotion = reducedMotion
         )
 

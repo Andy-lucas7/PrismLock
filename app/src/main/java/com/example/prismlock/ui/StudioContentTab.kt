@@ -105,6 +105,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -198,11 +201,15 @@ internal fun ContentTab(
         return
     }
     var activeCategoryId by remember { mutableStateOf(KustomFormulaEngine.categories.first().id) }
-    val liveNow by produceState(initialValue = LocalDateTime.now(), node.text) {
-        val period = if (Dynamic.hasSeconds(node)) 1000L else 15_000L
-        while (true) {
-            value = LocalDateTime.now()
-            delay(period)
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val liveNow by produceState(initialValue = LocalDateTime.now(), node.text, lifecycleOwner) {
+        val period = if (Dynamic.hasSeconds(node)) 1000L else 60_000L
+        // Aligned to the period boundary and paused while the app is not visible.
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                value = LocalDateTime.now()
+                delay(period - System.currentTimeMillis() % period)
+            }
         }
     }
 

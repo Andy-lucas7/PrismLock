@@ -228,6 +228,14 @@ private fun bakeTinyAmbientBitmap(src: Bitmap, outW: Int = 48, outH: Int = 104):
     return tiny
 }
 
+/** Moves a software bitmap to GPU memory (one copy instead of heap + HWUI texture). */
+private fun Bitmap.toGpuBitmap(): Bitmap {
+    if (config == Bitmap.Config.HARDWARE) return this
+    val hw = copy(Bitmap.Config.HARDWARE, false) ?: return this
+    recycle()
+    return hw
+}
+
 private fun hubMockTime(): LocalDateTime =
     LocalDateTime.of(java.time.LocalDate.now(), java.time.LocalTime.of(18, 45, 0))
 private val HUB_MOCK_ENV: Env = Env(
@@ -272,6 +280,7 @@ fun ThemeHubScreen(
     onRequestIgnoreBatteryOptimizations: () -> Unit = {}
 ) {
     val ctx = LocalContext.current
+    val appCtx = ctx.applicationContext
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
     val density = LocalDensity.current
@@ -402,6 +411,7 @@ fun ThemeHubScreen(
         previewImages.keys.toList().filter { it !in activeIds }.forEach { previewImages.remove(it) }
         ambientImages.keys.toList().filter { it !in activeIds }.forEach { ambientImages.remove(it) }
         HubPreviewCache.retainOnly(activeIds)
+        withContext(Dispatchers.IO) { runCatching { HubPreviewDiskCache.retainOnly(appCtx, activeIds) } }
 
         val windowList = ArrayList<Project>(12)
         val anchor = settledIndex.coerceIn(0, (activeItems.size - 1).coerceAtLeast(0))
@@ -456,8 +466,14 @@ fun ThemeHubScreen(
                 val wW = if (theme.isWidget) 420 else cardRenderW
                 val wH = if (theme.isWidget) (wW / theme.widgetAspect.coerceIn(0.6f, 4.5f)).roundToInt().coerceAtLeast(120) else cardRenderH
                 val sig = "${theme.id}|${theme.hashCode()}|${wW}x${wH}"
-                val entry = withContext(Dispatchers.Default) {
-                    renderMutex.withLock {
+                val diskKey = withContext(Dispatchers.Default) { HubPreviewDiskCache.key(theme, wW, wH) }
+                val fromDisk = withContext(Dispatchers.IO) {
+                    runCatching { HubPreviewDiskCache.load(appCtx, theme.id, diskKey) }.getOrNull()
+                }
+                val entry = if (fromDisk != null) {
+                    HubCachedCard(sig, fromDisk.preview, fromDisk.preview.asImageBitmap(), fromDisk.ambient.asImageBitmap())
+                } else withContext(Dispatchers.Default) {
+                    val rendered = renderMutex.withLock {
                         runCatching {
                             cardRenderer.clearShaderCachesForHome()
                             if (theme.isWidget) {
@@ -474,12 +490,7 @@ fun ThemeHubScreen(
                                 )
                                 val tinyAmb = bakeTinyAmbientBitmap(refBg ?: bmp)
                                 if (refBg != null && !refBg.isRecycled) runCatching { refBg.recycle() }
-                                HubCachedCard(
-                                    signature = sig,
-                                    preview = bmp,
-                                    previewImage = bmp.asImageBitmap(),
-                                    ambientImage = tinyAmb.asImageBitmap()
-                                )
+                                bmp to tinyAmb
                             } else {
                                 val uri = WallpaperCarousel.currentUri(ctx, theme, advance = false, persist = false)
                                 val rawBg = WallpaperCarousel.loadBitmap(ctx, uri, cardRenderW, cardRenderH, preferRgb565 = true, cacheInMemory = false)
@@ -508,15 +519,17 @@ fun ThemeHubScreen(
                                 if (depthMask != null && depthMask !== rawMask && !depthMask.isRecycled) depthMask.recycle()
                                 if (rawBg != null && !rawBg.isRecycled) rawBg.recycle()
                                 if (rawMask != null && !rawMask.isRecycled) rawMask.recycle()
-                                HubCachedCard(
-                                    signature = sig,
-                                    preview = bmp,
-                                    previewImage = bmp.asImageBitmap(),
-                                    ambientImage = tinyAmb.asImageBitmap()
-                                )
+                                bmp to tinyAmb
                             }
                         }.getOrNull()
+                    } ?: return@withContext null
+                    val (bmp, amb) = rendered
+                    withContext(Dispatchers.IO) {
+                        runCatching { HubPreviewDiskCache.save(appCtx, theme.id, diskKey, bmp, amb) }
                     }
+                    val gpuPreview = bmp.toGpuBitmap()
+                    val gpuAmb = amb.toGpuBitmap()
+                    HubCachedCard(sig, gpuPreview, gpuPreview.asImageBitmap(), gpuAmb.asImageBitmap())
                 }
                 if (entry != null) {
                     withContext(NonCancellable) {

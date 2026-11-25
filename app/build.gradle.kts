@@ -22,8 +22,10 @@ android {
     buildTypes {
         release {
             signingConfig = signingConfigs.getByName("debug")
+            // R8: shrinks/optimizes Compose + coroutines; ~halves dex and cuts JIT/RAM at runtime.
+            // kotlinx.serialization and AndroidX ship their own consumer keep rules.
             optimization {
-                enable = false
+                enable = true
             }
         }
     }

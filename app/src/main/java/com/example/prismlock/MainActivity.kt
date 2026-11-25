@@ -1,6 +1,5 @@
 package com.example.prismlock
 
-import android.app.Application
 import android.app.WallpaperManager
 import android.content.ComponentName
 import android.content.Context
@@ -9,7 +8,6 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Bundle
 import android.os.PowerManager
-import android.os.Process
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.PredictiveBackHandler
@@ -192,17 +190,11 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        val shouldKillUiProcess = !isChangingConfigurations &&
-            runCatching { !Application.getProcessName().endsWith(":wallpaper") }.getOrDefault(false) &&
-            !WallpaperBaker.isBakeRunning
         flushPendingSaveBlocking()
-        if (shouldKillUiProcess) {
+        if (!isChangingConfigurations) {
             releaseUiMemory()
         }
         super.onDestroy()
-        if (shouldKillUiProcess) {
-            Process.killProcess(Process.myPid())
-        }
     }
 }
 

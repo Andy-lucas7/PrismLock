@@ -31,6 +31,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -169,11 +170,14 @@ fun InteractiveLockPreview(
     val hasSecondsLayer = remember(project.layers) {
         Dynamic.hasSeconds(project)
     }
-    LaunchedEffect(hasSecondsLayer) {
+    LaunchedEffect(hasSecondsLayer, lifecycleOwner) {
         if (!hasSecondsLayer) return@LaunchedEffect
-        while (true) {
-            kotlinx.coroutines.delay(1000L)
-            secondsTick++
+        // Ticks only while visible, aligned to the wall-clock second (one wake per second, none in background).
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                kotlinx.coroutines.delay(1000L - System.currentTimeMillis() % 1000L)
+                secondsTick++
+            }
         }
     }
     val hitBoxes = remember(project.id) { mutableListOf<HitBox>() }
