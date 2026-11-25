@@ -4,6 +4,4 @@
     <include domain="file" path="media/" />
     <include domain="file" path="fonts/" />
     <include domain="file" path="custom_fonts/" />
-    <exclude domain="file" path="baked_cache/" />
-    <exclude domain="file" path="ipc_state/" />
 </full-backup-content>
