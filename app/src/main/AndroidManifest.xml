@@ -6,7 +6,6 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-    <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <queries>
@@ -60,13 +59,16 @@
             android:process=":wallpaper">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
-                <action android:name="com.example.prismlock.ACTION_WIDGET_TAP" />
-                <action android:name="com.example.prismlock.ACTION_WIDGET_REFRESH" />
             </intent-filter>
             <meta-data
                 android:name="android.appwidget.provider"
                 android:resource="@xml/prism_widget_info" />
         </receiver>
+
+        <receiver
+            android:name=".widget.PrismWidgetActionReceiver"
+            android:exported="false"
+            android:process=":wallpaper" />
 
         <meta-data
             android:name="com.google.mlkit.vision.DEPENDENCIES"

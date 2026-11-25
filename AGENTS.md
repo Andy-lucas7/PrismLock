@@ -10,7 +10,7 @@ AGENTS.md — PRISMLOCK ENGINE (SYSTEM DIRECTIVES & ARCHITECTURE)
 
 2. REGRAS DE PERFORMANCE E FLUIDEZ (120FPS SEM TRAVAMENTOS)
 
-• Zero Sensores Físicos: Proibido usar SensorManager, giroscópio ou acelerômetro em qualquer classe.
+• Sensores Controlados: Sensores só via MotionSource (Etapa 8), registrado apenas com o wallpaper visível e o paralaxe ligado; nenhum outro uso de sensores.
 • Event-Driven WallpaperService, Processo Isolado :wallpaper & Trava Térmica: 0% de uso de CPU/GPU em repouso. PrismWallpaperService e PrismWidgetProvider rodam isolados em android:process=":wallpaper" (sem carregar Compose ou bibliotecas nativas do ML Kit) mantendo o frame final completo pré-composto em RGB_565 em ACTION_TIME_TICK e ACTION_SCREEN_OFF para despertar em 0ms. Renderize apenas em ACTION_TIME_TICK, ACTION_BATTERY_CHANGED, onVisibilityChanged(true), ACTION_USER_PRESENT, toques na Tela Inicial quando houver camadas HOME_ONLY/ALWAYS e frames de vídeo quando visível (pausa síncrona imediata em onVisibilityChanged(false), ACTION_SCREEN_OFF e Home unlock quando lock-only).
 • Resolução Base Proporcional (FHD+): Todos os buffers internos (sharp, frosted, depthMask, lensHeightMap, VideoWallpaperRenderer e preview) operam com largura máxima de 1080px preservando a proporção exata da tela física. Não alterar artificialmente a taxa de atualização (Hz) nativa da tela.
 • Editor & Carrossel Hub Sem Engasgos (120Hz):
@@ -37,3 +37,8 @@ AGENTS.md — PRISMLOCK ENGINE (SYSTEM DIRECTIVES & ARCHITECTURE)
 	• Hit-test preciso por matriz inversa (inclusive subindo para STACK pai) com execução na Tela Inicial via onTouchEvent / COMMAND_TAP + PendingIntent BAL-safe e <queries> compatível com a Play Store; controles e modo teste ficam integrados na aba Posição & Toque.
 • Pacotes Portáteis & Diferenciação Widget/Wallpaper (PrismPackageManager):
 	• Exporta e importa pacotes .prism (Wallpapers, packageType = "WALLPAPER") e .widget.prism (Widgets, packageType = "WIDGET", isWidget = true, widgetAspect e widget.json opcional), empacotando theme.json/widget.json, bundle.json (v2), assets/, custom_assets/, layer_assets/ e fonts/, além de pastas descompactadas no mesmo padrão, roteando para ProjectStore.upsertWidget ou ProjectStore.upsertTheme conforme isWidget.
+
+4. MOVIMENTO E IDENTIDADE VISUAL
+
+• Referência normativa: PRISMLOCK_IDENTIDADE_MOVIMENTO.md e fonte única de tokens em docs/motion.tokens.json espelhada em ui/PrismMotion.kt.
+• Toda nova animação de UI deve consumir PrismMotion (Duration, Easing, Springs, Blur, Scale, Gesture, rubberBand e isReducedMotionEnabled), mantendo 100% das transformações em graphicsLayer/drawWithCache sem alocações por frame.

@@ -2,6 +2,7 @@ package com.example.prismlock.model
 
 import kotlinx.serialization.Serializable
 import java.util.UUID
+import kotlin.math.roundToInt
 
 @Serializable enum class LayerType { TEXT, STACK, SHAPE, ICON, SVG, IMAGE, DEPTH }
 @Serializable enum class Cond { ALWAYS, LOCK_ONLY, HOME_ONLY, CHARGING, NOT_CHARGING, LOW_BATTERY, DAY, NIGHT }
@@ -12,6 +13,23 @@ import java.util.UUID
 @Serializable enum class ShapeKind { RECT, CIRCLE, LINE, BAR, RING }
 @Serializable enum class Dir { VERTICAL, HORIZONTAL }
 @Serializable enum class Align { START, CENTER, END }
+@Serializable enum class MotionAxes { BOTH, HORIZONTAL, VERTICAL }
+@Serializable enum class LayerMotion { FOLLOW_PLANE, STILL, CUSTOM }
+
+@Serializable
+data class MotionScene(
+    val enabled: Boolean = false,
+    val intensity: Float = 1f,
+    val backgroundDepth: Float = 1f,
+    val itemsDepth: Float = 0f,
+    val subjectDepth: Float = -0.35f,
+    val axes: MotionAxes = MotionAxes.BOTH,
+    val invert: Boolean = false,
+    val homeScreen: Boolean = true
+) {
+    fun maxShiftPx(screenWidthPx: Int): Float =
+        48f * (screenWidthPx.coerceAtLeast(1) / 1080f) * intensity.coerceIn(0f, 2f)
+}
 
 @Serializable
 enum class TouchActionType {
@@ -132,7 +150,9 @@ data class LayerNode(
     val fxOffsetX: String = "",
     val fxOffsetY: String = "",
     val fxSize: String = "",
-    val fxAsset: String = ""
+    val fxAsset: String = "",
+    val motion: LayerMotion = LayerMotion.FOLLOW_PLANE,
+    val motionDepth: Float = 0f
 ) {
     fun hasFx(): Boolean =
         fxColor.isNotEmpty() ||
@@ -144,6 +164,9 @@ data class LayerNode(
             fxSize.isNotEmpty() ||
             fxAsset.isNotEmpty()
 }
+
+const val WIDGET_ASPECT_MIN = 0.6f
+const val WIDGET_ASPECT_MAX = 4.5f
 
 @Serializable
 data class Project(
@@ -165,13 +188,14 @@ data class Project(
     val depthSubjectPop: Float = 0f,
     val depthVignette: Float = 0f,
     val city: String = "",
-    val lat: Double = -23.55,
-    val lon: Double = -46.63,
+    val lat: Double? = null,
+    val lon: Double? = null,
     val dim: Float = 0.12f,
     val globals: List<GlobalVar> = emptyList(),
     val isWidget: Boolean = false,
     val widgetAspect: Float = 2.0f,
-    val customAssets: Map<String, String> = emptyMap()
+    val customAssets: Map<String, String> = emptyMap(),
+    val motion: MotionScene = MotionScene()
 ) {
     fun isDepthEnabledFor(imageKey: String): Boolean =
         depthOverrides[imageKey] ?: defaultDepthForNewImages
@@ -303,6 +327,116 @@ fun List<LayerNode>.move(id: String, delta: Int): List<LayerNode> {
 fun List<LayerNode>.flatten(depth: Int = 0, out: MutableList<Pair<LayerNode, Int>> = mutableListOf()): List<Pair<LayerNode, Int>> {
     for (n in this) { out.add(n to depth); n.children.flatten(depth + 1, out) }
     return out
+}
+
+fun List<LayerNode>.rootIndexOf(id: String?): Int {
+    if (id == null) return -1
+    for (i in indices) {
+        val root = this[i]
+        if (root.id == id || root.children.find(id) != null) return i
+    }
+    return -1
+}
+
+fun List<LayerNode>.isAboveSubject(id: String?): Boolean {
+    if (id == null) return false
+    val depthIdx = indexOfFirst { it.type == LayerType.DEPTH }
+    if (depthIdx < 0) return false
+    val rootIdx = rootIndexOf(id)
+    return rootIdx > depthIdx
+}
+
+fun List<LayerNode>.setAboveSubject(id: String, above: Boolean): List<LayerNode> {
+    val depthIdx = indexOfFirst { it.type == LayerType.DEPTH }
+    val rootIdx = rootIndexOf(id)
+    if (depthIdx < 0 || rootIdx < 0 || rootIdx == depthIdx) return this
+    val alreadyAbove = rootIdx > depthIdx
+    if (alreadyAbove == above) return this
+    val mutable = toMutableList()
+    val item = mutable.removeAt(rootIdx)
+    val newDepthIdx = mutable.indexOfFirst { it.type == LayerType.DEPTH }
+    val targetIdx = if (above) (newDepthIdx + 1).coerceAtMost(mutable.size) else newDepthIdx.coerceAtLeast(0)
+    mutable.add(targetIdx, item)
+    return mutable
+}
+
+private fun LayerNode.stripNestedDepth(): LayerNode {
+    if (children.isEmpty()) return this
+    var changed = false
+    val out = ArrayList<LayerNode>(children.size)
+    for (child in children) {
+        if (child.type == LayerType.DEPTH) {
+            changed = true
+            continue
+        }
+        val cleaned = child.stripNestedDepth()
+        if (cleaned !== child) changed = true
+        out.add(cleaned)
+    }
+    return if (changed) copy(children = out) else this
+}
+
+fun List<LayerNode>.ensureSingleRootDepth(): List<LayerNode> {
+    var seenDepth = false
+    var changed = false
+    val out = ArrayList<LayerNode>(size)
+    for (layer in this) {
+        if (layer.type == LayerType.DEPTH) {
+            if (seenDepth) {
+                changed = true
+                continue
+            }
+            seenDepth = true
+            val cleaned = if (layer.children.isNotEmpty()) {
+                changed = true
+                layer.copy(children = emptyList())
+            } else layer
+            out.add(cleaned)
+        } else {
+            val cleaned = layer.stripNestedDepth()
+            if (cleaned !== layer) changed = true
+            out.add(cleaned)
+        }
+    }
+    return if (changed) out else this
+}
+
+fun LayerNode.migrated(): LayerNode {
+    val w = axes["wght"]
+    val cleaned = if (w != null) {
+        copy(
+            weight = if (w.isFinite()) w.roundToInt().coerceIn(1, 1000) else weight,
+            axes = axes - "wght"
+        )
+    } else {
+        this
+    }
+    if (cleaned.children.isEmpty()) return cleaned
+    var changed = false
+    val migratedChildren = cleaned.children.map { child ->
+        val m = child.migrated()
+        if (m !== child) changed = true
+        m
+    }
+    return if (changed) cleaned.copy(children = migratedChildren) else cleaned
+}
+
+fun Project.migrated(): Project {
+    val phantomSp = lat == -23.55 && lon == -46.63 && city.isBlank()
+    var changed = phantomSp
+    val migratedLayers = if (layers.isEmpty()) layers else layers.map { layer ->
+        val m = layer.migrated()
+        if (m !== layer) changed = true
+        m
+    }
+    val deduped = migratedLayers.ensureSingleRootDepth()
+    if (deduped !== migratedLayers) changed = true
+    if (!changed) return this
+    return copy(
+        layers = deduped,
+        lat = if (phantomSp) null else lat,
+        lon = if (phantomSp) null else lon
+    )
 }
 
 object Presets {

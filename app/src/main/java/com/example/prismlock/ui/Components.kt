@@ -522,12 +522,22 @@ fun PrecisionSliderField(
     globals: Map<String, String> = emptyMap(),
     projectGlobals: List<GlobalVar> = emptyList(),
     onFxChange: ((String) -> Unit)? = null,
+    onDragStateChange: ((Boolean) -> Unit)? = null,
     onValueChange: (Float) -> Unit
 ) {
     var sliderVal by remember { mutableFloatStateOf(value.coerceIn(range.start, range.endInclusive)) }
     var dragging by remember { mutableStateOf(false) }
     var showEditDialog by remember { mutableStateOf(false) }
     var showFxDialog by remember { mutableStateOf(false) }
+
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        onDispose {
+            if (dragging) {
+                dragging = false
+                onDragStateChange?.invoke(false)
+            }
+        }
+    }
 
     LaunchedEffect(value) {
         if (!dragging) {
@@ -544,12 +554,18 @@ fun PrecisionSliderField(
             Slider(
                 value = sliderVal,
                 onValueChange = { v ->
-                    dragging = true
+                    if (!dragging) {
+                        dragging = true
+                        onDragStateChange?.invoke(true)
+                    }
                     sliderVal = v
                     onValueChange(v)
                 },
                 onValueChangeFinished = {
-                    dragging = false
+                    if (dragging) {
+                        dragging = false
+                        onDragStateChange?.invoke(false)
+                    }
                     onValueChangeFinished?.invoke()
                 },
                 valueRange = range,

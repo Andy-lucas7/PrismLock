@@ -71,6 +71,7 @@ import com.example.prismlock.wallpaper.VideoWallpaperRenderer
 import com.example.prismlock.wallpaper.WallpaperCarousel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.filter
@@ -125,6 +126,10 @@ fun InteractiveLockPreview(
     onUpdateLayer: (String, (LayerNode) -> LayerNode) -> Unit,
     onFlushSave: () -> Unit,
     onDragStateChange: (Boolean) -> Unit = {},
+    blurRefreshTick: Int = 0,
+    motionNormX: Float = 0f,
+    motionNormY: Float = 0f,
+    allowTiltDrag: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     val ctx = LocalContext.current
@@ -141,10 +146,24 @@ fun InteractiveLockPreview(
     val currentDepth by rememberUpdatedState(depthBitmap)
     val currentPreviewLocked by rememberUpdatedState(previewLocked)
     val currentTestTouchMode by rememberUpdatedState(testTouchMode)
+    val currentAllowTiltDrag by rememberUpdatedState(allowTiltDrag)
     val currentEnv by rememberUpdatedState(env.copy(locked = previewLocked))
+    val tiltX = remember { androidx.compose.animation.core.Animatable(0f) }
+    val tiltY = remember { androidx.compose.animation.core.Animatable(0f) }
+    val tiltScope = androidx.compose.runtime.rememberCoroutineScope()
 
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
     var preparedVersion by remember(project.id) { mutableStateOf(0) }
+    val currentBlurRefreshTick by rememberUpdatedState(blurRefreshTick)
+    val blurUiHandler = remember { android.os.Handler(android.os.Looper.getMainLooper()) }
+    DisposableEffect(renderer, project.id) {
+        renderer.onInteractiveBlurReady = {
+            blurUiHandler.post { preparedVersion++ }
+        }
+        onDispose {
+            renderer.onInteractiveBlurReady = null
+        }
+    }
     var videoFrameTick by remember { mutableIntStateOf(0) }
     var secondsTick by remember { mutableIntStateOf(0) }
     val hasSecondsLayer = remember(project.layers) {
@@ -227,9 +246,9 @@ fun InteractiveLockPreview(
         renderer.setAllowStaleLensOnMiss(true)
         snapshotFlow {
             Triple(
-                PreparedPreview(currentProject, currentBg, currentDepth, currentEnv, 0),
+                PreparedPreview(currentProject, currentBg, currentDepth, currentEnv, currentBlurRefreshTick),
                 canvasSize,
-                currentActiveDragId != null || currentDraggingStretch
+                currentActiveDragId != null || currentDraggingStretch || renderer.interactiveBlur
             )
         }.filter { !it.third }.debounce(160).conflate().collect { (frame, sz, _) ->
             val needsLensOrBlur = frame.project.layers.flatten().any { (n, _) ->
@@ -290,10 +309,11 @@ fun InteractiveLockPreview(
                         val rootBox = lockedDragId?.let { id -> hitBoxes.firstOrNull { it.id == id }?.rect }
                         var rawX = rootNode?.x ?: 0f
                         var rawY = rootNode?.y ?: 0f
-                        val boxW = rootBox?.width() ?: 0f
-                        val boxH = rootBox?.height() ?: 0f
-                        val boxOffsetX = if (rootBox != null && rootNode != null) rootBox.left - rootNode.x * cw else 0f
-                        val boxOffsetY = if (rootBox != null && rootNode != null) rootBox.top - rootNode.y * ch else 0f
+                        var boxW = rootBox?.width() ?: 0f
+                        var boxH = rootBox?.height() ?: 0f
+                        var boxOffsetX = if (rootBox != null && rootNode != null) rootBox.left - rootNode.x * cw else 0f
+                        var boxOffsetY = if (rootBox != null && rootNode != null) rootBox.top - rootNode.y * ch else 0f
+                        var wasMultiTouch = false
                         val baseMarginX = marginPx / sxScale
                         val baseMarginY = marginPx / syScale
                         val baseSnapX = snapRadiusPx / sxScale
@@ -307,6 +327,7 @@ fun InteractiveLockPreview(
                             val event = awaitPointerEvent()
                             val pressedCount = event.changes.count { it.pressed }
                             if (pressedCount >= 2) {
+                                wasMultiTouch = true
                                 if (!movedPastSlop) {
                                     movedPastSlop = true
                                     onDragStateChange(true)
@@ -332,6 +353,20 @@ fun InteractiveLockPreview(
                                 }
                                 event.changes.forEach { it.consume() }
                             } else if (pressedCount == 1) {
+                                if (wasMultiTouch) {
+                                    wasMultiTouch = false
+                                    val freshId = currentActiveDragId
+                                    val freshNode = freshId?.let { currentProject.layers.find(it) }
+                                    val freshBox = freshId?.let { id -> hitBoxes.firstOrNull { it.id == id }?.rect }
+                                    if (freshNode != null && freshBox != null) {
+                                        rawX = freshNode.x
+                                        rawY = freshNode.y
+                                        boxW = freshBox.width()
+                                        boxH = freshBox.height()
+                                        boxOffsetX = freshBox.left - freshNode.x * cw
+                                        boxOffsetY = freshBox.top - freshNode.y * ch
+                                    }
+                                }
                                 val pan = event.calculatePan()
                                 totalPan += pan
                                 if (!movedPastSlop && totalPan.getDistance() > touchSlop) {
@@ -340,7 +375,16 @@ fun InteractiveLockPreview(
                                     if (currentActiveDragId != null) onDragStateChange(true)
                                 }
                                 val dragId = currentActiveDragId
-                                if (movedPastSlop && dragId != null && pan != Offset.Zero) {
+                                if (dragId == null && currentAllowTiltDrag && pan != Offset.Zero) {
+                                    movedPastSlop = true
+                                    tiltScope.launch {
+                                        val nx = (tiltX.value + pan.x / (vw * 0.35f)).coerceIn(-1f, 1f)
+                                        val ny = (tiltY.value + pan.y / (vh * 0.35f)).coerceIn(-1f, 1f)
+                                        tiltX.snapTo(nx)
+                                        tiltY.snapTo(ny)
+                                    }
+                                    event.changes.forEach { it.consume() }
+                                } else if (movedPastSlop && dragId != null && pan != Offset.Zero) {
                                     rawX = (rawX + (pan.x / sxScale) / cw).coerceIn(0f, 1f)
                                     rawY = (rawY + (pan.y / syScale) / ch).coerceIn(0f, 1f)
 
@@ -420,6 +464,10 @@ fun InteractiveLockPreview(
                         } else {
                             onFlushSave()
                         }
+                        if (tiltX.value != 0f || tiltY.value != 0f) {
+                            tiltScope.launch { tiltX.animateTo(0f, PrismMotion.ExpandFloatSpring) }
+                            tiltScope.launch { tiltY.animateTo(0f, PrismMotion.ExpandFloatSpring) }
+                        }
                         activeDraggingLayerId = null
                         snapLineX = null
                         snapLineY = null
@@ -481,8 +529,11 @@ fun InteractiveLockPreview(
                             append(viewW).append('x').append(viewH).append('|')
                             append(timeKey).append('|')
                             append(lockedEnv.hashCode()).append('|')
-                            append(ver)
+                            append(ver).append('|')
+                            append(blurRefreshTick)
                         }
+                        val effMotionX = (motionNormX + tiltX.value).coerceIn(-1f, 1f)
+                        val effMotionY = (motionNormY + tiltY.value).coerceIn(-1f, 1f)
                         renderer.renderScaledBaseFrame(
                             canvas = c.nativeCanvas,
                             viewW = viewW,
@@ -495,7 +546,9 @@ fun InteractiveLockPreview(
                             env = lockedEnv,
                             now = now,
                             hits = hitBoxes,
-                            cacheKey = sceneCacheKey
+                            cacheKey = sceneCacheKey,
+                            motionNormX = effMotionX,
+                            motionNormY = effMotionY
                         )
                     }
                 }

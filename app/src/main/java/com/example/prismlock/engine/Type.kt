@@ -47,8 +47,12 @@ object FontManager {
     )
 
     val systemFamilies = listOf("sans-serif", "sans-serif-light", "sans-serif-condensed", "sans-serif-medium", "serif", "monospace", "cursive", "casual", "serif-monospace")
-    private val tfCache = HashMap<String, Typeface>()
-    private val composeFamilyCache = HashMap<String, ComposeFontFamily>()
+    private val tfCache = object : LinkedHashMap<String, Typeface>(24, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Typeface>?): Boolean = size > 20
+    }
+    private val composeFamilyCache = object : LinkedHashMap<String, ComposeFontFamily>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ComposeFontFamily>?): Boolean = size > 12
+    }
     private val axesCache = HashMap<String, List<FontAxis>>()
     private val familyNameCache = HashMap<String, String>()
     private val samsungFontFiles = ArrayList<File>()
@@ -262,15 +266,44 @@ object FontManager {
         syncedCount
     }
 
+    fun invalidateFontCache(fontId: String) {
+        synchronized(tfCache) {
+            val prefix = "$fontId|"
+            tfCache.keys.removeAll { it.startsWith(prefix) }
+        }
+        synchronized(composeFamilyCache) {
+            val prefix = "$fontId|"
+            composeFamilyCache.keys.removeAll { it.startsWith(prefix) }
+        }
+        synchronized(axesCache) { axesCache.remove(fontId) }
+        synchronized(familyNameCache) { familyNameCache.remove(fontId) }
+    }
+
     fun import(ctx: Context, uri: Uri): String? = runCatching {
         init(ctx)
-        var name = "font_${System.currentTimeMillis()}.ttf"
-        ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c -> if (c.moveToFirst()) name = c.getString(0).replace(Regex("[^A-Za-z0-9._-]"), "_") }
-        val f = File(dir, name)
-        ctx.contentResolver.openInputStream(uri)!!.use { i -> f.outputStream().use { i.copyTo(it) } }
-        Typeface.Builder(f).build() ?: error("invalid")
-        val id = "file:$name"
-        synchronized(familyNameCache) { familyNameCache.remove(id) }
+        var rawName = "font_${System.currentTimeMillis()}.ttf"
+        ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) rawName = c.getString(0).replace(Regex("[^A-Za-z0-9._-]"), "_")
+        }
+        val base = rawName.substringBeforeLast('.', rawName).ifBlank { "font" }
+        val ext = rawName.substringAfterLast('.', "ttf").lowercase().takeIf { it == "ttf" || it == "otf" } ?: "ttf"
+        val uniqueName = "${base}_${System.currentTimeMillis().toString(36)}.$ext"
+        val tmp = File(dir, "$uniqueName.tmp")
+        val f = File(dir, uniqueName)
+        try {
+            ctx.contentResolver.openInputStream(uri)!!.use { i -> tmp.outputStream().use { i.copyTo(it) } }
+            Typeface.Builder(tmp).build() ?: error("invalid")
+            if (!tmp.renameTo(f)) {
+                tmp.copyTo(f, overwrite = true)
+                tmp.delete()
+            }
+        } catch (e: Throwable) {
+            runCatching { tmp.delete() }
+            runCatching { f.delete() }
+            throw e
+        }
+        val id = "file:$uniqueName"
+        invalidateFontCache(id)
         id
     }.getOrNull()
 
@@ -434,7 +467,10 @@ object FontManager {
         val ax = axes(node.font)
         if (ax.isEmpty()) return ""
         val m = LinkedHashMap<String, Float>()
-        ax.forEach { m[it.tag] = node.axes[it.tag] ?: if (it.tag == "wght") node.weight.toFloat().coerceIn(it.min, it.max) else it.def }
+        ax.forEach {
+            m[it.tag] = if (it.tag == "wght") node.weight.toFloat().coerceIn(it.min, it.max)
+            else node.axes[it.tag] ?: it.def
+        }
         return m.entries.joinToString(", ") { "'${it.key}' ${it.value}" }
     }
 }

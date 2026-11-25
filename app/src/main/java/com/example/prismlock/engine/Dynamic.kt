@@ -19,9 +19,26 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 object Dynamic {
-    private val fmtCache = HashMap<String, DateTimeFormatter?>()
-    private val textCache = HashMap<String, String>()
-    private var cacheStamp = ""
+    private val fmtCache = java.util.concurrent.ConcurrentHashMap<String, java.util.Optional<DateTimeFormatter>>()
+    private const val MAX_TEXT_CACHE_STAMPS = 3
+    private val cacheLock = Any()
+    private val textCaches = LinkedHashMap<String, java.util.concurrent.ConcurrentHashMap<String, String>>(8, 0.75f, true)
+
+    private fun textCacheFor(stamp: String): java.util.concurrent.ConcurrentHashMap<String, String> =
+        synchronized(cacheLock) {
+            textCaches.getOrPut(stamp) { java.util.concurrent.ConcurrentHashMap() }.also {
+                while (textCaches.size > MAX_TEXT_CACHE_STAMPS) {
+                    val eldest = textCaches.keys.iterator()
+                    eldest.next()
+                    eldest.remove()
+                }
+            }
+        }
+
+    internal fun cachedFormatter(pattern: String): DateTimeFormatter? =
+        fmtCache.computeIfAbsent(pattern) {
+            java.util.Optional.ofNullable(runCatching { DateTimeFormatter.ofPattern(pattern, Locale.getDefault()) }.getOrNull())
+        }.orElse(null)
 
     val tags = listOf("{HH}", "{mm}", "{ss}", "{H}", "{hh}", "{a}", "{EEEE}", "{EEEE_UPPER}", "{EEE}", "{d}", "{dd}", "{MMMM}", "{MMM}", "{MM}",
         "{yyyy/MM/dd}", "{yyyy. MM. dd.}", "{bat}", "{charging}", "{temp}", "{cond}", "{city}", "{alarm}", "{steps}", "{dayprog}", "{=bat*2}")
@@ -83,7 +100,7 @@ object Dynamic {
         val hasSec = KustomFormulaEngine.hasSecondsToken(text)
         val gHash = globals.hashCode()
         val stamp = if (hasSec) "${now.withNano(0)}|$env|$gHash" else "${now.withSecond(0).withNano(0)}|$env|$gHash"
-        if (stamp != cacheStamp) { textCache.clear(); cacheStamp = stamp }
+        val textCache = textCacheFor(stamp)
         textCache[text]?.let { return it }
 
         var cur = if (hasDollar) KustomFormulaEngine.evalDollarBlocks(text, env, now, globals) else text
@@ -128,7 +145,7 @@ object Dynamic {
                 globals[t.trim().lowercase()]?.let { gVal ->
                     if ('$' in gVal) KustomFormulaEngine.evalDollarBlocks(gVal, env, now, globals) else gVal
                 } ?: run {
-                    val f = fmtCache.getOrPut(t) { runCatching { DateTimeFormatter.ofPattern(t, Locale.getDefault()) }.getOrNull() }
+                    val f = cachedFormatter(t)
                     f?.let { runCatching { it.format(now) }.getOrNull() } ?: "{$raw}"
                 }
             }

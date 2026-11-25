@@ -12,6 +12,7 @@ import com.example.prismlock.model.LayerNode
 import com.example.prismlock.model.LayerType
 import com.example.prismlock.model.Project
 import com.example.prismlock.model.flatten
+import com.example.prismlock.model.migrated
 import com.example.prismlock.wallpaper.WallpaperCarousel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -228,7 +229,7 @@ object PrismPackageManager {
 
                 if (!isZip) {
                     val rawJson = bis.bufferedReader().readText()
-                    val imported = json.decodeFromString(Project.serializer(), rawJson)
+                    val imported = json.decodeFromString(Project.serializer(), rawJson).migrated()
                     val isW = imported.isWidget || nameHintWidget
                     return@withContext imported.copy(
                         id = UUID.randomUUID().toString(),
@@ -240,6 +241,8 @@ object PrismPackageManager {
 
                 val newThemeId = UUID.randomUUID().toString()
                 val themeDir = File(File(ctx.filesDir, "imported_themes").apply { mkdirs() }, newThemeId).apply { mkdirs() }
+                var importSucceeded = false
+                try {
                 val assetsDir = File(themeDir, "assets").apply { mkdirs() }
                 val customAssetsDir = File(themeDir, "custom_assets").apply { mkdirs() }
                 val layerAssetsDir = File(themeDir, "layer_assets").apply { mkdirs() }
@@ -258,51 +261,57 @@ object PrismPackageManager {
                     while (entry != null) {
                         if (!entry.isDirectory) {
                             val rel = entry.name.replace('\\', '/').trimStart('/')
-                            if (".." !in rel) {
+                            val hasTraversal = rel.split('/').any { it == ".." }
+                            if (!hasTraversal) {
                                 val fileName = File(rel).name.replace(Regex("[^A-Za-z0-9._-]"), "_")
                                 when {
                                     rel == "widget.json" || rel.endsWith("/widget.json") -> {
                                         sawWidgetJson = true
-                                        themeJsonText = zis.readBytes().toString(Charsets.UTF_8)
+                                        themeJsonText = readBoundedBytes(zis, 2 * 1024 * 1024)?.toString(Charsets.UTF_8)
                                     }
                                     (rel == "theme.json" || rel.endsWith("/theme.json")) -> {
-                                        if (themeJsonText == null) themeJsonText = zis.readBytes().toString(Charsets.UTF_8)
-                                    }
-                                    themeJsonText == null && rel.endsWith(".json") && !rel.endsWith("bundle.json") -> {
-                                        themeJsonText = zis.readBytes().toString(Charsets.UTF_8)
+                                        if (themeJsonText == null) themeJsonText = readBoundedBytes(zis, 2 * 1024 * 1024)?.toString(Charsets.UTF_8)
                                     }
                                     rel == "bundle.json" || rel.endsWith("/bundle.json") -> {
-                                        val bText = zis.readBytes().toString(Charsets.UTF_8)
-                                        bundleManifest = runCatching { json.decodeFromString(PrismBundleManifest.serializer(), bText) }.getOrNull()
+                                        val bText = readBoundedBytes(zis, 2 * 1024 * 1024)?.toString(Charsets.UTF_8)
+                                        if (bText != null) {
+                                            bundleManifest = runCatching { json.decodeFromString(PrismBundleManifest.serializer(), bText) }.getOrNull()
+                                        }
                                     }
                                     ("/fonts/" in "/$rel") || rel.endsWith(".ttf", true) || rel.endsWith(".otf", true) -> {
-                                        val dst = File(customFontsDir, fileName)
-                                        dst.outputStream().use { zis.copyTo(it) }
-                                        if (runCatching { Typeface.Builder(dst).build() }.getOrNull() != null) {
+                                        val tmp = File(customFontsDir, "$fileName.tmp")
+                                        val okCopy = copyBoundedToFile(zis, tmp, 32 * 1024 * 1024)
+                                        if (okCopy && runCatching { Typeface.Builder(tmp).build() }.getOrNull() != null) {
+                                            val dst = File(customFontsDir, fileName)
+                                            if (!tmp.renameTo(dst)) { tmp.copyTo(dst, overwrite = true); tmp.delete() }
                                             val fontId = "custom:$fileName"
+                                            FontManager.invalidateFontCache(fontId)
                                             extractedFonts[rel] = fontId
                                             extractedFonts[fileName] = fontId
                                         } else {
-                                            dst.delete()
+                                            tmp.delete()
                                         }
                                     }
                                     rel.startsWith("custom_assets/") || "/custom_assets/" in "/$rel" -> {
                                         val dst = File(customAssetsDir, fileName)
-                                        dst.outputStream().use { zis.copyTo(it) }
-                                        extractedCustomAssets[rel] = dst
-                                        extractedCustomAssets[fileName] = dst
+                                        if (copyBoundedToFile(zis, dst, 64 * 1024 * 1024)) {
+                                            extractedCustomAssets[rel] = dst
+                                            extractedCustomAssets[fileName] = dst
+                                        } else dst.delete()
                                     }
                                     rel.startsWith("layer_assets/") || "/layer_assets/" in "/$rel" -> {
                                         val dst = File(layerAssetsDir, fileName)
-                                        dst.outputStream().use { zis.copyTo(it) }
-                                        extractedLayerAssets[rel] = dst
-                                        extractedLayerAssets[fileName] = dst
+                                        if (copyBoundedToFile(zis, dst, 64 * 1024 * 1024)) {
+                                            extractedLayerAssets[rel] = dst
+                                            extractedLayerAssets[fileName] = dst
+                                        } else dst.delete()
                                     }
                                     ("/assets/" in "/$rel") || isMediaFileName(fileName) -> {
                                         val dst = File(assetsDir, fileName)
-                                        dst.outputStream().use { zis.copyTo(it) }
-                                        extractedAssets[rel] = dst
-                                        extractedAssets[fileName] = dst
+                                        if (copyBoundedToFile(zis, dst, 200 * 1024 * 1024)) {
+                                            extractedAssets[rel] = dst
+                                            extractedAssets[fileName] = dst
+                                        } else dst.delete()
                                     }
                                 }
                             }
@@ -313,7 +322,7 @@ object PrismPackageManager {
                 }
 
                 val parsedProject = themeJsonText?.let {
-                    runCatching { json.decodeFromString(Project.serializer(), it) }.getOrNull()
+                    runCatching { json.decodeFromString(Project.serializer(), it).migrated() }.getOrNull()
                 } ?: return@withContext null
 
                 assembleImportedProject(
@@ -326,7 +335,10 @@ object PrismPackageManager {
                     extractedCustomAssets = extractedCustomAssets,
                     extractedLayerAssets = extractedLayerAssets,
                     assetsDir = assetsDir
-                )
+                ).also { importSucceeded = true }
+                } finally {
+                    if (!importSucceeded) runCatching { themeDir.deleteRecursively() }
+                }
             }
         }.getOrNull()
     }
@@ -441,7 +453,7 @@ object PrismPackageManager {
             }
 
             val parsedProject = themeJsonText?.let {
-                runCatching { json.decodeFromString(Project.serializer(), it) }.getOrNull()
+                runCatching { json.decodeFromString(Project.serializer(), it).migrated() }.getOrNull()
             } ?: return@withContext null
 
             assembleImportedProject(
@@ -618,6 +630,35 @@ object PrismPackageManager {
         }
         val baseWithoutExt = cleanBase.substringBeforeLast('.', cleanBase).ifBlank { "media" }
         return "media_${idx}_${baseWithoutExt}.$ext"
+    }
+
+    private fun readBoundedBytes(input: InputStream, maxBytes: Int): ByteArray? {
+        val out = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(16 * 1024)
+        var total = 0
+        while (true) {
+            val n = input.read(buf)
+            if (n <= 0) break
+            total += n
+            if (total > maxBytes) return null
+            out.write(buf, 0, n)
+        }
+        return out.toByteArray()
+    }
+
+    private fun copyBoundedToFile(input: InputStream, dst: File, maxBytes: Long): Boolean {
+        var total = 0L
+        val buf = ByteArray(32 * 1024)
+        dst.outputStream().use { out ->
+            while (true) {
+                val n = input.read(buf)
+                if (n <= 0) break
+                total += n
+                if (total > maxBytes) return false
+                out.write(buf, 0, n)
+            }
+        }
+        return true
     }
 
     private fun isMediaFileName(name: String): Boolean {

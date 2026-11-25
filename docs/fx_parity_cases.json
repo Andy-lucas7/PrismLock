@@ -1,0 +1,29 @@
+{
+  "timestamp": "2026-11-25T18:45:00",
+  "env": {
+    "battery": 85,
+    "charging": false,
+    "temp": 24,
+    "isDay": true,
+    "city": "Curitiba"
+  },
+  "globals": {
+    "accent": "#FF8AB4F8",
+    "status_label": "$if(bi(charging), \"Carregando\", \"Bateria \" + bi(level) + \"%\")$",
+    "greeting": "Olá $gv(user, Visitante)$"
+  },
+  "cases": [
+    { "name": "clock_24h", "expr": "$df(HH)$:$df(mm)$", "expected": "18:45" },
+    { "name": "battery_level", "expr": "$bi(level)$%", "expected": "85%" },
+    { "name": "conditional_false", "expr": "$if(bi(charging), \"SIM\", \"NAO\")$", "expected": "NAO" },
+    { "name": "conditional_numeric", "expr": "$if(bi(level) >= 80, \"ALTA\", \"BAIXA\")$", "expected": "ALTA" },
+    { "name": "text_upper", "expr": "$tc(up, \"prismlock\")$", "expected": "PRISMLOCK" },
+    { "name": "math_add_mul", "expr": "$2 + 3 * 4$", "expected": "14" },
+    { "name": "weather_temp", "expr": "$wi(temp)$°", "expected": "24°" },
+    { "name": "global_plain", "expr": "$gv(accent)$", "expected": "#FF8AB4F8" },
+    { "name": "global_nested_formula", "expr": "$gv(status_label)$", "expected": "Bateria 85%" },
+    { "name": "global_fallback", "expr": "$gv(greeting)$", "expected": "Olá Visitante" },
+    { "name": "color_contrast_dark", "expr": "$ce(\"#FF000000\", contrast)$", "expected": "#FFFFFFFF" },
+    { "name": "color_contrast_light", "expr": "$ce(\"#FFFFFFFF\", contrast)$", "expected": "#FF000000" }
+  ]
+}
