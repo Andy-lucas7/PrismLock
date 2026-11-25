@@ -412,8 +412,12 @@ fun StudioScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Left: Back to Theme Hub + Theme Name Pill
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                // Left: Back to Theme Hub + Theme Name Pill (cede espaço aos botões da direita)
+                Row(
+                    modifier = Modifier.weight(1f).padding(end = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
                     IconButton(
                         onClick = onBack,
                         modifier = Modifier
@@ -429,6 +433,7 @@ fun StudioScreen(
                     }
                     Box(
                         modifier = Modifier
+                            .weight(1f, fill = false)
                             .frostedChrome(shape = RoundedCornerShape(18.dp), elevation = 6.dp)
                             .clickable { showRenameDialog = true }
                             .padding(horizontal = 12.dp, vertical = 7.dp)
@@ -440,7 +445,8 @@ fun StudioScreen(
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Medium,
                                 maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f, fill = false)
                             )
                             Icon(
                                 MIcons.Rounded.Edit,
@@ -974,6 +980,7 @@ private fun LayersTab(
     onImportSvg: () -> Unit
 ) {
     val flat = remember(project.layers) { project.layers.flatten() }
+    val globalsMap = remember(project.globals) { project.globalsMap() }
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1076,7 +1083,7 @@ private fun LayersTab(
                     Spacer(Modifier.width(9.dp))
                     Column(Modifier.weight(1f)) {
                         Text(node.name, color = PrismColors.PureWhite, fontSize = 12.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(layerSubtitle(node, env, project.globalsMap()), color = PrismColors.MutedZinc, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(layerSubtitle(node, env, globalsMap), color = PrismColors.MutedZinc, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                     IconButton(onClick = { onCommit(project.copy(layers = project.layers.move(node.id, -1))) }, Modifier.size(26.dp)) {
                         Icon(MIcons.Rounded.ArrowUpward, null, tint = PrismColors.MutedZinc, modifier = Modifier.size(15.dp))
@@ -2609,13 +2616,12 @@ private fun ShapeAndFontTab(
     onPickFontFolder: () -> Unit,
     onRefreshFontFolder: (Boolean) -> Unit
 ) {
-    val ctx = LocalContext.current
     if (node == null) {
         Text("Selecione uma camada", color = PrismColors.MutedZinc, fontSize = 12.sp)
         return
     }
     var showFontListDialog by remember { mutableStateOf(false) }
-    val allFonts = remember(importedFonts) { FontManager.availableFonts(ctx) }
+    val allFonts = importedFonts
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         when (node.type) {

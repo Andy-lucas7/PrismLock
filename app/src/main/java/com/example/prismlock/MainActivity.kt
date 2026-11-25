@@ -46,7 +46,6 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -88,10 +87,12 @@ import com.example.prismlock.widget.PrismWidgetProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import java.util.UUID
@@ -200,24 +201,32 @@ private fun PrismApp() {
     var selectedLayerId by remember { mutableStateOf<String?>(null) }
     var focusThemeId by remember { mutableStateOf<String?>(null) }
     var pendingAssetAlias by remember { mutableStateOf<String?>(null) }
-    val saveFlow = remember { MutableSharedFlow<Project>(extraBufferCapacity = 64) }
+    // Pipeline único de persistência: toda gravação (debounce ou imediata) serializa no mutex
+    // e grava sempre o estado MAIS RECENTE do editor, impedindo que um save atrasado sobrescreva um commit novo.
+    val saveRequests = remember { MutableSharedFlow<Unit>(extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST) }
+    val saveMutex = remember { Mutex() }
 
-    LaunchedEffect(Unit) {
-        saveFlow.debounce(400).collectLatest { pending ->
-            if (pending.isWidget) {
-                ProjectStore.upsertWidget(ctx, pending)
+    suspend fun persist(explicit: Project? = null) {
+        saveMutex.withLock {
+            val snapshot = explicit ?: editingProject
+            if (snapshot.isWidget) {
+                ProjectStore.upsertWidget(ctx, snapshot)
             } else {
-                ProjectStore.upsertTheme(ctx, pending)
+                ProjectStore.upsertTheme(ctx, snapshot)
             }
         }
+    }
+
+    LaunchedEffect(Unit) {
+        saveRequests.debounce(400).collect { persist() }
     }
 
     var previewUri by remember { mutableStateOf<String?>(null) }
     val env by EnvProvider.env.collectAsState()
     var fontFolderUri by remember { mutableStateOf<String?>(null) }
-    var importedFonts by remember {
-        FontManager.init(ctx)
-        mutableStateOf(FontManager.availableFonts(ctx))
+    var importedFonts by remember { mutableStateOf<List<String>>(emptyList()) }
+    suspend fun reloadFonts() {
+        importedFonts = withContext(Dispatchers.IO) { FontManager.availableFonts(ctx) }
     }
 
     LaunchedEffect(Unit) {
@@ -228,16 +237,13 @@ private fun PrismApp() {
             FontManager.syncFontFolder(ctx, savedFolder)
         }
         FontManager.prewarm(ctx)
-        importedFonts = FontManager.availableFonts(ctx)
+        reloadFonts()
     }
     val wallPalette = remember(rawBgBitmap) { renderer.extractPalette(rawBgBitmap) }
 
     var isBaking by remember { mutableStateOf(false) }
     var bakeProgress by remember { mutableFloatStateOf(0f) }
     var bakeStatus by remember { mutableStateOf("Otimizando e compilando pacote nativo...") }
-
-    val currentProject by rememberUpdatedState(editingProject)
-    val currentSelectedId by rememberUpdatedState(selectedLayerId)
 
     LaunchedEffect(
         screen,
@@ -280,7 +286,7 @@ private fun PrismApp() {
     ) {
         val rBg = rawBgBitmap
         val rDepth = rawDepthBitmap
-        val proj = currentProject
+        val proj = editingProject
         if (rBg != null && rDepth != null && proj.hasDepthPostProcessing()) {
             kotlinx.coroutines.delay(60L)
             val (baseW, baseH) = WallpaperBaker.resolveDisplaySize(ctx)
@@ -307,26 +313,16 @@ private fun PrismApp() {
 
     fun stage(newProj: Project) {
         editingProject = newProj
-        saveFlow.tryEmit(newProj)
-    }
-
-    fun persistProject(snapshot: Project) {
-        scope.launch {
-            if (snapshot.isWidget) {
-                ProjectStore.upsertWidget(ctx, snapshot)
-            } else {
-                ProjectStore.upsertTheme(ctx, snapshot)
-            }
-        }
+        saveRequests.tryEmit(Unit)
     }
 
     fun flushSave() {
-        persistProject(currentProject)
+        scope.launch { persist() }
     }
 
     fun commit(newProj: Project) {
         editingProject = newProj
-        persistProject(newProj)
+        flushSave()
     }
 
     fun openStudio(theme: Project) {
@@ -342,14 +338,14 @@ private fun PrismApp() {
         fontFolderUri?.let { saved ->
             scope.launch {
                 FontManager.syncFontFolder(ctx, saved)
-                importedFonts = FontManager.availableFonts(ctx)
+                reloadFonts()
             }
         }
     }
 
     fun returnToHub() {
-        val snapshot = currentProject
-        persistProject(snapshot)
+        val snapshot = editingProject
+        scope.launch { persist(snapshot) }
         renderer.clearShaderCachesForHome()
         renderer.releaseOffscreenResources()
         rawBgBitmap = null
@@ -404,11 +400,11 @@ private fun PrismApp() {
     }
 
     fun updateLayer(id: String, f: (LayerNode) -> LayerNode) {
-        stage(currentProject.copy(layers = currentProject.layers.mapNode(id, f)))
+        stage(editingProject.copy(layers = editingProject.layers.mapNode(id, f)))
     }
 
     fun updateSelected(f: (LayerNode) -> LayerNode) {
-        val id = currentSelectedId ?: return
+        val id = selectedLayerId ?: return
         updateLayer(id, f)
     }
 
@@ -416,7 +412,7 @@ private fun PrismApp() {
         if (uri != null) {
             runCatching { ctx.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
             previewUri = null
-            commit(currentProject.copy(folderUri = uri.toString(), imageUri = null))
+            commit(editingProject.copy(folderUri = uri.toString(), imageUri = null))
         }
     }
 
@@ -425,16 +421,18 @@ private fun PrismApp() {
             runCatching { ctx.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
             val s = uri.toString()
             previewUri = s
-            commit(currentProject.copy(imageUri = s, folderUri = null))
+            commit(editingProject.copy(imageUri = s, folderUri = null))
         }
     }
 
     val fontPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
-            val f = FontManager.import(ctx, uri)
-            if (f != null) {
-                importedFonts = FontManager.availableFonts(ctx)
-                updateSelected { it.copy(font = f) }
+            scope.launch {
+                val f = withContext(Dispatchers.IO) { FontManager.import(ctx, uri) }
+                if (f != null) {
+                    reloadFonts()
+                    updateSelected { it.copy(font = f) }
+                }
             }
         }
     }
@@ -447,7 +445,7 @@ private fun PrismApp() {
             scope.launch {
                 ProjectStore.setFontFolderUri(ctx, s)
                 val count = FontManager.syncFontFolder(ctx, s)
-                importedFonts = FontManager.availableFonts(ctx)
+                reloadFonts()
                 snackbar.showSnackbar("$count ${if (count == 1) "fonte sincronizada" else "fontes sincronizadas"} da pasta")
             }
         }
@@ -455,11 +453,13 @@ private fun PrismApp() {
 
     val svgPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
-            val svg = Icons.importSvg(ctx, uri)
-            if (svg != null) {
-                val n = LayerNode(name = "SVG", type = LayerType.SVG, svgData = svg.data, svgW = svg.w, svgH = svg.h, w = 140f, h = 140f)
-                commit(currentProject.copy(layers = currentProject.layers + n))
-                selectedLayerId = n.id
+            scope.launch {
+                val svg = withContext(Dispatchers.IO) { Icons.importSvg(ctx, uri) }
+                if (svg != null) {
+                    val n = LayerNode(name = "SVG", type = LayerType.SVG, svgData = svg.data, svgW = svg.w, svgH = svg.h, w = 140f, h = 140f)
+                    commit(editingProject.copy(layers = editingProject.layers + n))
+                    selectedLayerId = n.id
+                }
             }
         }
     }
@@ -470,7 +470,7 @@ private fun PrismApp() {
                 val imported = PrismPackageManager.importFromDocument(ctx, uri)
                 if (imported != null) {
                     FontManager.prewarm(ctx)
-                    importedFonts = FontManager.availableFonts(ctx)
+                    reloadFonts()
                     if (imported.isWidget) {
                         ProjectStore.upsertWidget(ctx, imported)
                         focusThemeId = imported.id
@@ -493,7 +493,7 @@ private fun PrismApp() {
                 val imported = PrismPackageManager.importFromFolder(ctx, uri)
                 if (imported != null) {
                     FontManager.prewarm(ctx)
-                    importedFonts = FontManager.availableFonts(ctx)
+                    reloadFonts()
                     if (imported.isWidget) {
                         ProjectStore.upsertWidget(ctx, imported)
                         focusThemeId = imported.id
@@ -513,7 +513,7 @@ private fun PrismApp() {
     val exportThemePicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
         if (uri != null) {
             scope.launch {
-                val exporting = currentProject
+                val exporting = editingProject
                 val ok = PrismPackageManager.exportPackage(ctx, exporting, uri)
                 snackbar.showSnackbar(
                     if (ok) {
@@ -538,29 +538,33 @@ private fun PrismApp() {
         pendingAssetAlias = null
         if (uri != null && !alias.isNullOrBlank()) {
             runCatching { ctx.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
-            val mime = ctx.contentResolver.getType(uri).orEmpty().lowercase()
-            val svg = if ("svg" in mime || uri.toString().lowercase().endsWith(".svg")) {
-                Icons.importSvg(ctx, uri)
-            } else {
-                val bmp = WallpaperCarousel.loadCustomAssetBitmap(ctx, uri.toString(), 64, 64)
-                if (bmp == null) Icons.importSvg(ctx, uri) else null
-            }
-            if (svg != null) {
-                val encoded = Icons.encodeSvgAsset(svg)
-                commit(currentProject.copy(customAssets = currentProject.customAssets + (alias to encoded)))
-                updateSelected { node ->
-                    when (node.type) {
-                        LayerType.SVG -> if (node.svgData.isEmpty()) node.copy(svgData = svg.data, svgW = svg.w, svgH = svg.h) else node
-                        LayerType.ICON -> if (node.fxAsset.isBlank()) node.copy(fxAsset = alias) else node
-                        else -> node
+            scope.launch {
+                val svg = withContext(Dispatchers.IO) {
+                    val mime = ctx.contentResolver.getType(uri).orEmpty().lowercase()
+                    if ("svg" in mime || uri.toString().lowercase().endsWith(".svg")) {
+                        Icons.importSvg(ctx, uri)
+                    } else {
+                        val bmp = WallpaperCarousel.loadCustomAssetBitmap(ctx, uri.toString(), 64, 64)
+                        if (bmp == null) Icons.importSvg(ctx, uri) else null
                     }
                 }
-                scope.launch { snackbar.showSnackbar("SVG \"$alias\" salvo para uso em fórmulas") }
-            } else {
-                val s = uri.toString()
-                commit(currentProject.copy(customAssets = currentProject.customAssets + (alias to s)))
-                updateSelected { it.copy(imageUri = if (it.imageUri.isBlank()) alias else it.imageUri) }
-                scope.launch { snackbar.showSnackbar("Ativo \"$alias\" salvo para uso em fórmulas") }
+                if (svg != null) {
+                    val encoded = Icons.encodeSvgAsset(svg)
+                    commit(editingProject.copy(customAssets = editingProject.customAssets + (alias to encoded)))
+                    updateSelected { node ->
+                        when (node.type) {
+                            LayerType.SVG -> if (node.svgData.isEmpty()) node.copy(svgData = svg.data, svgW = svg.w, svgH = svg.h) else node
+                            LayerType.ICON -> if (node.fxAsset.isBlank()) node.copy(fxAsset = alias) else node
+                            else -> node
+                        }
+                    }
+                    snackbar.showSnackbar("SVG \"$alias\" salvo para uso em fórmulas")
+                } else {
+                    val s = uri.toString()
+                    commit(editingProject.copy(customAssets = editingProject.customAssets + (alias to s)))
+                    updateSelected { it.copy(imageUri = if (it.imageUri.isBlank()) alias else it.imageUri) }
+                    snackbar.showSnackbar("Ativo \"$alias\" salvo para uso em fórmulas")
+                }
             }
         }
     }
@@ -665,48 +669,46 @@ private fun PrismApp() {
                     onBack = ::returnToHub,
                     onRenameTheme = { newTitle ->
                         val cleanTitle = newTitle.trim().ifBlank {
-                            if (currentProject.isWidget) "Prism Widget" else "Default Screen"
+                            if (editingProject.isWidget) "Prism Widget" else "Default Screen"
                         }
-                        commit(currentProject.copy(title = cleanTitle))
+                        commit(editingProject.copy(title = cleanTitle))
                     },
                     onSaveExplicit = {
                         flushSave()
-                        scope.launch { snackbar.showSnackbar("\"${currentProject.title}\" salvo") }
+                        scope.launch { snackbar.showSnackbar("\"${editingProject.title}\" salvo") }
                     },
                     onSaveAsNew = { title ->
-                        val cloned = currentProject.copy(
+                        val cloned = editingProject.copy(
                             id = UUID.randomUUID().toString(),
                             title = title,
-                            layers = currentProject.layers.map { it.copyDeep() }
+                            layers = editingProject.layers.map { it.copyDeep() }
                         )
                         commit(cloned)
                         scope.launch { snackbar.showSnackbar("Salvo como \"$title\"") }
                     },
-                    onApply = { applyAndBake(currentProject, forcePicker = false) },
+                    onApply = { applyAndBake(editingProject, forcePicker = false) },
                     onExportFile = {
-                        val safeName = PrismPackageManager.sanitizeArchiveFileName(currentProject.title)
-                        val extName = if (currentProject.isWidget) "$safeName.widget.prism" else "$safeName.prism"
+                        val safeName = PrismPackageManager.sanitizeArchiveFileName(editingProject.title)
+                        val extName = if (editingProject.isWidget) "$safeName.widget.prism" else "$safeName.prism"
                         exportThemePicker.launch(extName)
                     },
                     onToggleDepth = { imageKey, enabled ->
-                        val nextMap = currentProject.depthOverrides.toMutableMap().apply {
+                        val nextMap = editingProject.depthOverrides.toMutableMap().apply {
                             put(imageKey, enabled)
                         }.toMap()
                         val nextLayers = if (enabled) {
-                            val existing = currentProject.layers.firstOrNull { it.type == LayerType.DEPTH }
+                            val existing = editingProject.layers.firstOrNull { it.type == LayerType.DEPTH }
                             when {
                                 existing == null -> {
                                     val depthNode = LayerNode(name = "Sujeito 3D", type = LayerType.DEPTH)
-                                    val insertIdx = if (currentProject.layers.isNotEmpty()) 1 else 0
-                                    currentProject.layers.toMutableList().apply { add(insertIdx, depthNode) }
+                                    val insertIdx = if (editingProject.layers.isNotEmpty()) 1 else 0
+                                    editingProject.layers.toMutableList().apply { add(insertIdx, depthNode) }
                                 }
-                                existing.hidden -> currentProject.layers.mapNode(existing.id) { it.copy(hidden = false) }
-                                else -> currentProject.layers
+                                existing.hidden -> editingProject.layers.mapNode(existing.id) { it.copy(hidden = false) }
+                                else -> editingProject.layers
                             }
-                        } else currentProject.layers
-                        val updated = currentProject.copy(depth = true, depthOverrides = nextMap, layers = nextLayers)
-                        editingProject = updated
-                        saveFlow.tryEmit(updated)
+                        } else editingProject.layers
+                        stage(editingProject.copy(depth = true, depthOverrides = nextMap, layers = nextLayers))
                     },
                     onSelectPreview = { uriStr, idx ->
                         previewUri = uriStr
@@ -727,7 +729,7 @@ private fun PrismApp() {
                         bgBitmap = null
                         depthBitmap = null
                         renderer.clearShaderCachesForHome()
-                        commit(currentProject.copy(folderUri = null, imageUri = null))
+                        commit(editingProject.copy(folderUri = null, imageUri = null))
                     },
                     onImportFont = { fontPicker.launch(arrayOf("font/*", "application/x-font-ttf", "application/x-font-opentype", "*/*")) },
                     hasFontFolder = fontFolderUri != null,
@@ -739,7 +741,7 @@ private fun PrismApp() {
                         } else {
                             scope.launch {
                                 val count = FontManager.syncFontFolder(ctx, saved)
-                                importedFonts = FontManager.availableFonts(ctx)
+                                reloadFonts()
                                 if (showToast) {
                                     snackbar.showSnackbar("$count ${if (count == 1) "fonte atualizada" else "fontes atualizadas"}")
                                 }
@@ -754,7 +756,7 @@ private fun PrismApp() {
                     },
                     onNextWallpaper = {
                         scope.launch {
-                            val next = WallpaperCarousel.currentUri(ctx, currentProject, advance = true)
+                            val next = WallpaperCarousel.currentUri(ctx, editingProject, advance = true)
                             if (next != null) previewUri = next
                         }
                     }
