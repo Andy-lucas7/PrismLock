@@ -162,8 +162,9 @@ class LiquidGlassRenderer {
     }
 
     private class Workspace {
-        val blurShader = RuntimeShader(BLUR_AGSL)
-        val crystalShader = RuntimeShader(CRYSTAL_AGSL)
+        // Compilação AGSL só quando um preenchimento Blur/Cristal for realmente desenhado nesta thread.
+        val blurShader by lazy(LazyThreadSafetyMode.NONE) { RuntimeShader(BLUR_AGSL) }
+        val crystalShader by lazy(LazyThreadSafetyMode.NONE) { RuntimeShader(CRYSTAL_AGSL) }
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         val filterPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
             isFilterBitmap = true
@@ -408,6 +409,16 @@ class LiquidGlassRenderer {
                 completeLockscreenBitmap = complete,
                 overlayLayerBitmap = null
             )
+        }
+
+        /** Frame único em repouso: move para memória de GPU (zero cópia no canvas de hardware, sem textura duplicada). */
+        fun toHardware(): BakedMinuteScene {
+            if (!isSingleCompleteFrame()) return this
+            val complete = completeLockscreenBitmap ?: return this
+            if (complete.isRecycled || complete.config == Bitmap.Config.HARDWARE) return this
+            val hw = complete.copy(Bitmap.Config.HARDWARE, false) ?: return this
+            complete.recycle()
+            return copy(clockLayerBitmap = hw, completeLockscreenBitmap = hw, overlayLayerBitmap = null)
         }
 
         fun recycle() {
