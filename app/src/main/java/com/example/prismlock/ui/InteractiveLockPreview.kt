@@ -19,6 +19,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -163,8 +164,19 @@ fun InteractiveLockPreview(
     var snapLineY by remember(project.id) { mutableStateOf<Float?>(null) }
     var activeDraggingLayerId by remember(project.id) { mutableStateOf<String?>(null) }
     val currentActiveDragId by rememberUpdatedState(activeDraggingLayerId)
+    val currentOnUpdateLayer by rememberUpdatedState(onUpdateLayer)
+    val currentOnSelectLayer by rememberUpdatedState(onSelectLayer)
+    val currentOnFlushSave by rememberUpdatedState(onFlushSave)
+    val currentOnTriggerLayerTouch by rememberUpdatedState(onTriggerLayerTouch)
     var isDraggingStretch by remember(project.id) { mutableStateOf(false) }
     val currentDraggingStretch by rememberUpdatedState(isDraggingStretch)
+    var isCanvasGestureActive by remember(project.id) { mutableStateOf(false) }
+    val currentOnDragStateChange by rememberUpdatedState(onDragStateChange)
+    val isEditorDragging = isCanvasGestureActive || isDraggingStretch
+    LaunchedEffect(isEditorDragging) { currentOnDragStateChange(isEditorDragging) }
+    DisposableEffect(Unit) {
+        onDispose { currentOnDragStateChange(false) }
+    }
 
     val isVideoPreview by produceState(initialValue = false, activePreviewUri) {
         value = activePreviewUri != null && withContext(Dispatchers.IO) {
@@ -216,10 +228,6 @@ fun InteractiveLockPreview(
             vr.setSource(uri, bw, bh, blurPx)
             vr.play()
         }
-    }
-
-    DisposableEffect(project.id) {
-        onDispose { onDragStateChange(false) }
     }
 
     LaunchedEffect(renderer, project.id) {
@@ -303,101 +311,103 @@ fun InteractiveLockPreview(
                         var lastSnapX: Float? = null
                         var lastSnapY: Float? = null
 
-                        do {
-                            val event = awaitPointerEvent()
-                            val pressedCount = event.changes.count { it.pressed }
-                            if (pressedCount >= 2) {
-                                if (!movedPastSlop) {
+                        try {
+                            do {
+                                val event = awaitPointerEvent()
+                                val pressedCount = event.changes.count { it.pressed }
+                                if (pressedCount >= 2) {
                                     movedPastSlop = true
-                                    onDragStateChange(true)
-                                } else {
-                                    onDragStateChange(true)
-                                }
-                                val targetId = currentActiveDragId ?: currentSelectedId?.let { sid ->
-                                    generateSequence(sid) { cur -> currentProject.layers.parentOf(cur)?.id }.last()
-                                }
-                                val targetNode = targetId?.let { currentProject.layers.find(it) }
-                                if (targetNode != null && !targetNode.locked) {
-                                    val zoom = event.calculateZoom()
-                                    val rot = event.calculateRotation()
-                                    if (zoom != 1f || rot != 0f) {
-                                        onUpdateLayer(targetNode.id) {
-                                            val rawRot = (it.rotation + rot + 180f).mod(360f) - 180f
-                                            it.copy(
-                                                scale = (it.scale * zoom).coerceIn(0.25f, 4f),
-                                                rotation = rawRot
-                                            )
+                                    isCanvasGestureActive = true
+                                    val targetId = lockedDragId ?: currentSelectedId?.let { sid ->
+                                        generateSequence(sid) { cur -> currentProject.layers.parentOf(cur)?.id }.last()
+                                    }
+                                    val targetNode = targetId?.let { currentProject.layers.find(it) }
+                                    if (targetNode != null && !targetNode.locked) {
+                                        val zoom = event.calculateZoom()
+                                        val rot = event.calculateRotation()
+                                        if (zoom != 1f || rot != 0f) {
+                                            currentOnUpdateLayer(targetNode.id) {
+                                                val rawRot = (it.rotation + rot + 180f).mod(360f) - 180f
+                                                it.copy(
+                                                    scale = (it.scale * zoom).coerceIn(0.25f, 4f),
+                                                    rotation = rawRot
+                                                )
+                                            }
                                         }
                                     }
-                                }
-                                event.changes.forEach { it.consume() }
-                            } else if (pressedCount == 1) {
-                                val pan = event.calculatePan()
-                                totalPan += pan
-                                if (!movedPastSlop && totalPan.getDistance() > touchSlop) {
-                                    movedPastSlop = true
-                                    if (picked != null) onSelectLayer(picked.id)
-                                    if (currentActiveDragId != null) onDragStateChange(true)
-                                }
-                                val dragId = currentActiveDragId
-                                if (movedPastSlop && dragId != null && pan != Offset.Zero) {
-                                    rawX = (rawX + (pan.x / sxScale) / cw).coerceIn(0f, 1f)
-                                    rawY = (rawY + (pan.y / syScale) / ch).coerceIn(0f, 1f)
-
-                                    val rawLeft = rawX * cw + boxOffsetX
-                                    val rawCenterX = rawLeft + boxW * 0.5f
-                                    val rawRight = rawLeft + boxW
-                                    var nx = rawX
-                                    val sX: Float? = when {
-                                        abs(rawCenterX - cw * 0.5f) <= baseSnapX -> {
-                                            nx = ((cw * 0.5f - boxW * 0.5f - boxOffsetX) / cw).coerceIn(0f, 1f)
-                                            cw * 0.5f
-                                        }
-                                        abs(rawLeft - baseMarginX) <= baseSnapX -> {
-                                            nx = ((baseMarginX - boxOffsetX) / cw).coerceIn(0f, 1f)
-                                            baseMarginX
-                                        }
-                                        abs(rawRight - (cw - baseMarginX)) <= baseSnapX -> {
-                                            nx = ((cw - baseMarginX - boxW - boxOffsetX) / cw).coerceIn(0f, 1f)
-                                            cw - baseMarginX
-                                        }
-                                        else -> null
-                                    }
-
-                                    val rawTop = rawY * ch + boxOffsetY
-                                    val rawCenterY = rawTop + boxH * 0.5f
-                                    val rawBottom = rawTop + boxH
-                                    var ny = rawY
-                                    val sY: Float? = when {
-                                        abs(rawCenterY - ch * 0.5f) <= baseSnapY -> {
-                                            ny = ((ch * 0.5f - boxH * 0.5f - boxOffsetY) / ch).coerceIn(0f, 1f)
-                                            ch * 0.5f
-                                        }
-                                        abs(rawTop - baseMarginY) <= baseSnapY -> {
-                                            ny = ((baseMarginY - boxOffsetY) / ch).coerceIn(0f, 1f)
-                                            baseMarginY
-                                        }
-                                        abs(rawBottom - (ch - baseMarginY)) <= baseSnapY -> {
-                                            ny = ((ch - baseMarginY - boxH - boxOffsetY) / ch).coerceIn(0f, 1f)
-                                            ch - baseMarginY
-                                        }
-                                        else -> null
-                                    }
-
-                                    if ((sX != null && sX != lastSnapX) || (sY != null && sY != lastSnapY)) {
-                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    }
-                                    lastSnapX = sX
-                                    lastSnapY = sY
-                                    snapLineX = sX?.let { it * sxScale }
-                                    snapLineY = sY?.let { it * syScale }
-                                    onUpdateLayer(dragId) { it.copy(x = nx, y = ny) }
                                     event.changes.forEach { it.consume() }
-                                }
-                            }
-                        } while (event.changes.any { it.pressed })
+                                } else if (pressedCount == 1) {
+                                    val pan = event.calculatePan()
+                                    totalPan += pan
+                                    if (!movedPastSlop && totalPan.getDistance() > touchSlop) {
+                                        movedPastSlop = true
+                                        if (picked != null) currentOnSelectLayer(picked.id)
+                                        if (lockedDragId != null) isCanvasGestureActive = true
+                                    }
+                                    val dragId = lockedDragId
+                                    if (movedPastSlop && dragId != null && pan != Offset.Zero) {
+                                        rawX = (rawX + (pan.x / sxScale) / cw).coerceIn(0f, 1f)
+                                        rawY = (rawY + (pan.y / syScale) / ch).coerceIn(0f, 1f)
 
-                        onDragStateChange(false)
+                                        val rawLeft = rawX * cw + boxOffsetX
+                                        val rawCenterX = rawLeft + boxW * 0.5f
+                                        val rawRight = rawLeft + boxW
+                                        var nx = rawX
+                                        val sX: Float? = when {
+                                            abs(rawCenterX - cw * 0.5f) <= baseSnapX -> {
+                                                nx = ((cw * 0.5f - boxW * 0.5f - boxOffsetX) / cw).coerceIn(0f, 1f)
+                                                cw * 0.5f
+                                            }
+                                            abs(rawLeft - baseMarginX) <= baseSnapX -> {
+                                                nx = ((baseMarginX - boxOffsetX) / cw).coerceIn(0f, 1f)
+                                                baseMarginX
+                                            }
+                                            abs(rawRight - (cw - baseMarginX)) <= baseSnapX -> {
+                                                nx = ((cw - baseMarginX - boxW - boxOffsetX) / cw).coerceIn(0f, 1f)
+                                                cw - baseMarginX
+                                            }
+                                            else -> null
+                                        }
+
+                                        val rawTop = rawY * ch + boxOffsetY
+                                        val rawCenterY = rawTop + boxH * 0.5f
+                                        val rawBottom = rawTop + boxH
+                                        var ny = rawY
+                                        val sY: Float? = when {
+                                            abs(rawCenterY - ch * 0.5f) <= baseSnapY -> {
+                                                ny = ((ch * 0.5f - boxH * 0.5f - boxOffsetY) / ch).coerceIn(0f, 1f)
+                                                ch * 0.5f
+                                            }
+                                            abs(rawTop - baseMarginY) <= baseSnapY -> {
+                                                ny = ((baseMarginY - boxOffsetY) / ch).coerceIn(0f, 1f)
+                                                baseMarginY
+                                            }
+                                            abs(rawBottom - (ch - baseMarginY)) <= baseSnapY -> {
+                                                ny = ((ch - baseMarginY - boxH - boxOffsetY) / ch).coerceIn(0f, 1f)
+                                                ch - baseMarginY
+                                            }
+                                            else -> null
+                                        }
+
+                                        if ((sX != null && sX != lastSnapX) || (sY != null && sY != lastSnapY)) {
+                                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        }
+                                        lastSnapX = sX
+                                        lastSnapY = sY
+                                        snapLineX = sX?.let { it * sxScale }
+                                        snapLineY = sY?.let { it * syScale }
+                                        currentOnUpdateLayer(dragId) { it.copy(x = nx, y = ny) }
+                                        event.changes.forEach { it.consume() }
+                                    }
+                                }
+                            } while (event.changes.any { it.pressed })
+                        } finally {
+                            isCanvasGestureActive = false
+                            activeDraggingLayerId = null
+                            snapLineX = null
+                            snapLineY = null
+                        }
+
                         if (!movedPastSlop) {
                             if (currentTestTouchMode) {
                                 val hitAction = TouchActionExecutor.hitTestActionable(
@@ -409,20 +419,17 @@ fun InteractiveLockPreview(
                                 )
                                 if (hitAction != null) {
                                     haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    onSelectLayer(hitAction.id)
-                                    onTriggerLayerTouch(hitAction)
+                                    currentOnSelectLayer(hitAction.id)
+                                    currentOnTriggerLayerTouch(hitAction)
                                 } else {
-                                    onSelectLayer(picked?.id)
+                                    currentOnSelectLayer(picked?.id)
                                 }
                             } else {
-                                onSelectLayer(picked?.id)
+                                currentOnSelectLayer(picked?.id)
                             }
                         } else {
-                            onFlushSave()
+                            currentOnFlushSave()
                         }
-                        activeDraggingLayerId = null
-                        snapLineX = null
-                        snapLineY = null
                     }
                 }
         ) {
@@ -524,24 +531,36 @@ fun InteractiveLockPreview(
             }
         }
 
-        if (selected != null && selected.type == LayerType.TEXT && !selected.locked && selectedHitRect != null) {
-            val rect = selectedHitRect!!
-            val handleX = rect.centerX().roundToInt()
-            val handleY = (rect.bottom + 14f).roundToInt()
+        val hasSelectedHitRect by remember { derivedStateOf { selectedHitRect != null } }
+        if (selected != null && selected.type == LayerType.TEXT && !selected.locked && hasSelectedHitRect) {
+            val stretchLayerId = selected.id
             Box(
                 modifier = Modifier
-                    .offset { IntOffset(handleX - 38, handleY - 12) }
+                    .offset {
+                        val rect = selectedHitRect ?: return@offset IntOffset.Zero
+                        IntOffset(
+                            rect.centerX().roundToInt() - 38.dp.roundToPx(),
+                            (rect.bottom + 14f).roundToInt() - 12.dp.roundToPx()
+                        )
+                    }
                     .size(width = 76.dp, height = 24.dp)
                     .clip(RoundedCornerShape(12.dp))
                     .background(PrismColors.PureWhite)
-                    .pointerInput(selected.id) {
-                        detectDragGestures(
-                            onDragStart = { isDraggingStretch = true; onDragStateChange(true) },
-                            onDragEnd = { isDraggingStretch = false; onDragStateChange(false); onFlushSave() },
-                            onDragCancel = { isDraggingStretch = false; onDragStateChange(false); onFlushSave() }
-                        ) { change, dragAmount ->
-                            change.consume()
-                            onUpdateLayer(selected.id) { it.copy(stretch = (it.stretch + dragAmount.y / 140f).coerceIn(1f, 3f)) }
+                    .pointerInput(stretchLayerId) {
+                        try {
+                            detectDragGestures(
+                                onDragStart = { isDraggingStretch = true },
+                                onDragEnd = { isDraggingStretch = false; currentOnFlushSave() },
+                                onDragCancel = { isDraggingStretch = false; currentOnFlushSave() }
+                            ) { change, dragAmount ->
+                                change.consume()
+                                currentOnUpdateLayer(stretchLayerId) { it.copy(stretch = (it.stretch + dragAmount.y / 140f).coerceIn(1f, 3f)) }
+                            }
+                        } finally {
+                            if (isDraggingStretch) {
+                                isDraggingStretch = false
+                                currentOnFlushSave()
+                            }
                         }
                     },
                 contentAlignment = Alignment.Center

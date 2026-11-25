@@ -215,6 +215,7 @@ class LiquidGlassRenderer {
     private val lastLensInvMatrixByNode = ConcurrentHashMap<String, Matrix>()
     private val lensShaderCache = ConcurrentHashMap<String, Pair<Bitmap, BitmapShader>>()
     @Volatile private var allowStaleLensOnMiss = false
+    private val forceFreshLensOnThread = ThreadLocal<Boolean>()
     @Volatile private var lastScaledSceneKey = ""
     private val lastCachedHits = ArrayList<HitBox>()
 
@@ -706,8 +707,7 @@ class LiquidGlassRenderer {
         env: Env,
         now: LocalDateTime
     ) {
-        val prevStale = allowStaleLensOnMiss
-        allowStaleLensOnMiss = false
+        forceFreshLensOnThread.set(true)
         try {
             val screenW = w.coerceAtLeast(1)
             val screenH = h.coerceAtLeast(1)
@@ -782,7 +782,7 @@ class LiquidGlassRenderer {
                 )
             }
         } finally {
-            allowStaleLensOnMiss = prevStale
+            forceFreshLensOnThread.remove()
         }
     }
 
@@ -1872,7 +1872,7 @@ class LiquidGlassRenderer {
         val key = "$nodeId|${screenW}x$screenH|${bevelPx.roundToInt()}|${baseStrokePx.roundToInt()}|$geomKey$imgTag"
         lensHeightCache.get(key)?.let { return it }
 
-        if (allowStaleLensOnMiss) {
+        if (allowStaleLensOnMiss && forceFreshLensOnThread.get() != true) {
             lastLensByNode[nodeId]?.takeIf { !it.isRecycled && it.width == screenW && it.height == screenH }?.let {
                 return it
             }
