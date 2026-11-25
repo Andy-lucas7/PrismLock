@@ -214,6 +214,7 @@ internal fun LayersTab(
     onImportSvg: () -> Unit
 ) {
     val flat = remember(project.layers) { project.layers.flatten() }
+    val globalsMap = remember(project.globals) { project.globalsMap() }
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -355,7 +356,7 @@ internal fun LayersTab(
                                 )
                             }
                         }
-                        Text(layerSubtitle(node, env, project.globalsMap()), color = PrismColors.MutedZinc, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(layerSubtitle(node, env, globalsMap), color = PrismColors.MutedZinc, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                     IconButton(onClick = { onCommit(project.copy(layers = project.layers.move(node.id, -1))) }, Modifier.size(26.dp)) {
                         Icon(MIcons.Rounded.ArrowUpward, null, tint = PrismColors.MutedZinc, modifier = Modifier.size(15.dp))

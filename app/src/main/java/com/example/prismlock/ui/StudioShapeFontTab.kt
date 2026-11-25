@@ -192,13 +192,13 @@ internal fun ShapeAndFontTab(
     onPickFontFolder: () -> Unit,
     onRefreshFontFolder: (Boolean) -> Unit
 ) {
-    val ctx = LocalContext.current
     if (node == null) {
         Text("Selecione uma camada", color = PrismColors.MutedZinc, fontSize = 12.sp)
         return
     }
     var showFontListDialog by remember { mutableStateOf(false) }
-    val allFonts = remember(importedFonts) { FontManager.availableFonts(ctx) }
+    // Already resolved off the main thread by the caller; rescanning here stalled every recomposition.
+    val allFonts = importedFonts
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         when (node.type) {

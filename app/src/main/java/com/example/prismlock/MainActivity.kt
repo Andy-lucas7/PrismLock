@@ -107,6 +107,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import java.util.UUID
@@ -119,10 +120,16 @@ internal object PendingSave {
         ref.set(p)
     }
 
+    // Serializes writers: the snapshot is taken under the lock, so a slower earlier flush can never
+    // land after (and overwrite) a newer one.
+    private val writeLock = kotlinx.coroutines.sync.Mutex()
+
     suspend fun flush(ctx: Context) {
-        val p = ref.getAndSet(null) ?: return
-        withContext(NonCancellable) {
-            if (p.isWidget) ProjectStore.upsertWidget(ctx, p) else ProjectStore.upsertTheme(ctx, p)
+        writeLock.withLock {
+            val p = ref.getAndSet(null) ?: return@withLock
+            withContext(NonCancellable) {
+                if (p.isWidget) ProjectStore.upsertWidget(ctx, p) else ProjectStore.upsertTheme(ctx, p)
+            }
         }
     }
 }
@@ -287,9 +294,10 @@ private fun PrismApp() {
     var previewUri by remember { mutableStateOf<String?>(null) }
     val env by EnvProvider.env.collectAsStateWithLifecycle()
     var fontFolderUri by remember { mutableStateOf<String?>(null) }
-    var importedFonts by remember {
-        FontManager.init(ctx)
-        mutableStateOf(FontManager.availableFonts(ctx))
+    // Font scan touches the filesystem: never on the main thread.
+    var importedFonts by remember { mutableStateOf<List<String>>(emptyList()) }
+    suspend fun reloadFonts() {
+        importedFonts = withContext(Dispatchers.IO) { FontManager.availableFonts(ctx) }
     }
 
     LaunchedEffect(deferHubPreviews) {
@@ -300,7 +308,7 @@ private fun PrismApp() {
         if (savedFolder != null) {
             FontManager.syncFontFolder(ctx, savedFolder)
         }
-        importedFonts = FontManager.availableFonts(ctx)
+        reloadFonts()
     }
     val wallPalette = remember(rawBgBitmap) { renderer.extractPalette(rawBgBitmap) }
 
@@ -463,7 +471,7 @@ private fun PrismApp() {
         fontFolderUri?.let { saved ->
             scope.launch {
                 FontManager.syncFontFolder(ctx, saved)
-                importedFonts = FontManager.availableFonts(ctx)
+                reloadFonts()
             }
         }
     }
@@ -614,10 +622,12 @@ private fun PrismApp() {
 
     val fontPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
-            val f = FontManager.import(ctx, uri)
-            if (f != null) {
-                importedFonts = FontManager.availableFonts(ctx)
-                updateSelected { it.copy(font = f) }
+            scope.launch {
+                val f = withContext(Dispatchers.IO) { FontManager.import(ctx, uri) }
+                if (f != null) {
+                    reloadFonts()
+                    updateSelected { it.copy(font = f) }
+                }
             }
         }
     }
@@ -630,7 +640,7 @@ private fun PrismApp() {
             scope.launch {
                 ProjectStore.setFontFolderUri(ctx, s)
                 val count = FontManager.syncFontFolder(ctx, s)
-                importedFonts = FontManager.availableFonts(ctx)
+                reloadFonts()
                 snackbar.showSnackbar("$count ${if (count == 1) "fonte sincronizada" else "fontes sincronizadas"} da pasta")
             }
         }
@@ -638,11 +648,13 @@ private fun PrismApp() {
 
     val svgPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
-            val svg = Icons.importSvg(ctx, uri)
-            if (svg != null) {
-                val n = LayerNode(name = "SVG", type = LayerType.SVG, svgData = svg.data, svgW = svg.w, svgH = svg.h, w = 140f, h = 140f)
-                commit(editingProject.copy(layers = editingProject.layers + n))
-                selectedLayerId = n.id
+            scope.launch {
+                val svg = withContext(Dispatchers.IO) { Icons.importSvg(ctx, uri) }
+                if (svg != null) {
+                    val n = LayerNode(name = "SVG", type = LayerType.SVG, svgData = svg.data, svgW = svg.w, svgH = svg.h, w = 140f, h = 140f)
+                    commit(editingProject.copy(layers = editingProject.layers + n))
+                    selectedLayerId = n.id
+                }
             }
         }
     }
@@ -653,7 +665,7 @@ private fun PrismApp() {
                 val imported = PrismPackageManager.importFromDocument(ctx, uri)
                 if (imported != null) {
                     FontManager.prewarm(ctx)
-                    importedFonts = FontManager.availableFonts(ctx)
+                    reloadFonts()
                     if (imported.isWidget) {
                         ProjectStore.upsertWidget(ctx, imported)
                         focusThemeId = imported.id
@@ -676,7 +688,7 @@ private fun PrismApp() {
                 val imported = PrismPackageManager.importFromFolder(ctx, uri)
                 if (imported != null) {
                     FontManager.prewarm(ctx)
-                    importedFonts = FontManager.availableFonts(ctx)
+                    reloadFonts()
                     if (imported.isWidget) {
                         ProjectStore.upsertWidget(ctx, imported)
                         focusThemeId = imported.id
@@ -741,29 +753,33 @@ private fun PrismApp() {
         pendingAssetAlias = null
         if (uri != null && !alias.isNullOrBlank()) {
             runCatching { ctx.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
-            val mime = ctx.contentResolver.getType(uri).orEmpty().lowercase()
-            val svg = if ("svg" in mime || uri.toString().lowercase().endsWith(".svg")) {
-                Icons.importSvg(ctx, uri)
-            } else {
-                val bmp = WallpaperCarousel.loadCustomAssetBitmap(ctx, uri.toString(), 64, 64)
-                if (bmp == null) Icons.importSvg(ctx, uri) else null
-            }
-            if (svg != null) {
-                val encoded = Icons.encodeSvgAsset(svg)
-                commit(editingProject.copy(customAssets = editingProject.customAssets + (alias to encoded)))
-                updateSelected { node ->
-                    when (node.type) {
-                        LayerType.SVG -> if (node.svgData.isEmpty()) node.copy(svgData = svg.data, svgW = svg.w, svgH = svg.h) else node
-                        LayerType.ICON -> if (node.fxAsset.isBlank()) node.copy(fxAsset = alias) else node
-                        else -> node
+            scope.launch {
+                val svg = withContext(Dispatchers.IO) {
+                    val mime = ctx.contentResolver.getType(uri).orEmpty().lowercase()
+                    if ("svg" in mime || uri.toString().lowercase().endsWith(".svg")) {
+                        Icons.importSvg(ctx, uri)
+                    } else {
+                        val bmp = WallpaperCarousel.loadCustomAssetBitmap(ctx, uri.toString(), 64, 64)
+                        if (bmp == null) Icons.importSvg(ctx, uri) else null
                     }
                 }
-                scope.launch { snackbar.showSnackbar("SVG \"$alias\" salvo para uso em fórmulas") }
-            } else {
-                val s = uri.toString()
-                commit(editingProject.copy(customAssets = editingProject.customAssets + (alias to s)))
-                updateSelected { it.copy(imageUri = if (it.imageUri.isBlank()) alias else it.imageUri) }
-                scope.launch { snackbar.showSnackbar("Ativo \"$alias\" salvo para uso em fórmulas") }
+                if (svg != null) {
+                    val encoded = Icons.encodeSvgAsset(svg)
+                    commit(editingProject.copy(customAssets = editingProject.customAssets + (alias to encoded)))
+                    updateSelected { node ->
+                        when (node.type) {
+                            LayerType.SVG -> if (node.svgData.isEmpty()) node.copy(svgData = svg.data, svgW = svg.w, svgH = svg.h) else node
+                            LayerType.ICON -> if (node.fxAsset.isBlank()) node.copy(fxAsset = alias) else node
+                            else -> node
+                        }
+                    }
+                    snackbar.showSnackbar("SVG \"$alias\" salvo para uso em fórmulas")
+                } else {
+                    val s = uri.toString()
+                    commit(editingProject.copy(customAssets = editingProject.customAssets + (alias to s)))
+                    updateSelected { it.copy(imageUri = if (it.imageUri.isBlank()) alias else it.imageUri) }
+                    snackbar.showSnackbar("Ativo \"$alias\" salvo para uso em fórmulas")
+                }
             }
         }
     }
@@ -965,7 +981,7 @@ private fun PrismApp() {
                         } else {
                             scope.launch {
                                 val count = FontManager.syncFontFolder(ctx, saved)
-                                importedFonts = FontManager.availableFonts(ctx)
+                                reloadFonts()
                                 if (showToast) {
                                     snackbar.showSnackbar("$count ${if (count == 1) "fonte atualizada" else "fontes atualizadas"}")
                                 }

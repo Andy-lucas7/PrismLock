@@ -26,6 +26,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -164,6 +165,7 @@ object ProjectStore {
     fun flow(ctx: Context): Flow<Project> = ctx.applicationContext.prismStore.data
         .map { it[KEY] }.distinctUntilChanged()
         .map { s -> s?.let { decodeProject(it)?.let { p -> applyRuntimeGlobals(ctx, p) } } ?: emptyProject }
+        .flowOn(Dispatchers.Default)
 
     fun themesFlow(ctx: Context): Flow<List<Project>> = ctx.applicationContext.prismStore.data
         .map { it[THEMES_KEY] to it[KEY] }
@@ -181,6 +183,7 @@ object ProjectStore {
                 }
             }
         }
+        .flowOn(Dispatchers.Default)
 
     /** One starter per style/audience, mirroring the most-saved lock screen styles (see Presets.all). */
     private val starterThemes: List<Project> by lazy { listOf(
@@ -292,7 +295,7 @@ object ProjectStore {
         return merged
     }
 
-    suspend fun save(ctx: Context, p: Project) {
+    suspend fun save(ctx: Context, p: Project): Unit = withContext(Dispatchers.IO) {
         val s = json.encodeToString(Project.serializer(), p)
         writeAtomicText(activeProjectFile(ctx), s)
         writeRuntimeGlobals(ctx, p)
@@ -465,6 +468,7 @@ object ProjectStore {
             val decoded = raw?.let { decodeProjectList(it) }
             if (!decoded.isNullOrEmpty()) decoded.map { applyRuntimeGlobals(ctx, it.copy(isWidget = true)) } else defaultStarterWidgets()
         }
+        .flowOn(Dispatchers.Default)
 
     fun activeWidgetFlow(ctx: Context): Flow<Project> = ctx.applicationContext.prismStore.data
         .map { it[ACTIVE_WIDGET_KEY] }
@@ -473,6 +477,7 @@ object ProjectStore {
             raw?.let { decodeProject(it) }?.copy(isWidget = true)?.let { applyRuntimeGlobals(ctx, it) }
                 ?: defaultStarterWidgets().first()
         }
+        .flowOn(Dispatchers.Default)
 
     suspend fun getActiveWidget(ctx: Context): Project {
         val f = activeWidgetFile(ctx)
@@ -491,7 +496,7 @@ object ProjectStore {
         return merged
     }
 
-    suspend fun saveActiveWidget(ctx: Context, p: Project) {
+    suspend fun saveActiveWidget(ctx: Context, p: Project): Unit = withContext(Dispatchers.IO) {
         val clean = p.copy(isWidget = true)
         val encoded = json.encodeToString(Project.serializer(), clean)
         writeAtomicText(activeWidgetFile(ctx), encoded)
@@ -517,12 +522,12 @@ object ProjectStore {
         }
     }
 
-    suspend fun upsertWidget(ctx: Context, p: Project) {
+    suspend fun upsertWidget(ctx: Context, p: Project): Unit = withContext(Dispatchers.IO) {
         val clean = p.copy(isWidget = true)
         writeRuntimeGlobals(ctx, clean)
         if (isWallpaperProcess()) {
             saveActiveWidget(ctx, clean)
-            return
+            return@withContext
         }
         var shouldWriteActiveIpc = false
         ctx.applicationContext.prismStore.edit { prefs ->

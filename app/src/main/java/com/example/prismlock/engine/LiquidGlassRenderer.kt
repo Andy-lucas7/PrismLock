@@ -2255,8 +2255,11 @@ class LiquidGlassRenderer {
         val imgTag = if (imageMaskBmp != null && !imageMaskBmp.isRecycled) "|img${System.identityHashCode(imageMaskBmp)}" else ""
         val key = "$nodeId|${screenW}x$screenH|${bevelPx.roundToInt()}|${baseStrokePx.roundToInt()}|$geomKey$imgTag"
         lensHeightCache.get(key)?.let { return it }
+        // Drag/interactive frame: reuse the previous lens if any; with none yet, generate once so the glass never vanishes.
         if (!mayGenerateAssets()) {
-            return lastLensByNode[nodeId]?.takeIf { !it.isRecycled && it.width == screenW && it.height == screenH }
+            lastLensByNode[nodeId]?.takeIf { !it.isRecycled && it.width == screenW && it.height == screenH }?.let {
+                return it
+            }
         }
         return synchronized(maskLock) {
         lensHeightCache.get(key)?.let { return it }

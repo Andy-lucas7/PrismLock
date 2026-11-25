@@ -457,8 +457,12 @@ fun StudioScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Left: Back to Theme Hub + Theme Name Pill
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                // Left: Back to Theme Hub + Theme Name Pill (cede espaço aos botões da direita)
+                Row(
+                    modifier = Modifier.weight(1f).padding(end = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
                     IconButton(
                         onClick = onBack,
                         modifier = Modifier
@@ -474,6 +478,7 @@ fun StudioScreen(
                     }
                     Box(
                         modifier = Modifier
+                            .weight(1f, fill = false)
                             .frostedChrome(shape = RoundedCornerShape(18.dp), elevation = 6.dp)
                             .clickable { showRenameDialog = true }
                             .padding(horizontal = 12.dp, vertical = 7.dp)
@@ -485,7 +490,8 @@ fun StudioScreen(
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Medium,
                                 maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f, fill = false)
                             )
                             Icon(
                                 MIcons.Rounded.Edit,
